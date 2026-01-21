@@ -529,6 +529,7 @@ class RevisionSession:
     # User selections for what to revise
     target_samples: list[str] = field(default_factory=list)
     input_spec: dict[str, Any] = field(default_factory=dict)  # User's revision specification
+    revision_history: list[dict[str, Any]] = field(default_factory=list)  # History of apply_revision calls
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -540,6 +541,7 @@ class RevisionSession:
             "updated_at": self.updated_at,
             "target_samples": self.target_samples,
             "input_spec": self.input_spec,
+            "revision_history": self.revision_history,
         }
 
     @classmethod
@@ -553,4 +555,5 @@ class RevisionSession:
             updated_at=data["updated_at"],
             target_samples=data.get("target_samples", []),
             input_spec=data.get("input_spec", {}),
+            revision_history=data.get("revision_history", []),
         )

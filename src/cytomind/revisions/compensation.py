@@ -5,7 +5,8 @@ Handles iterative refinement of compensation results with lazy visualization
 subset materialization and on-demand feedback generation.
 """
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
+import json
 from pathlib import Path
 from shutil import rmtree
 import hashlib
@@ -20,6 +21,7 @@ from cytomind.domain.pipeline import  StepRun
 from cytomind.steps.compensation import apply_compensation
 from cytomind.revisions import RevisionHandlerRegistry
 from cytomind.revisions.base import BaseRevisionHandler
+from cytomind.qc.compensation import run_channel_tests, run_pairwise_tests, CompensationQCEvaluator
 from cytomind.visualization import (
     build_histogram2d_with_marginals,
     build_histogram1d,
@@ -124,6 +126,128 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         return self.workspace / "compensations"
 
     @property
+    def qc_cache_dir(self) -> Path:
+        """Get or create the QC cache directory."""
+        qc_dir = self.workspace / "qc_cache"
+        qc_dir.mkdir(parents=True, exist_ok=True)
+        return qc_dir
+
+    def _qc_cache_key(self, sample_id: str, comp_id: str, n_subset: int, test_type: str) -> str:
+        """Generate cache key for QC tests.
+
+        Parameters
+        ----------
+        sample_id : str
+            Sample ID
+        comp_id : str
+            Resolved compensation ID
+        n_subset : int
+            Subset size
+        test_type : str
+            "channel" or "pairwise"
+
+        Returns
+        -------
+        str
+            Cache key filename
+        """
+        return f"{sample_id}_{comp_id}_{n_subset}_{test_type}.csv"
+
+    def _qc_metadata_path(self, sample_id: str, comp_id: str, n_subset: int, test_type: str) -> Path:
+        """Path for QC cache metadata JSON (debugging/reproducibility)."""
+        return (self.qc_cache_dir / self._qc_cache_key(sample_id, comp_id, n_subset, test_type)).with_suffix(".json")
+
+    def _json_safe(self, obj: Any) -> Any:
+        """Convert objects to JSON-serializable structures."""
+        if obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, (list, tuple)):
+            return [self._json_safe(v) for v in obj]
+        if isinstance(obj, dict):
+            return {str(k): self._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, np.ndarray):
+            return [self._json_safe(v) for v in obj.tolist()]
+        return str(obj)
+
+    def _qc_metadata_payload(
+        self,
+        tests: list[Any] | None,
+        config: Mapping[str, Any],
+        sample_id: str,
+        comp_id: str,
+        n_subset: int,
+        test_type: str,
+    ) -> dict[str, Any]:
+        """Build JSON payload for cached QC metadata."""
+
+        return {
+            "sample_id": sample_id,
+            "comp_id": comp_id,
+            "n_subset": n_subset,
+            "test_type": test_type,
+            "created_at": now_iso(),
+            "config": self._json_safe(config),
+            "tests": [] if tests is None else [
+                {
+                    "test_name": getattr(t, "test_name", None),
+                    "test_type": getattr(t, "test_type", None),
+                    "status": getattr(t, "status", None),
+                    "message": getattr(t, "message", None),
+                    "metadata": self._json_safe(getattr(t, "metadata", {})),
+                    "metrics": self._json_safe(getattr(t, "metrics", {})),
+                    "thresholds": self._json_safe(getattr(t, "thresholds", {})),
+                }
+                for t in tests
+            ],
+        }
+
+    def _get_cached_qc_tests(self, sample_id: str, comp_id: str, n_subset: int, test_type: str) -> pd.DataFrame | None:
+        """Load QC test results from cache if available.
+
+        Parameters
+        ----------
+        sample_id : str
+            Sample ID
+        comp_id : str
+            Resolved compensation ID
+        n_subset : int
+            Subset size
+        test_type : str
+            "channel" or "pairwise"
+
+        Returns
+        -------
+        pd.DataFrame | None
+            Cached results or None if not cached
+        """
+        cache_path = self.qc_cache_dir / self._qc_cache_key(sample_id, comp_id, n_subset, test_type)
+        if cache_path.exists():
+            return pd.read_csv(cache_path)
+        return None
+
+    def _save_qc_tests_to_cache(
+        self,
+        df: pd.DataFrame,
+        tests: list[Any] | None,
+        config: Mapping[str, Any],
+        sample_id: str,
+        comp_id: str,
+        n_subset: int,
+        test_type: str,
+    ) -> None:
+        """Save QC test results and metadata to cache for reproducibility."""
+
+        cache_path = self.qc_cache_dir / self._qc_cache_key(sample_id, comp_id, n_subset, test_type)
+        metadata_path = self._qc_metadata_path(sample_id, comp_id, n_subset, test_type)
+
+        df.to_csv(cache_path, index=False)
+
+        payload = self._qc_metadata_payload(tests, config, sample_id, comp_id, n_subset, test_type)
+        metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    @property
     def samples(self) -> dict[str, dict[str, Any]]:
         """Get the sample metadata dictionary from state."""
         return self.state.get("samples", {})
@@ -221,9 +345,11 @@ class CompensationRevisionHandler(BaseRevisionHandler):
     def apply_revision(
         self,
         user_input: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> None:
         """
         Apply revision modifications to update sample compensation in the workspace.
+
+        Tracks all changes in the session's revision history for reproducibility.
 
         Supported inputs (sample_id is required as str or list[str]):
           - Existing compensation: {"sample_id": "S1" | ["S1", "S2"], "comp_id": "comp_123" | "raw" | None}
@@ -270,15 +396,16 @@ class CompensationRevisionHandler(BaseRevisionHandler):
                     if sid not in comp_info["batch"]:
                         comp_info["batch"].append(sid)
 
-            self.session.updated_at = now_iso()
-            self.save_session()
-
-            return {
-                "status": "applied",
+            # Track change in history
+            self.session.revision_history.append({
+                "timestamp": now_iso(),
                 "mode": "existing_compensation",
                 "comp_id": comp_id,
                 "samples_updated": target_samples,
-            }
+            })
+
+            self.session.updated_at = now_iso()
+            self.save_session()
 
         # Case 2: Spillover provided (new or existing comp_id reuse)
         if "spillover" in user_input:
@@ -299,18 +426,19 @@ class CompensationRevisionHandler(BaseRevisionHandler):
                 )
                 comp_ids_created.append(comp_id)
 
-            self.session.updated_at = now_iso()
-            self.save_session()
-
-            return {
-                "status": "applied",
+            # Track change in history
+            self.session.revision_history.append({
+                "timestamp": now_iso(),
                 "mode": "new_spillover",
                 "comp_ids": comp_ids_created,
                 "samples_updated": target_samples,
-                "spillover_shape": spillover_df.shape,
-            }
+            })
 
-        raise ValueError("user_input must contain either 'comp_id' or 'spillover'")
+            self.session.updated_at = now_iso()
+            self.save_session()
+
+        else:
+            raise ValueError("user_input must contain either 'comp_id' or 'spillover'")
 
     def _commit(self) -> tuple[dict[str, Any], StepRun | None]:
         """
@@ -597,13 +725,16 @@ class CompensationRevisionHandler(BaseRevisionHandler):
     def get_channel_qc_table(self, sample_id: str, comp_id: str = "current") -> pd.DataFrame:
         """Get channel QC table for a sample under a specific compensation.
 
+        Computes QC metrics on the visualization subset and returns a table of
+        single-channel test results.
+
         Parameters
         ----------
         sample_id : str
             Sample ID
         comp_id : str
             Which compensation to apply:
-                - "current",
+                - "current" (mapped in workspace),
                 - "parent" (parent of current),
                 - "active" (compensation from sample metadata),
                 - "raw" (identity matrix)
@@ -611,30 +742,62 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         Returns
         -------
         pd.DataFrame
-            Channel QC table
+            Channel QC table with columns: channel, test_name, status, metric_name, metric_value
         """
-        raise NotImplementedError("Channel QC computation not implemented yet")
-        comp_id, comp_ref = self._resolve_compensation(sample_id, comp_id)
+        # Resolve compensation ID and determine subset size
+        comp_id_resolved, comp_ref = self._resolve_compensation(sample_id, comp_id)
+        n_subset = int(self.state.get("n_subset", 10000))
 
-        # Load compensated visualization subset
-        n_subset = int(self.state["n_subset"])
-        comp_subset = self.load_viz_data_compensated(sample_id, comp_id, n_subset)
+        # Check cache first
+        cached_df = self._get_cached_qc_tests(sample_id, comp_id_resolved, n_subset, "channel")
+        if cached_df is not None:
+            return cached_df
 
-        # Compute channel QC metrics
-        qc_df = compute_channel_qc(comp_subset)
+        # Load compensated subset
+        comp_subset = self.load_viz_data_compensated(sample_id, comp_id_resolved, n_subset)
 
-        return qc_df
+        # Get config from default
+        config = dict(CompensationQCEvaluator.default_config)  # type: ignore[attr-defined]
+
+        # Run ONLY channel tests (efficient - skips pairwise)
+        tests = run_channel_tests(comp_subset, config)
+
+        # Convert to DataFrame
+        records = []
+        for test in tests:
+            channel = test.metadata.get("channel", "?")
+            for metric_name, metric_value in test.metrics.items():
+                records.append({
+                    "channel": channel,
+                    "test_name": test.test_name,
+                    "status": test.status,
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                })
+
+        if not records:
+            df = pd.DataFrame(columns=["channel", "test_name", "status", "metric_name", "metric_value"])
+        else:
+            df = pd.DataFrame.from_records(records)
+
+        # Save to cache for next call
+        self._save_qc_tests_to_cache(df, tests, config, sample_id, comp_id_resolved, n_subset, "channel")
+
+        return df
 
     def get_channel_pair_qc_table(self, sample_id: str, comp_id: str = "current") -> pd.DataFrame:
         """Get channel pair QC table for a sample under a specific compensation.
 
+        Computes QC metrics on the visualization subset and returns a table of
+        pairwise test results. Results are cached to avoid recomputation.
+
         Parameters
         ----------
         sample_id : str
             Sample ID
         comp_id : str
             Which compensation to apply:
-                - "current",
+                - "current" (mapped in workspace),
                 - "parent" (parent of current),
                 - "active" (compensation from sample metadata),
                 - "raw" (identity matrix)
@@ -642,19 +805,50 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         Returns
         -------
         pd.DataFrame
-            Channel pair QC table
+            Channel pair QC table with columns: donor, receiver, test_name, status, metric_name, metric_value
         """
-        raise NotImplementedError("Channel pair QC computation not implemented yet")
-        comp_id, comp_ref = self._resolve_compensation(sample_id, comp_id)
+        # Resolve compensation ID and determine subset size
+        comp_id_resolved, comp_ref = self._resolve_compensation(sample_id, comp_id)
+        n_subset = int(self.state.get("n_subset", 10000))
 
-        # Load compensated visualization subset
-        n_subset = int(self.state["n_subset"])
-        comp_subset = self.load_viz_data_compensated(sample_id, comp_id, n_subset)
+        # Check cache first
+        cached_df = self._get_cached_qc_tests(sample_id, comp_id_resolved, n_subset, "pairwise")
+        if cached_df is not None:
+            return cached_df
 
-        # Compute channel pair QC metrics
-        qc_df = compute_channel_pair_qc(comp_subset)
+        # Load compensated subset
+        comp_subset = self.load_viz_data_compensated(sample_id, comp_id_resolved, n_subset)
 
-        return qc_df
+        # Get config from default
+        config = dict(CompensationQCEvaluator.default_config)  # type: ignore[attr-defined]
+
+        # Run ONLY pairwise tests (efficient - skips channel tests)
+        tests = run_pairwise_tests(comp_subset, config)
+
+        # Convert to DataFrame
+        records = []
+        for test in tests:
+            donor = test.metadata.get("donor_channel", "?")
+            receiver = test.metadata.get("receiver_channel", "?")
+            for metric_name, metric_value in test.metrics.items():
+                records.append({
+                    "donor": donor,
+                    "receiver": receiver,
+                    "test_name": test.test_name,
+                    "status": test.status,
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                })
+
+        if not records:
+            df = pd.DataFrame(columns=["donor", "receiver", "test_name", "status", "metric_name", "metric_value"])
+        else:
+            df = pd.DataFrame.from_records(records)
+
+        # Save to cache for next call
+        self._save_qc_tests_to_cache(df, tests, config, sample_id, comp_id_resolved, n_subset, "pairwise")
+
+        return df
 
 
     def get_spillover_table(self, sample_id: str, comp_id: str = "current") -> pd.DataFrame:

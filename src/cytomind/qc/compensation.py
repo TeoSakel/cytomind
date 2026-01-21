@@ -12,13 +12,13 @@ import pandas as pd
 import anndata as ad
 from scipy.stats import median_abs_deviation as mad, spearmanr, gaussian_kde
 from scipy.signal import find_peaks
-from flowutils.transforms import logicle
+from cytomind.domain.transforms import transform_registry
 
 from cytomind.qc.base import StepQCEvaluator
 from cytomind.qc import QCEvaluatorRegistry
 from cytomind.domain.pipeline import StepRun, QCRunStatus, QCFlag, QCTestRecord
 from cytomind.visualization import build_histogram1d
-from cytomind.visualization.transforms import apply_transform
+from cytomind.visualization.transforms import apply_transform, get_default_transformations
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -1116,6 +1116,250 @@ class QuantizationLatticeTest:
         raise NotImplementedError("Plotting not yet implemented for QuantizationLatticeTest.")
 
 
+# ============================================================================
+# Stateless QC Test Orchestrators (module-level functions)
+# ============================================================================
+
+def _run_single_channel_tests(x: np.ndarray, cfg: Mapping[str, Any]) -> list[QCTestRecord]:
+    """
+    Run negative-fluorescence checks for a single channel (stateless).
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Channel values
+    cfg : Mapping[str, Any]
+        Configuration dict with thresholds:
+        - neg_warn, neg_severe
+        - strong_warn, strong_severe
+        - min_neg_events_for_sigma
+
+    Returns
+    -------
+    list[QCTestRecord]
+        Computed test records
+    """
+    neg_test_obj = NegativeFluorescenceTest(
+        neg_warn=cfg["neg_warn"],
+        neg_severe=cfg["neg_severe"],
+    )
+    strong_neg_test_obj = StrongNegativeFluorescenceTest(
+        min_neg_events_for_sigma=cfg["min_neg_events_for_sigma"],
+        strong_k=cfg.get("strong_k", 4.0),
+        strong_warn=cfg["strong_warn"],
+        strong_severe=cfg["strong_severe"],
+    )
+    return [
+        neg_test_obj.fit_classify(x),
+        strong_neg_test_obj.fit_classify(x),
+    ]
+
+
+def _run_channel_pair_tests(
+    x_donor: np.ndarray,
+    x_recv: np.ndarray,
+    cfg: Mapping[str, Any],
+) -> list[QCTestRecord]:
+    """
+    Run pairwise donor->receiver checks (stateless).
+
+    Parameters
+    ----------
+    x_donor : np.ndarray
+        Raw donor channel values
+    x_donor_trans : np.ndarray
+        Logicle-transformed donor values
+    x_recv : np.ndarray
+        Raw receiver channel values
+    x_recv_trans : np.ndarray
+        Logicle-transformed receiver values
+    cfg : Mapping[str, Any]
+        Configuration dict with thresholds:
+        - high_quantile, min_high_events
+        - tail_neg_warn, tail_neg_severe
+        - tail_cor_warn, tail_cor_severe
+        - (optional) banding_*, lattice_* for disabled tests
+
+    Returns
+    -------
+    list[QCTestRecord]
+        Computed test records
+    """
+    neg_enrich_test = NegativeEnrichmentTest(
+        high_quantile=cfg.get("high_quantile", 0.90),
+        min_high_events=cfg.get("min_high_events", 200),
+        neg_warn=cfg.get("tail_neg_warn", 0.20),
+        neg_severe=cfg.get("tail_neg_severe", 0.40),
+    )
+    neg_enrich = neg_enrich_test.fit_classify(x_donor, x_recv)
+
+    corr_test = HighDonorCorrelationTest(
+        high_quantile=cfg.get("high_quantile", 0.90),
+        min_high_events=cfg.get("min_high_events", 200),
+        cor_warn=cfg.get("tail_cor_warn", 0.50),
+        cor_severe=cfg.get("tail_cor_severe", 0.80),
+    )
+    corr = corr_test.fit_classify(x_donor, x_recv)
+
+    return [neg_enrich, corr]
+
+
+def run_channel_tests(
+    adata: ad.AnnData,
+    config: Mapping[str, Any],
+) -> list[QCTestRecord]:
+    """
+    Run channel-level QC tests on compensated AnnData (stateless).
+
+    Parameters
+    ----------
+    adata : ad.AnnData
+        Compensated data to analyze
+    config : Mapping[str, Any]
+        Configuration dict with QC thresholds
+
+    Returns
+    -------
+    list[QCTestRecord]
+        Channel-level test records with metadata["channel"] populated
+    """
+    if adata.n_obs == 0 or adata.X is None:
+        return []
+
+    all_tests: list[QCTestRecord] = []
+    cfg = config
+
+    # Get fluorescence channels
+    fluoro_idx = np.where(adata.var["type"] == "fluorescence")[0]
+    if len(fluoro_idx) == 0:
+        raise ValueError("No fluorescence channels found in adata.var['type']")
+
+    fluoro_labels = adata.var.index[fluoro_idx].tolist()
+
+    # Single-channel tests
+    for j, name in zip(fluoro_idx, fluoro_labels):
+        x_col = np.asarray(adata.X[:, j]).ravel()
+        tests = _run_single_channel_tests(x_col, cfg)
+        for test in tests:
+            test.metadata["channel"] = name
+            all_tests.append(test)
+
+    return all_tests
+
+
+def run_pairwise_tests(
+    adata: ad.AnnData,
+    config: Mapping[str, Any],
+) -> list[QCTestRecord]:
+    """
+    Run pairwise QC tests on compensated AnnData (stateless).
+
+    Parameters
+    ----------
+    adata : ad.AnnData
+        Compensated data to analyze
+    config : Mapping[str, Any]
+        Configuration dict with QC thresholds
+
+    Returns
+    -------
+    list[QCTestRecord]
+        Pairwise test records with metadata["donor_channel"] and
+        metadata["receiver_channel"] populated
+    """
+    if adata.n_obs == 0 or adata.X is None:
+        return []
+
+    all_tests: list[QCTestRecord] = []
+    cfg = config
+
+    # Get fluorescence channels
+    fluoro_idx = np.where(adata.var["type"] == "fluorescence")[0]
+    if len(fluoro_idx) == 0:
+        raise ValueError("No fluorescence channels found in adata.var['type']")
+
+    fluoro_labels = adata.var.index[fluoro_idx].tolist()
+
+    # Pairwise tests
+    X_dense = np.asarray(adata.X)
+    # transform_name = cfg.get("transform_func", "logicle")
+    # transform_ref = get_default_transformations().get(transform_name)
+    # if transform_ref is None:
+    #     raise ValueError(f"Unknown transform function: {transform_name}")
+    # transform = transform_registry[transform_name](**transform_ref.params)
+    # Xtrans = transform.apply(X_dense)
+    # clip_quantile = cfg.get("clip_quantile", 0.01)
+    # if clip_quantile > 0:
+    #     x_lo, x_hi = np.quantile(Xtrans, [clip_quantile, 1.0 - clip_quantile], axis=0)
+    #     np.clip(Xtrans, x_lo, x_hi, out=Xtrans)
+
+    for i, donor_name in zip(fluoro_idx, fluoro_labels):
+        for j, recv_name in zip(fluoro_idx, fluoro_labels):
+            if i == j:
+                continue
+            x_donor = np.asarray(X_dense[:, i]).ravel()
+            x_recv = np.asarray(X_dense[:, j]).ravel()
+
+            tests = _run_channel_pair_tests(
+                x_donor=x_donor,
+                x_recv=x_recv,
+                cfg=cfg,
+            )
+
+            for test in tests:
+                test.metadata["donor_channel"] = donor_name
+                test.metadata["receiver_channel"] = recv_name
+                all_tests.append(test)
+
+    return all_tests
+
+
+def run_compensation_tests(
+    adata: ad.AnnData,
+    config: Mapping[str, Any],
+) -> list[QCTestRecord]:
+    """
+    Run all QC tests on compensated AnnData without StepQCEvaluator dependency.
+
+    This stateless function computes all channel and pairwise QC tests on the
+    provided AnnData object. It's designed for reuse by both the main QC evaluator
+    and revision handlers that need QC analysis on visualization subsets.
+
+    Parameters
+    ----------
+    adata : ad.AnnData
+        Compensated data to analyze (can be full sample or subset)
+    config : Mapping[str, Any]
+        Configuration dict with QC thresholds. See CompensationQCEvaluator.default_config
+        for all available parameters.
+
+    Returns
+    -------
+    list[QCTestRecord]
+        All test records (channel-level and pairwise). Records have:
+        - test_type: "compensation_channel" or "compensation_pair"
+        - test_name: identifier for the test
+        - status: "PASS", "WARN", "FAIL", or "SKIP"
+        - metadata: empty dict (caller should populate with sample_id, comp_id, etc.)
+        - metrics: computed values
+        - thresholds: applied threshold tuples
+
+    Notes
+    -----
+    - Caller is responsible for adding sample_id, comp_id, and channel names to
+      test.metadata after this function returns.
+    - Does not modify adata or config in-place.
+    - Raises ValueError if adata has no fluorescence channels.
+    """
+    all_tests = run_channel_tests(adata, config)
+
+    # Only run pairwise tests if enabled
+    if config.get("compute_pairwise", True):
+        all_tests.extend(run_pairwise_tests(adata, config))
+
+    return all_tests
+
+
 @QCEvaluatorRegistry.register("compensate")
 class CompensationQCEvaluator(StepQCEvaluator):
     """QC evaluator for compensation step runs."""
@@ -1144,6 +1388,7 @@ class CompensationQCEvaluator(StepQCEvaluator):
         "lattice_x_bins": 64,
         "lattice_min_points_per_bin": 300,
         "lattice_jump_k": 4.0,
+        "transform_func": "logicle",
     }
 
     def __init__(self, config: Mapping[str, Any] | None = None):
@@ -1381,6 +1626,9 @@ class CompensationQCEvaluator(StepQCEvaluator):
     ) -> dict[str, list[QCTestRecord]]:
         """Run channel and pairwise QC on compensated data.
 
+        Uses the stateless run_compensation_tests() function internally,
+        then aggregates results into QCRunStatus for step-level tracking.
+
         Returns dict with all tests (channel and pairwise).
         """
         all_tests = {"channel": [], "pairwise": []}
@@ -1391,129 +1639,39 @@ class CompensationQCEvaluator(StepQCEvaluator):
             step.add_reason(code="NO_EVENTS", message="No events selected for compensation QC.")
             return all_tests
 
-        cfg = self.config
+        # Call stateless function to get all test results
+        tests = run_compensation_tests(adata, self.config)
+
         step = qc.get_step("COMP_QC_OVERVIEW")
 
-        fluoro_idx = np.where(adata.var["type"] == "fluorescence")[0]
-        fluoro_labels = adata.var.index[fluoro_idx].tolist()
-        # Single-channel tests
-        for j, name in zip(fluoro_idx, fluoro_labels):
-            x_col = np.asarray(adata.X[:, j]).ravel()
-            tests = self._check_single_channel(x_col, cfg)
-            for test in tests:
-                # Store all tests with metadata
-                test.metadata["channel"] = name
-                test.metadata["sample_id"] = sample_id
-                test.metadata["compensation"] = comp_id
+        # Separate into channel and pairwise, add context metadata
+        for test in tests:
+            test.metadata["sample_id"] = sample_id
+            test.metadata["compensation"] = comp_id
+
+            if test.test_type == "compensation_channel":
                 all_tests["channel"].append(test)
+            else:  # compensation_pair
+                all_tests["pairwise"].append(test)
 
-                # Only add to QC report if WARN or SEVERE
-                if test.status in {"SEVERE", "WARN"}:
-                    step.flag = QCFlag.WARN
-                    step.add_reason(
-                        code=f"COMP_CHANNEL_{name}_{test.test_name}_{test.status}",
-                        message=f"Channel {name} failed: {test.test_name}",
-                        test=test,
-                    )
-
-        if not cfg.get("compute_pairwise", True):
-            return all_tests
-
-        # Pairwise tests
-        X_dense = np.asarray(adata.X)
-        Xtrans = logicle(X_dense, channel_indices=fluoro_idx)
-        clip_quantile = cfg.get("clip_quantile", 0.01)
-        if clip_quantile > 0:
-            x_lo, x_hi = np.quantile(Xtrans, [clip_quantile, 1.0 - clip_quantile], axis=0)
-            np.clip(Xtrans, x_lo, x_hi, out=Xtrans)
-
-        for i, donor_name in zip(fluoro_idx, fluoro_labels):
-            for j, recv_name in zip(fluoro_idx, fluoro_labels):
-                if i == j:
-                    continue
-                x_donor = np.asarray(X_dense[:, i]).ravel()
-                x_recv = np.asarray(X_dense[:, j]).ravel()
-
-                tests = self._check_channel_pair(
-                    x_donor=x_donor,
-                    x_donor_trans=Xtrans[:, i],
-                    x_recv=x_recv,
-                    x_recv_trans=Xtrans[:, j],
-                    cfg=cfg,
+            # Only add to QC report if WARN or SEVERE
+            if test.status in {"SEVERE", "WARN"}:
+                step.flag = QCFlag.WARN
+                channel_info = test.metadata.get("channel", "?")
+                pair_info = (
+                    f"{test.metadata.get('donor_channel', '?')}"
+                    f" -> {test.metadata.get('receiver_channel', '?')}"
+                    if test.test_type == "compensation_pair"
+                    else channel_info
                 )
-
-                for test in tests:
-                    # Store all tests with metadata
-                    test.metadata["sample_id"] = sample_id
-                    test.metadata["compensation"] = comp_id
-                    test.metadata["donor_channel"] = donor_name
-                    test.metadata["receiver_channel"] = recv_name
-                    all_tests["pairwise"].append(test)
+                step.add_reason(
+                    code=f"COMP_{test.test_type.upper()}_{pair_info}_{test.test_name}_{test.status}",
+                    message=f"{'Channel' if test.test_type == 'compensation_channel' else 'Pair'} {pair_info}: {test.test_name}",
+                    test=test,
+                )
 
         return all_tests
 
-    @staticmethod
-    def _check_single_channel(x: np.ndarray, cfg: Mapping[str, Any]) -> list[QCTestRecord]:
-        """Run negative-fluorescence checks for a single channel."""
-        neg_test_obj = NegativeFluorescenceTest(
-            neg_warn=cfg["neg_warn"],
-            neg_severe=cfg["neg_severe"],
-        )
-        strong_neg_test_obj = StrongNegativeFluorescenceTest(
-            min_neg_events_for_sigma=cfg["min_neg_events_for_sigma"],
-            strong_k=cfg.get("strong_k", 4.0),
-            strong_warn=cfg["strong_warn"],
-            strong_severe=cfg["strong_severe"],
-        )
-        return [
-            neg_test_obj.fit_classify(x),
-            strong_neg_test_obj.fit_classify(x),
-        ]
-
-    @staticmethod
-    def _check_channel_pair(
-        x_donor: np.ndarray,
-        x_donor_trans: np.ndarray,
-        x_recv: np.ndarray,
-        x_recv_trans: np.ndarray,
-        cfg: Mapping[str, Any],
-    ) -> list[QCTestRecord]:
-        """Run pairwise donor->receiver checks."""
-        neg_enrich_test = NegativeEnrichmentTest(
-            high_quantile=cfg.get("high_quantile", 0.90),
-            min_high_events=cfg.get("min_high_events", 200),
-            neg_warn=cfg.get("tail_neg_warn", 0.20),
-            neg_severe=cfg.get("tail_neg_severe", 0.40),
-        )
-        neg_enrich = neg_enrich_test.fit_classify(x_donor, x_recv)
-
-        corr_test = HighDonorCorrelationTest(
-            high_quantile=cfg.get("high_quantile", 0.90),
-            min_high_events=cfg.get("min_high_events", 200),
-            cor_warn=cfg.get("tail_cor_warn", 0.50),
-            cor_severe=cfg.get("tail_cor_severe", 0.80),
-        )
-        corr = corr_test.fit_classify(x_donor, x_recv)
-
-        # band_test = ResidualBandingTest(
-        #     nbins=cfg.get("banding_bins", 256),
-        #     prominence=cfg.get("banding_prominence", 0.05),
-        #     warn_threshold=cfg.get("banding_warn", 3),
-        #     severe_threshold=cfg.get("banding_severe", 5),
-        # )
-        # banding = band_test.fit_classify(x_donor_trans, x_recv_trans)
-
-        # lat_test = QuantizationLatticeTest(
-        #     x_bins=cfg.get("lattice_x_bins", 64),
-        #     min_points_per_bin=cfg.get("lattice_min_points_per_bin", 300),
-        #     jump_k=cfg.get("lattice_jump_k", 4.0),
-        #     warn_threshold=cfg.get("lattice_warn", 5),
-        #     severe_threshold=cfg.get("lattice_severe", 7),
-        # )
-        # lattice = lat_test.fit_classify(x_donor_trans, x_recv_trans)
-
-        # return [neg_enrich, corr, banding, lattice]
-        return [neg_enrich, corr]
 
     def _save_channel_plot(
         self,

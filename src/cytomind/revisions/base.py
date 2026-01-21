@@ -302,22 +302,19 @@ class BaseRevisionHandler(ABC):
     def apply_revision(
         self,
         user_input: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> None:
         """
-        Apply revision modifications and return updated QC summary.
+        Apply revision modifications and track in history.
+
+        Records the applied changes in the session's revision history
+        for reproducibility and debugging.
 
         Parameters
         ----------
         user_input : dict
             User-specified modifications
-
-        Returns
-        -------
-        dict
-            Updated QC summary for the revised state
         """
         self.session.updated_at = now_iso()
-        return {}
 
     @abstractmethod
     def _commit(self) -> tuple[dict[str, Any], StepRun | None]:
