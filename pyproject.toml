@@ -1,0 +1,35 @@
+[project]
+name = "cytomind"
+version = "0.1.0"
+description = "CytoMind App Backend"
+authors = [
+    {name = "Teo Sakel",email = "teo.sakel@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "flowkit (>=1.3.0,<2.0.0)",
+    "scanpy (>=1.11.5,<2.0.0)",
+    "plotly (>=6.5.2,<7.0.0)"
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter>=1.0.0"
+]
+
+[tool.poetry]
+packages = [{include = "cytomind", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "jupyter (>=1.1.1,<2.0.0)",
+]
+test = [
+    "pytest (>=9.0.2,<10.0.0)",
+    "mypy (>=1.19.1,<2.0.0)"
+]
