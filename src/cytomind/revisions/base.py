@@ -434,17 +434,20 @@ class BaseRevisionHandler(ABC):
         self.state["seed"] = input_spec.pop("seed", self.state.get("seed", 42))
 
         # Validate target samples
-        original_samples: list[str] = self.step_run.inputs.get("sample_ids", [])
-        self.session.target_samples = input_spec.pop("sample_ids", original_samples)
-        original_samples_set = set(original_samples)
+        sample_flags: dict[str, str] = self.step_run.qc_summary["basic_summary"]["per_sample_flags"]
+        processed_samples = [sid for sid, flag in sample_flags.items() if flag != "FAIL"]
+        self.session.target_samples = input_spec.pop("sample_ids", []) or processed_samples
         for sid in self.session.target_samples:
-            if sid not in original_samples_set:
+            if sid not in sample_flags:
                 raise ValueError(f"Sample {sid} not in original step inputs.")
+            elif sample_flags[sid] == "FAIL":
+                raise ValueError(f"Sample {sid} was not processed successfully in the original step.")
 
         self.session.input_spec = input_spec
         now = now_iso()
         self.session.created_at = now
         self.session.updated_at = now
+        self.save_session()
         return self.session
 
     def cleanup_workspace(self) -> None:

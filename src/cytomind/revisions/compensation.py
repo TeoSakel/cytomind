@@ -297,8 +297,8 @@ class CompensationRevisionHandler(BaseRevisionHandler):
                 raise ValueError(f"Sample {sid} not found in project")
             samples[sid] = {
                 "n_events": sample.n_events,
-                "active_compensation": sample.compensation,
-                "compensation": sample.compensation,
+                "active_compensation": sample.compensation or "raw",
+                "compensation": sample.compensation or "raw",
             }
 
         # Copy compensation matrices from main repo
@@ -306,7 +306,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         compensations = {}
         for sid in self.session.target_samples:
             sample = project.samples[sid]
-            comp_id = sample.compensation if sample.compensation else "raw"
+            comp_id = sample.compensation or "raw"
 
             # Skip raw / identity
             if comp_id == "raw":
@@ -321,15 +321,11 @@ class CompensationRevisionHandler(BaseRevisionHandler):
                     "id": comp_id,
                     "name": comp_ref.name,
                     "source": comp_ref.source,
-                    "path": str(comp_path),
+                    "path": comp_path.as_posix(),
                     "parent": None,  # Default compensations have no parent
                     "is_default": True,
                     "batch": comp_ref.batch.copy(),
                 }
-
-            # Record that this sample uses the compensation
-            if sid not in compensations[comp_id].setdefault("samples", []):
-                compensations[comp_id]["samples"].append(sid)
 
         # Initialize handler state
         self.state.update({
@@ -381,11 +377,8 @@ class CompensationRevisionHandler(BaseRevisionHandler):
 
         # Case 1: Existing or trivial compensation
         if "comp_id" in user_input and "spillover" not in user_input:
-            comp_id = user_input.get("comp_id")
-            if comp_id is None:
-                comp_id = "raw"
-
-            if comp_id != "raw" and comp_id not in self.compensations:
+            comp_id = user_input["comp_id"]
+            if comp_id is not None and comp_id not in self.compensations:
                 raise ValueError(f"Compensation {comp_id} not found in workspace")
 
             for sid in target_samples:
@@ -564,12 +557,11 @@ class CompensationRevisionHandler(BaseRevisionHandler):
 
     def get_comp_ref(self, comp_id: str) -> CompensationRef:
         """Load compensation from workspace (not main repo)."""
-        if comp_id == "raw":
-            return self._get_identity_compensation()
-
         try:
             comp_info = self.state["compensations"][comp_id]
         except KeyError:
+            if comp_id == "raw":
+                return self._get_identity_compensation()
             raise KeyError(f"Compensation {comp_id} not found in workspace")
 
         spill_df = pd.read_csv(comp_info["path"], index_col=False)
@@ -578,6 +570,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             id=comp_info["id"],
             name=comp_info["name"],
             source=comp_info["source"],
+            batch=comp_info["batch"],
             _spill=spill_df,
         )
 
@@ -625,7 +618,6 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         if comp_id and comp_id in self.compensations:
             comp_info = self.compensations[comp_id]
             comp_path = Path(comp_info["path"])
-            comp_info.setdefault("batch", [])
             if sample_id not in comp_info["batch"]:
                 comp_info["batch"].append(sample_id)
         else:
@@ -704,12 +696,28 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             columns=fluoro_channels
         )
 
-        return CompensationRef(
-            id="identity",
+        comp_ref = CompensationRef(
+            id="raw",
             name="Raw (Identity)",
             source="identity",
+            batch=[sid for sid, sinfo in self.samples.items() if sinfo["compensation"] == "raw"],
             _spill=identity_matrix,
         )
+
+        comp_path = self.comp_dir / "identity.csv"
+        comp_ref.spill.to_csv(comp_path, index=False)
+        self.compensations["raw"] = {
+            "id": comp_ref.id,
+            "name": comp_ref.name,
+            "source": comp_ref.source,
+            "path": comp_path.as_posix(),
+            "parent": None,  # Default compensations have no parent
+            "is_default": False,
+            "batch": comp_ref.batch.copy(),
+        }
+
+        self.save_session()
+        return comp_ref
 
     # --- Table implementations ----
 
