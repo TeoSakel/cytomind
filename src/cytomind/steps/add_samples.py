@@ -91,9 +91,10 @@ class AddSamplesStep(BaseStep):
             return {}, qc
         if meta["datatype"] not in {"F", "D", "I", "A"}:
             step_meta.flag = QCFlag.WARN
+            fcs_dtype = fcs.metadata.get("datatype")
             step_meta.add_reason(
                 code="UNKNOWN_DATATYPE",
-                message=(f"Unknown datatype '{fcs.metadata.get("datatype")}' in FCS file {fcs_path}.",
+                message=(f"Unknown datatype '{fcs_dtype}' in FCS file {fcs_path}.",
                          "Expected one of F, D, I, A")
             )
 
@@ -201,7 +202,7 @@ class AddSamplesStep(BaseStep):
             step_get_outputs.add_reason(
                 code="SAMPLE_OUTPUTS_MISSING",
                 message=(f"Some samples in batch {batch_id} are missing outputs",
-                            f"from step run: {missing_samples}.")
+                         f"from step run: {missing_samples}.")
             )
             return {}, qc
 
@@ -279,8 +280,8 @@ class AddSamplesStep(BaseStep):
                             sample_step.add_reason(
                                 code="NON_PRIMARY_PANEL",
                                 message=(f"Sample has non-primary panel (group {ph[:8]}). "
-                                        f"Primary panel group is {primary_panel_hash[:8]}. "
-                                        "Panel harmonization may be needed."))
+                                         f"Primary panel group is {primary_panel_hash[:8]}. "
+                                         "Panel harmonization may be needed."))
         else:
             # Single panel group: use it as the canonical project panel
             panel_hash = next(iter(panel_groups.keys()))
