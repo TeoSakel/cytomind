@@ -53,7 +53,7 @@ class AddSamplesRevisionHandler(BaseRevisionHandler):
             Initialized session
         """
         session = super().start_revision(input_spec)
-        self.state["step_output"] = self.step_run.outputs.get("summary", {})
+        self.state["step_output"] = self.step_run.batch_outputs.get("summary", {})
         self.save_session()
 
         return session

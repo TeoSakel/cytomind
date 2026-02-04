@@ -1631,7 +1631,7 @@ class CompensationQCEvaluator(StepQCEvaluator):
 
         Returns dict with all tests (channel and pairwise).
         """
-        all_tests = {"channel": [], "pairwise": []}
+        all_tests: dict[str, list[QCTestRecord]] = {"channel": [], "pairwise": []}
 
         if adata.n_obs == 0 or adata.X is None:
             step = qc.get_step("comp_qc_no_events")

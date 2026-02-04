@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any
+from typing import Any, Mapping
 from pathlib import Path
 
 import hashlib
@@ -13,7 +13,7 @@ from .base import BaseStep
 from . import register_step
 
 PathLike = Path | str
-
+__all__ = ["AddSamplesStep"]
 
 @register_step("add_samples")
 class AddSamplesStep(BaseStep):
@@ -23,11 +23,7 @@ class AddSamplesStep(BaseStep):
     Aggregation builds the deduplicated panel and compensation catalog.
     """
 
-    def run_sample(
-        self,
-        sample_id: str,
-        step_run: StepRun,
-    ) -> tuple[dict, QCRunStatus]:
+    def run_sample(self, sample_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
 
         qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
         try:
@@ -54,7 +50,7 @@ class AddSamplesStep(BaseStep):
         step_load = qc.get_step("parse_fcs")
         fcs_path = sample.fcs_path.as_posix()  # for error messages
         try:
-            fcs = fk.Sample(fcs_path)
+            fcs = fk.Sample(fcs_path)  # TODO: load only metadata not events
         except Exception as e:
             step_load.flag = QCFlag.FAIL
             step_load.add_reason(code="FCS_PARSE_ERROR",
@@ -181,22 +177,19 @@ class AddSamplesStep(BaseStep):
         }
         return output_info, qc
 
-    def run_batch(self, batch_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
         """
-        Aggregate outputs: deduplicate panel and compensations across samples.
-        Group samples into batches based on identical panel structures and compensations.
+        Finalize batch by aggregating per-sample outputs.
+
+        Deduplicates panel and compensations across samples, groups samples by panel,
+        and populates project_updates with the aggregated data.
         """
-        qc = QCRunStatus(sample_id=batch_id, step_run_id=step_run.id)
 
         # Check batch existence
         step_get_outputs = qc.get_step("gather_sample_outputs")
-        batch = self.project.batches.get(batch_id)
-        if batch is None:
-            step_get_outputs.flag = QCFlag.FAIL
-            step_get_outputs.add_reason("BATCH_NOT_FOUND", f"Batch {batch_id} not found in project.")
-            return {}, qc
+        batch = self.project.batches[batch_id]
 
-        missing_samples = [sid for sid in batch if sid not in step_run.outputs]
+        missing_samples = [sid for sid in batch if sid not in step_run.sample_outputs]
         if missing_samples:
             step_get_outputs.flag = QCFlag.FAIL
             step_get_outputs.add_reason(
@@ -208,7 +201,7 @@ class AddSamplesStep(BaseStep):
 
         # 1) Gather sample outputs
         outputs = {
-            sid: step_run.outputs[sid] for sid in batch
+            sid: step_run.sample_outputs[sid] for sid in batch
             if step_run.per_sample_qc[sid].overall_flag == QCFlag.PASS
         }
 
@@ -342,8 +335,8 @@ class AddSamplesStep(BaseStep):
         # 5) Create batches
         step_create_batches = qc.get_step("create_batches")
         batches = {
-            "panel": BatchRef(
-                id="panel",
+            "__panel__": BatchRef(
+                id="__panel__",
                 sample_ids=sample_ids,
                 tags=["panel_group"],
                 meta={"panel_hash": panel_hash},
@@ -406,44 +399,40 @@ class AddSamplesStep(BaseStep):
             step_build_dims.add_reason(code="INFO",
                                        message=f"Built {len(comp_dimensions)} comp dimensions (samples already compensated).")
 
-        # Return "raw" types for project update
-        output_info = {
+        # Append project updates for this batch
+        step_run.project_updates.append({
             "panel": panel,
             "compensations": compensations,  # must be CompensationRef to keep _spill
             "samples": samples,
             "batches": batches,
             "dimensions": dimensions,
-            "panel_groups_info": panel_groups_info,
-        }
+        })
 
+        for sid in samples:
+            out = step_run.sample_outputs.pop(sid)
+            if step_run.per_sample_qc[sid].overall_flag != QCFlag.PASS:
+                step_run.sample_outputs[sid] = out["sample_meta"]
+
+
+        # Store panel_groups_info in batch_outputs for revision handler
+        output_info = {"panel_groups_info": panel_groups_info}
         return output_info, qc
 
-    def update_project(self, step_run: StepRun) -> StepRun:
-        """Write aggregated registries to project."""
-        # batch_ids = step_run.inputs.get("batch_ids", [])
-        # if len(batch_ids) != 1:
-        #     raise ValueError("add_samples expects exactly one batch_id (with all samples) in inputs.")
-        # batch_id = batch_ids[0]
-        batch_id = "summary"
-        agg = step_run.outputs[batch_id]
-        self.repo.update_project_metadata(
-            samples=agg.get("samples", {}),
-            panel=agg.get("panel", []),
-            compensations=agg.get("compensations", []),
-            batches=agg.get("batches", {}),
-            dimensions=agg.get("dimensions", {}),
-        )
+    def merge_config(self, step_run: StepRun) -> dict:
+        batch_ids = step_run.inputs.get("batch_ids", [])
+        if not batch_ids:
+            raise ValueError("AddSampleStep requires a single batch_id as input.")
+        if len(batch_ids) > 1:
+            raise ValueError("AddSampleStep cannot merge multiple batch_ids; expected only one.")
+        sample_ids = step_run.inputs.get("sample_ids", [])
+        if sample_ids:
+            raise ValueError("AddSampleStep does not support sample_ids input for merging; expected none.")
 
-        # Clean up step for storage
-        for sid in agg.get("samples", {}):
-            step_run.outputs[sid] = {}  # clear outputs after aggregation (all written to project/batches)
-        step_run.outputs[batch_id]["compensations"] = [comp.to_dict() for comp in agg.get("compensations", [])]
-        return step_run
-
+        return super().merge_config(step_run)
 
 # ---- Helper functions (module-level) ----
 
-def parse_channel_json_filtered(data: dict) -> dict[str, dict]:
+def parse_channel_json_filtered(data: Mapping[str, Any]) -> dict[str, dict]:
     """
     Parse a channel JSON dictionary and extract drop/rename information for each FCS file.
 
@@ -531,7 +520,7 @@ def _compute_panel_hash(panel: list[ChannelRef]) -> str:
     return hashlib.md5(panel_str.encode("utf-8")).hexdigest()[:16]
 
 
-def _iter_comp_records_from_metadata(text: dict[str, str]):
+def _iter_comp_records_from_metadata(text: Mapping[str, str]):
     if "infcyt" in text:
         src = text.get("infinispill_src", "").strip()
         if src:
@@ -552,7 +541,7 @@ def _make_compensation_id(comp_key: str, comp_value: str) -> str:
     return f"comp_{h}"
 
 
-def _get_instrument(text: dict[str, str]) -> str | None:
+def _get_instrument(text: Mapping[str, str]) -> str | None:
     for key in ("cyt", "cytsn", "inst"):
         val = text.get(key)
         if val:
@@ -560,7 +549,7 @@ def _get_instrument(text: dict[str, str]) -> str | None:
     return None
 
 
-def _parse_infcyt_fields(text: dict[str, str]) -> dict:
+def _parse_infcyt_fields(text: Mapping[str, str]) -> dict:
     if "infcyt" not in text:
         return {}
     return {
@@ -570,7 +559,7 @@ def _parse_infcyt_fields(text: dict[str, str]) -> dict:
     }
 
 
-def _parse_acquired_at(text: dict[str, str]) -> str | None:
+def _parse_acquired_at(text: Mapping[str, str]) -> str | None:
     date_str = text.get("date")
     time_str = text.get("btim") or text.get("etim")
     if not date_str:
@@ -600,7 +589,7 @@ def _parse_acquired_at(text: dict[str, str]) -> str | None:
     return datetime(parsed_date.year, parsed_date.month, parsed_date.day).isoformat()
 
 
-def _extract_panel_from_fcs(fcs: fk.Sample, rename_info: dict[str, dict[str, str]] = {}) -> list[ChannelRef]:
+def _extract_panel_from_fcs(fcs: fk.Sample, rename_info: Mapping[str, Mapping[str, str]] = {}) -> list[ChannelRef]:
     """
     Extract panel from FCS file and optionally apply channel/marker renames.
 
@@ -608,7 +597,7 @@ def _extract_panel_from_fcs(fcs: fk.Sample, rename_info: dict[str, dict[str, str
     ----------
     fcs : fk.Sample
         FlowKit Sample object
-    rename_info : dict[str, dict[str, str]]
+    rename_info : Mapping[str, Mapping[str, str]]
         Optional rename mappings with structure {"channel": {old: new}, "marker": {old: new}}
 
     Returns

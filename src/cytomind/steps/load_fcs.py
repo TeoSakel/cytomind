@@ -92,6 +92,6 @@ class LoadFCS(BaseStep):
             for sid, qc in step_run.per_sample_qc.items() if qc.overall_flag != QCFlag.FAIL
         }
         for sid, ref in samples.items():
-            ref.n_events = step_run.outputs[sid].get("n_events", 0)
+            ref.n_events = step_run.sample_outputs[sid].get("n_events", 0)
         self.repo.update_project_metadata(samples=samples)
         return step_run

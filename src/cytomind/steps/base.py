@@ -38,63 +38,149 @@ class BaseStep:
         self.config = dict(self.default_config)
         self.project = self.repo.load_project()
 
-    # --- default run: loops over samples (optionally parallel) -----
+    # --- default run: three-phase execution per batch -----
 
     def run(self, step_run: StepRun) -> StepRun:
-        """Main Function that must be called from Pipeline orchestrator
+        """Main orchestrator using three-phase execution model.
 
-        First loops over samples and calls `run_sample` for each sample.
-        Then calls `run_all_samples` to produce overall outputs.
-        Finally summarizes QC information generated from all previous steps
-        using `summarize_qc` and and updates project state using `update_project`.
+        For each batch:
+        1. prepare_batch() - set up batch-level context (priors, thresholds, etc.)
+        2. run_sample() - process each sample using batch context
+        3. finalize_batch() - aggregate per-sample results and populate project_updates
+
+        Then:
+        4. Summarize QC from all phases
+        5. Apply accumulated project_updates to project via update_project()
+        6. Track project updates
+
+        Sample filtering:
+        - If step_run.inputs["sample_ids"] is provided, only those samples are processed
+        - This allows partial reruns within a batch or sample-only processing
+        - If no batch_ids but sample_ids are specified, samples are processed directly
+          without prepare_batch/finalize_batch phases
+
+        This enables patterns like:
+        - prepare_batch computes global thresholds, run_sample applies them
+        - finalize_batch aggregates per-sample results for batch-level summaries
+        - project_updates defers all persistence until full batch aggregation is visible
 
         Args:
-            step_run (StepRun): contains the information necessary to
-            run the step.
+            step_run (StepRun): execution context (mutable, shared across phases)
 
         Returns:
-            StepRun: updated step run with outputs and QC information
+            StepRun: updated with outputs, QC, project_updates, and status
         """
-
-        sample_ids = step_run.inputs.get("sample_ids", [])
-        per_sample_qc: dict[str, QCRunStatus] = {}
-
         step_run.config = self.merge_config(step_run)
-        # TODO: here you can plug in multiprocessing/threading if you want
-        for sample_id in sample_ids:
-            try:
-                output_info, qc = self.run_sample(sample_id, step_run)
-            except Exception as exc:
-                # on error, produce empty output and a failing QC with message
-                output_info = {}
-                qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
-                step = qc.get_step(self.__class__.__name__)
-                step.flag = QCFlag.FAIL
-                step.add_reason("RUN_TIME_ERROR", str(exc))
-
-            step_run.outputs[sample_id] = output_info
-            step_run.per_sample_qc[sample_id] = qc
-
-        # Run step at batch level if needed
         batch_ids = step_run.inputs.get("batch_ids", [])
+        input_sample_ids = step_run.inputs.get("sample_ids", [])  # Optional filter
+
+        # Execute batches with three-phase model
         for batch_id in batch_ids:
+
+            # Phase 1: Prepare batch context
             try:
-                output_info, qc = self.run_batch(batch_id, step_run)
+                output_info, batch_qc = self.prepare_batch(batch_id, step_run)
             except Exception as exc:
                 output_info = {}
-                qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
-                step = qc.get_step(self.__class__.__name__)
+                batch_qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
+                step = batch_qc.get_step(self.__class__.__name__)
                 step.flag = QCFlag.FAIL
-                step.add_reason("RUN_TIME_ERROR", str(exc))
+                step.add_reason("PREPARE_BATCH_RUNTIME_ERROR", str(exc))
+                step_run.batch_outputs[batch_id] = output_info
+                step_run.qc_summary[batch_id] = batch_qc
 
-            step_run.outputs[qc.sample_id] = output_info
-            step_run.per_sample_qc[qc.sample_id] = qc
+            step_run.batch_outputs[batch_id] = output_info
+            step_run.qc_summary[batch_id] = batch_qc
+            if batch_qc.overall_flag == QCFlag.FAIL:
+                # Skip processing samples in this batch if preparation failed
+                continue
 
-        step_run.qc_summary = self.summarize_qc(per_sample_qc)
+            # Phase 2: Process each sample in batch
+            batch = self.project.batches[batch_id]  # prepare_batch ensures batch exists
+            # Determine which samples to process: use input filter if provided
+            if input_sample_ids:
+                samples_to_process = [sid for sid in input_sample_ids if sid in set(batch.sample_ids)]
+            else:
+                samples_to_process = batch.sample_ids
+
+            for sample_id in samples_to_process:
+                try:
+                    output_info, qc = self.run_sample(sample_id, step_run)
+                except Exception as exc:
+                    output_info = {}
+                    qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+                    step = qc.get_step(self.__class__.__name__)
+                    step.flag = QCFlag.FAIL
+                    step.add_reason("RUN_SAMPLE_RUNTIME_ERROR", str(exc))
+                step_run.sample_outputs[sample_id] = output_info
+                step_run.per_sample_qc[sample_id] = qc
+
+            # Phase 3: Finalize batch (aggregate per-sample results)
+            try:
+                # Reuse the same QCRunStatus from prepare_batch to persist steps
+                output_info, batch_qc = self.finalize_batch(batch_id, step_run, batch_qc)
+            except Exception as exc:
+                output_info = {}
+                step = batch_qc.get_step(self.__class__.__name__)
+                step.flag = QCFlag.FAIL
+                step.add_reason("FINALIZE_BATCH_RUNTIME_ERROR", str(exc))
+
+            step_run.batch_outputs[batch_id] = output_info
+            step_run.qc_summary[batch_id] = batch_qc
+
+        # If no batches specified but sample_ids provided, process samples directly
+        if not batch_ids and input_sample_ids:
+            for sample_id in input_sample_ids:
+                try:
+                    output_info, qc = self.run_sample(sample_id, step_run)
+                except Exception as exc:
+                    output_info = {}
+                    qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+                    step = qc.get_step(self.__class__.__name__)
+                    step.flag = QCFlag.FAIL
+                    step.add_reason("RUN_SAMPLE_RUNTIME_ERROR", str(exc))
+
+                step_run.sample_outputs[sample_id] = output_info
+                step_run.per_sample_qc[sample_id] = qc
+
+        # Aggregate overall QC summary from per-sample QC (dict format)
+        step_run.qc_summary["_overall_"] = self.summarize_qc(step_run.per_sample_qc)
         step_run = self.update_project(step_run)
+        step_run = self.cleanup_step_run(step_run)
         step_run.status = "completed"
 
         return step_run
+
+    def prepare_batch(self, batch_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
+        """
+        Prepare batch-level context before processing samples.
+
+        This phase runs first for each batch. Use it to:
+        - Compute batch-level statistics or priors (global thresholds, fitted parameters)
+        - Load pooled batch data for fitting gates, compensation matrices, etc.
+        - Set up shared state in step_run.batch_outputs[batch_id]
+
+        Per-sample methods will read batch_outputs[batch_id] to access these priors.
+
+        Default implementation does nothing (no-op).
+
+        Args:
+            batch_id: ID of the batch to prepare
+            step_run: shared execution context (write to step_run.batch_outputs[batch_id])
+
+        Returns:
+            (output_info, batch_qc) where:
+                output_info: dict with batch context/outputs
+                batch_qc: QCRunStatus for batch-level QC (stored in step_run.qc_summary[batch_id])
+        """
+        qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
+        try:
+            batch = self.project.batches[batch_id]
+        except KeyError:
+            step = qc.get_step("LoadBatch")
+            step.flag = QCFlag.FAIL
+            step.add_reason("BATCH_NOT_FOUND", f"Batch {batch_id} not found in project.")
+        return {}, qc
 
     def run_sample(
         self,
@@ -102,12 +188,16 @@ class BaseStep:
         step_run: StepRun,
     ) -> tuple[dict, QCRunStatus]:
         """
-        Do the actual work for *one* sample.
+        Process one sample, optionally using batch context from prepare_batch.
+
+        Can read batch context from step_run.batch_outputs[batch_id] that was
+        set up by prepare_batch(). Write per-sample results to
+        step_run.sample_outputs[sample_id] for finalize_batch() to aggregate.
 
         Returns:
           (output_info, qc_info) for this sample
           where:
-            output_info: dict to store under step_run.outputs[sample.id]
+            output_info: dict to store under step_run.sample_outputs[sample.id]
             qc_info: QCRunStatus to store under step_run.per_sample_qc[sample.id]
         """
         qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
@@ -119,10 +209,32 @@ class BaseStep:
             step.add_reason("SAMPLE_NOT_FOUND", f"Sample {sample_id} not found in project.")
         return {}, qc
 
-    def run_batch(self, batch_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
-        """Summarize overall output from this step run. Method to run after run()."""
-        qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
-        return {}, qc
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
+        """
+        Finalize batch after all samples are processed.
+
+        This phase runs last for each batch. Use it to:
+        - Read per-sample results from step_run.sample_outputs
+        - Aggregate results (pooled statistics, batch-level summaries)
+        - Populate step_run.project_updates with changes to persist
+        - Update step_run.batch_outputs[batch_id] with aggregated results
+        - Add finalize-specific QC steps to the provided qc
+
+        Default implementation does nothing (no-op).
+
+        Args:
+            batch_id: ID of the batch to finalize
+            step_run: shared execution context (read from sample_outputs, write to project_updates)
+            qc: QCRunStatus from prepare_batch (add new steps to this)
+
+        Returns:
+            (output_info, batch_qc) where:
+                output_info: dict with aggregated batch results
+                qc: Updated QCRunStatus with finalize steps added
+        """
+        # Do nothing by default
+        output_info = step_run.batch_outputs.get(batch_id, {})
+        return output_info, qc
 
     def summarize_qc(self, per_sample_qc: Mapping[str, QCRunStatus]) -> dict:
         sample_qc = [qc for sid, qc in per_sample_qc.items() if sid in self.project.samples]
@@ -145,7 +257,59 @@ class BaseStep:
         }
 
     def update_project(self, step_run: StepRun) -> StepRun:
-        """Update project metadata based on step run results."""
+        """Apply project_updates accumulated by phases to the project.
+
+        The step implementation (prepare_batch/finalize_batch) appends update dicts
+        to project_updates list. This method applies them sequentially, then cleans
+        up the updates to only keep IDs of updated entries.
+
+        Subclasses can override to add step-specific cleanup or validation before
+        or after calling super().update_project().
+
+        Args:
+            step_run: execution context with accumulated project_updates list
+
+        Returns:
+            step_run: with project updates applied and cleaned up
+        """
+        # Apply updates and collect cleaned versions
+        cleaned_updates = []
+        for updates in step_run.project_updates:
+            self.repo.update_project_metadata(**updates)
+
+            # Clean up: keep only IDs of updated entries
+            cleaned = updates.copy()
+            if "samples" in updates:
+                cleaned["samples"] = list(updates["samples"].keys())
+            if "batches" in updates:
+                cleaned["batches"] = list(updates["batches"].keys())
+            if "compensations" in updates:
+                cleaned["compensations"] = [c.id if hasattr(c, 'id') else c for c in updates["compensations"]]
+            if "panel" in updates:
+                cleaned["panel"] = [ch.pnn if hasattr(ch, 'pnn') else ch for ch in updates["panel"]]
+            if "dimensions" in updates:
+                cleaned["dimensions"] = {
+                    layer: [dim.id if hasattr(dim, 'id') else dim for dim in dims]
+                    for layer, dims in updates["dimensions"].items()
+                }
+            if "transformations" in updates:
+                cleaned["transformations"] = list(updates["transformations"].keys())
+            if "gating_strategies" in updates:
+                cleaned["gating_strategies"] = [gs.id if hasattr(gs, 'id') else gs for gs in updates["gating_strategies"]]
+
+            cleaned_updates.append(cleaned)
+
+        # Replace full updates with cleaned versions
+        step_run.project_updates = cleaned_updates
+        return step_run
+
+    def cleanup_step_run(self, step_run: StepRun) -> StepRun:
+        """
+        Cleanup any temporary data in step_run before persisting.
+
+        Default implementation does nothing. Subclasses can override
+        to remove large intermediate data structures if needed.
+        """
         return step_run
 
     # --- utility methods for steps -----
@@ -183,6 +347,25 @@ class BaseStep:
             if reraise:
                 raise
             return None, step_status
+
+    def load_layer(
+        self,
+        sample: SampleRef,
+        qc: QCRunStatus,
+        layer: str | None = None,
+    ) -> tuple[AnnData | None, QCStepStatus]:
+        """
+        Load AnnData for the sample's layer and update QC.
+        Returns (AnnData, updated qc).
+        """
+        return self.run_step(
+            qc,
+            f"load_anndata_{layer}",
+            self.repo._load_sample_layer,
+            reason_code_fail="LOAD_ANNDATA_ERROR",
+            sample_id=sample.id,
+            layer=layer or sample.default_layer,
+        )
 
     def load_adata(
         self,
