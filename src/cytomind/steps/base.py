@@ -1,18 +1,24 @@
 from __future__ import annotations
+from re import A
 from typing import Any, Mapping, Callable, TypeVar, Sequence, TYPE_CHECKING
 from collections import Counter
 
-if TYPE_CHECKING:
-    from cytomind.infra.repo import ProjectRepository
-else:
-    ProjectRepository = object
-
-R = TypeVar("R") # Type variable for the result returned by the provided callable
-
 import numpy as np
-from numpy.typing import NDArray
-from anndata import AnnData
-from cytomind.domain.pipeline import SampleRef, StepRun, QCRunStatus, QCStepStatus, QCFlag
+from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
+
+if TYPE_CHECKING:
+    from anndata import AnnData
+    from numpy.typing import NDArray
+    from cytomind.domain.pipeline import SampleRef, StepRun
+    from cytomind.infra.repo import ProjectRepository
+    R = TypeVar("R") # Type variable for the result returned by the provided callable
+else:
+    AnnData = object
+    NDArray = object
+    SampleRef = object
+    StepRun = object
+    ProjectRepository = object
+    R = object
 
 
 class BaseStep:

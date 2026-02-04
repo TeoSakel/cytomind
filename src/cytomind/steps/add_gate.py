@@ -5,11 +5,12 @@ from numpy.typing import NDArray
 import numpy as np
 import anndata as ad
 
-from cytomind.domain.pipeline import BatchRef, SampleRef, StepRun, QCRunStatus, QCFlag
 from cytomind.domain.gates import GateNode
+from cytomind.domain.qc import QCRunStatus, QCFlag
 from cytomind.gates import GateRegistry
 
 if TYPE_CHECKING:
+    from cytomind.domain.pipeline import BatchRef, SampleRef, StepRun
     from cytomind.gates.base import Gate
     from cytomind.gates.glm_gates import QuadrantGate
 else:

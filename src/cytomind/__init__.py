@@ -9,7 +9,8 @@ del PackageNotFoundError
 del version
 
 from cytomind.domain.flow import CompensationRef, DimensionDef, ChannelRef, TransformationRef
-from cytomind.domain.pipeline import Project, SampleRef, StepRun, QCRunStatus
+from cytomind.domain.pipeline import Project, SampleRef, StepRun
+from cytomind.domain.qc import QCRunStatus
 from cytomind.infra.repo import ProjectRepository
 from cytomind.infra.pipeline import InteractivePipeline
 from cytomind.steps import StepRegistry

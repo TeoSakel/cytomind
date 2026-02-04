@@ -8,9 +8,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, TYPE_CHECKING
 from collections import Counter
-from pathlib import Path
 
-from cytomind.domain.pipeline import QCRunStatus, QCFlag
+from cytomind.domain.qc import QCRunStatus, QCFlag
 
 if TYPE_CHECKING:
     from cytomind.domain.pipeline import StepRun

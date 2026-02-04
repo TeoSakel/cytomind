@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from cytomind.domain.constants import GML_VERSION
-from cytomind.domain.pipeline import StepRun, QCRunStatus, QCFlag
+from cytomind.domain.pipeline import StepRun
+from cytomind.domain.qc import QCRunStatus, QCFlag
 from cytomind.domain.gates import GatingStrategyRef
 from cytomind.utils import string_to_filename
 from .base import BaseStep

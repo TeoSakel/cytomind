@@ -16,7 +16,8 @@ from cytomind.domain.transforms import transform_registry
 
 from cytomind.qc.base import StepQCEvaluator
 from cytomind.qc import QCEvaluatorRegistry
-from cytomind.domain.pipeline import StepRun, QCRunStatus, QCFlag, QCTestRecord
+from cytomind.domain.pipeline import StepRun
+from cytomind.domain.qc import QCRunStatus, QCFlag, QCTestRecord
 from cytomind.visualization import build_histogram1d
 from cytomind.visualization.transforms import apply_transform, get_default_transformations
 

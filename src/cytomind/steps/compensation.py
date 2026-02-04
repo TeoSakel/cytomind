@@ -3,7 +3,7 @@ from typing import Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cytomind.domain.flow import CompensationRef
-    from cytomind.domain.pipeline import QCStepStatus, SampleRef, StepRun
+    from cytomind.domain.pipeline import SampleRef, StepRun
     from anndata import AnnData
 else:
     CompensationRef = object
@@ -12,7 +12,7 @@ else:
     SampleRef = object
     StepRun = object
 
-from cytomind.domain.pipeline import QCRunStatus, QCFlag
+from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
 from .base import BaseStep
 from . import register_step
 

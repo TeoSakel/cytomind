@@ -8,7 +8,8 @@ from datetime import datetime
 import flowkit as fk
 
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef
-from cytomind.domain.pipeline import SampleRef, StepRun, QCRunStatus, QCFlag, BatchRef
+from cytomind.domain.pipeline import SampleRef, StepRun, BatchRef
+from cytomind.domain.qc import QCRunStatus, QCFlag
 from .base import BaseStep
 from . import register_step
 

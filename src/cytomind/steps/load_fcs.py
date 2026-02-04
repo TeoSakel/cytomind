@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from cytomind.domain.pipeline import QCRunStatus, QCFlag, StepRun
+from cytomind.domain.pipeline import StepRun
+from cytomind.domain.qc import QCRunStatus, QCFlag
 from .base import BaseStep
 from . import register_step
-
 
 import flowkit as fk
 import anndata as ad

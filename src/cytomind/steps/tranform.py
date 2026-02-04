@@ -1,9 +1,9 @@
 from __future__ import annotations
 from typing import Iterable, Mapping, TYPE_CHECKING
 
-from cytomind.domain.transforms import TransformationRef, transform_registry
-from cytomind.domain.pipeline import QCFlag, QCStepStatus, QCRunStatus, SampleRef, StepRun
 from cytomind.domain.flow import DimensionDef
+from cytomind.domain.transforms import TransformationRef, transform_registry
+from cytomind.domain.qc import QCFlag, QCStepStatus, QCRunStatus
 from .base import BaseStep
 from . import register_step
 
@@ -11,6 +11,11 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 
+if TYPE_CHECKING:
+    from cytomind.domain.pipeline import SampleRef, StepRun
+else:
+    SampleRef = object
+    StepRun = object
 
 @register_step("add_layer")
 class AddLayerStep(BaseStep):
