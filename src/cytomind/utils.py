@@ -8,15 +8,15 @@ import pandas as pd
 
 # Methods to compress and decompress binary masks using run-length encoding (RLE).
 
-def rlencode(mask: NDArray[np.bool_]) -> NDArray[np.int_]:
+def rlencode(mask: Sequence[bool] | NDArray[np.bool_]) -> NDArray[np.int_]:
     """
     Run-length encode a 1D binary mask. This can be used to store
     masks more compactly.
 
     Parameters
     ----------
-    mask : numpy.ndarray
-        1D numpy array of bool.
+    mask : Sequence[bool] | numpy.ndarray
+        1D sequence or numpy array of bool.
 
     Returns
     -------
@@ -116,3 +116,29 @@ def spillover_df_to_string(df: pd.DataFrame, fmt: str = ".6g") -> str:
         warnings.warn("Spillover matrix contains values outside the range [-1, 1]")
 
     return ",".join((n, *markers, *map(lambda x: format(x, fmt), values)))
+
+def string_to_filename(s: str) -> str:
+    """
+    Convert a string to a safe filename by replacing unsafe characters.
+
+    Parameters
+    ----------
+    s : str
+        Input string to convert.
+
+    Returns
+    -------
+    str
+        Safe filename string.
+    """
+    # replace certain characters with underscores
+    underscore_chars = [' ', ':', '/', '|', '\\', '-', ',', ';']
+    for char in underscore_chars:
+        s = s.replace(char, '_')
+    # collapse repeated underscores
+    while "__" in s:
+        s = s.replace("__", "_")
+    rm_chars = ['<', '>', '"', '?', '*', "'", '[', ']', '(', ')']
+    for char in rm_chars:
+        s = s.replace(char, '')
+    return s

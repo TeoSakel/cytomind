@@ -12,6 +12,7 @@ from anndata import AnnData
 from pandas import DataFrame
 
 from cytomind.domain.flow import *
+from cytomind.domain.gates import GatingStrategyRef
 
 if TYPE_CHECKING:
     Numeric = int | float
@@ -25,6 +26,7 @@ class Project:
     dimensions: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
     compensations: dict[str, CompensationRef] = field(default_factory=dict)
     transformations: dict[str, TransformationRef] = field(default_factory=dict)
+    gating_strategies: dict[str, GatingStrategyRef] = field(default_factory=dict)
 
     @property
     def panel_df(self) -> DataFrame:
@@ -48,6 +50,7 @@ class Project:
             compensations={k: CompensationRef.from_record(v) for k, v in data.get("compensations", {}).items()},
             transformations={k: TransformationRef.from_record(v) for k, v in data.get("transformations", {}).items()},
             batches={k: BatchRef.from_record(v) for k, v in data.get("batches", {}).items()},
+            gating_strategies={k: GatingStrategyRef.from_dict(v) for k, v in data.get("gating_strategies", {}).items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,6 +65,7 @@ class Project:
             "compensations": {k: v.to_dict() for k, v in self.compensations.items()},
             "transformations": {k: v.to_dict() for k, v in self.transformations.items()},
             "batches": {k: v.to_dict() for k, v in self.batches.items()},
+            "gating_strategies": {k: v.to_dict() for k, v in self.gating_strategies.items()},
         }
 
 @dataclass
@@ -181,27 +185,74 @@ class SampleRef:
 
 @dataclass
 class StepRun:
+    """
+    Mutable execution context for a step run, shared across all execution phases.
+
+    The StepRun acts as a mutable container that phases populate incrementally:
+    - prepare_batch() populates batch_outputs[batch_id] with batch context (priors, thresholds, etc.)
+    - run_sample() reads from batch_outputs and populates sample_outputs[sample_id]
+    - finalize_batch() reads from sample_outputs, aggregates, and populates project_updates
+    - update_project() applies accumulated project_updates to the project
+
+    Fields
+    ------
+    sample_outputs : dict[str, Any]
+        Per-sample results keyed by sample_id. Populated by run_sample(),
+        read by finalize_batch() for aggregation.
+
+    batch_outputs : dict[str, Any]
+        Per-batch results and context keyed by batch_id. Populated by
+        prepare_batch() and finalize_batch(). read by run_sample() for batch context.
+
+    project_updates : list[dict[str, Any]]
+        List of project change dicts accumulated by phases (mainly finalize_batch()).
+        Each dict contains keys for project registries (samples, dimensions, compensations, etc.).
+        Applied sequentially by update_project() in the order they were added.
+        Each batch can append its own update dict to this list.
+    """
     id: str
-    step_type: str          # "parse_fcs", "compensate", "transform", ...
-    config: dict[str, Any]  # algorithmic knobs for this run
-    inputs: dict[str, Any]  # ids: sample_ids, comp_id, etc.
-    outputs: dict[str, Any] = field(default_factory=dict)
+    step_type: str
+    status: str = "pending"                         # "pending" | "completed" | "failed"
+    created_at: str = ""                            # ISO string
+    config: dict[str, Any] = field(default_factory=dict)          # algorithmic knobs for this run
+    inputs: dict[str, Any] = field(default_factory=dict)          # ids: sample_ids, batch_ids, etc.
+    sample_outputs: dict[str, Any] = field(default_factory=dict)  # keyed by sample_id
+    batch_outputs: dict[str, Any] = field(default_factory=dict)   # keyed by batch_id
+    project_updates: list[dict[str, Any]] = field(default_factory=list)  # list of project changes to apply
     per_sample_qc: dict[str, QCRunStatus] = field(default_factory=dict)
     qc_summary: dict[str, Any] = field(default_factory=dict)
-    project_updates: set = field(default_factory=set)
-    status: str = "pending"  # "pending" | "completed" | "failed"
-    created_at: str = ""     # ISO string
 
     def to_dict(self) -> dict[str, Any]:
         base = asdict(self)
-        # set is not JSON-serializable
+        # Serialize QC objects
         base["per_sample_qc"] = {
             sid: qc.to_dict() for sid, qc in self.per_sample_qc.items()
         }
-        base["project_updates"] = list(self.project_updates)
         return base
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "StepRun":
+        per_sample_qc_data = data.get("per_sample_qc", {}) or {}
+        per_sample_qc = {
+            sid: QCRunStatus.from_dict(qc_dict)
+            for sid, qc_dict in per_sample_qc_data.items()
+        }
+        return cls(
+            id=data["id"],
+            step_type=data["step_type"],
+            config=data.get("config", {}),
+            inputs=data.get("inputs", {}),
+            sample_outputs=data.get("sample_outputs", {}),
+            batch_outputs=data.get("batch_outputs", {}),
+            project_updates=data.get("project_updates", []),
+            per_sample_qc=per_sample_qc,
+            qc_summary=data.get("qc_summary", {}),
+            status=data.get("status", "pending"),
+            created_at=data.get("created_at", ""),
+        )
 
+
+# TODO: move to qc.py
 class QCFlag(str, Enum):
     """Quality control FLAGS for gates and transformations."""
     PASS = "PASS"
@@ -486,10 +537,11 @@ class ResourceSpec:
                 step_type=step_dict["step_type"],
                 config=step_dict.get("config", {}),
                 inputs=step_dict.get("inputs", {}),
-                outputs=step_dict.get("outputs", {}),
+                sample_outputs=step_dict.get("sample_outputs", {}),
+                batch_outputs=step_dict.get("batch_outputs", {}),
+                project_updates=step_dict.get("project_updates", []),
                 per_sample_qc=step_dict.get("per_sample_qc", {}),
                 qc_summary=step_dict.get("qc_summary", {}),
-                project_updates=set(step_dict.get("project_updates", [])),
                 status=step_dict.get("status", "pending"),
                 created_at=step_dict.get("created_at", ""),
             )

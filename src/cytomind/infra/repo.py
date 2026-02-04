@@ -15,6 +15,8 @@ import anndata as ad
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef, TransformationRef
 from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef
 from cytomind.domain.transforms import get_default_transformations
+from cytomind.domain.gates import GateNode, GatingStrategyRef
+from cytomind.utils import now_iso, rlencode, rldecode
 
 PathLike = Path | str
 MaskLike = NDArray[np.bool_] | NDArray[np.int_] | slice
@@ -159,6 +161,7 @@ class ProjectRepository:
             self._update_comp_catalog(project.compensations.values())
             self._write_dimensions(project.dimensions)
             self._write_transformations(project.transformations)
+            self._update_gating_strategy_catalog(project.gating_strategies.values())
 
     def update_project_metadata(
         self,
@@ -168,6 +171,7 @@ class ProjectRepository:
         compensations: Iterable[CompensationRef] = [],
         transformations: Mapping[str, TransformationRef] = {},
         batches: Mapping[str, BatchRef] = {},
+        gating_strategies: Iterable[GatingStrategyRef] = [],
         drop_samples: Sequence[str] = [],
         drop_batches: Sequence[str] = [],
     ) -> None:
@@ -190,6 +194,8 @@ class ProjectRepository:
             Transformation references to add/update.
         batches : Mapping[str, BatchRef], optional
             Batch references to add/update.
+        gating_strategies : Iterable[GatingStrategyRef], optional
+            Gating strategy references to add/update.
         drop_samples : Sequence[str], optional
             List of sample IDs to remove from the project. This will delete sample
             directories and remove references from batches.
@@ -244,6 +250,9 @@ class ProjectRepository:
             project.transformations.update(transformations)
             update_needed = True
             self._write_transformations(project.transformations)
+        if gating_strategies:
+            project.gating_strategies = self._update_gating_strategy_catalog(gating_strategies)
+            update_needed = True
 
         # Handle batch deletions first
         drop_batches = list(drop_batches)
@@ -357,7 +366,6 @@ class ProjectRepository:
             Channel mapping structure with per-sample channel/protein renames.
             Only includes channels that change names.
         """
-        self.channel_mapping_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json(self.channel_mapping_path, mapping)
 
     # ------------- Dimension I/O -----------------
@@ -422,7 +430,6 @@ class ProjectRepository:
         dimensions : Mapping[str, list[DimensionDef]]
             Mapping of layer -> list of DimensionDef instances or dict-like records.
         """
-        self.dimensions_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json(
             self.dimensions_path,
             {layer: [vars(dim) for dim in dims] for layer, dims in dimensions.items()}
@@ -503,7 +510,6 @@ class ProjectRepository:
         transformations : Mapping[str, TransformationRef]
             Mapping of id -> TransformationRef to persist.
         """
-        self.transformations_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json(
             self.transformations_path,
             {k: v.to_dict() for k, v in transformations.items()}
@@ -893,89 +899,6 @@ class ProjectRepository:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json(path, batch.to_dict())
 
-    def build_batch_adata(
-        self,
-        batch,                       # BatchRef
-        layer: str,
-        n_events_per_sample: int = 10_000,
-        channels: Sequence[str] | None = None,
-        mask_dict: Mapping[str, NDArray[np.bool_]] = {},
-        seed: int | None = None,
-    ) -> ad.AnnData:
-        """
-        Build an AnnData pooling events from all samples in `batch`,
-        with up to `n_events_per_sample` events per sample.
-
-        Parameters
-        ----------
-        batch : BatchRef
-            Batch whose sample_ids will be pooled.
-        n_events_per_sample : int
-            Max number of events drawn from each sample.
-        channels : list of str, optional
-            Channel names (var_names) to keep. If None, keep all channels.
-        mask_dict : Mapping[str, MaskLike], optional
-            Mapping from sample_id to a boolean mask (np.ndarray) of length n_obs indicating which events to keep.
-            This is applied *before* downsampling.
-        layer : str
-            Use this layer as X in the pooled AnnData.
-        seed : int or None
-            Random seed for reproducible subsampling.
-
-        Returns
-        -------
-        batch_adata : AnnData
-            Concatenated AnnData with events from all samples.
-            Has a column `sample_id` in .obs.
-        """
-        rng = np.random.default_rng(seed)
-
-        per_sample_adatas: list[ad.AnnData] = []
-
-        for sample_id in batch.sample_ids:
-            # 1) Load sample AnnData (backed or in-memory)
-            sample_view = self._load_sample_layer(sample_id, layer=layer)
-
-            mask = np.asarray(mask_dict.get(sample_id, np.ones(sample_view.n_obs, dtype=bool)))
-            mask = np.where(mask)[0]
-            n_events = len(mask)
-            # If nothing left after filtering, skip this sample
-            if n_events == 0:
-                continue
-
-            # 4) downsample to n_events_per_sample
-            if n_events > n_events_per_sample:
-                mask = rng.choice(mask, size=n_events_per_sample, replace=False)
-                n_events = n_events_per_sample
-
-            # This copy materializes the subset into memory (small)
-            sample_sub = sample_view[mask, channels].to_memory(copy=True)
-            try:
-                sample_view.file.close()
-                del sample_view
-            except Exception:
-                pass
-
-            # 6) annotate sample_id in obs for provenance
-            sample_sub.obs["sample_id"] = sample_id
-
-            per_sample_adatas.append(sample_sub)
-
-        if not per_sample_adatas:
-            raise ValueError("No events collected for this batch (all empty after filtering?)")
-
-        # 7) concatenate all subsampled adatas
-        batch_adata = ad.concat(
-            per_sample_adatas,
-            axis=0,
-            join="inner",      # keep only channels common to all samples
-            label="sample_id", # also use sample_id as key label
-            keys=[a.obs["sample_id"].iloc[0] for a in per_sample_adatas],
-            index_unique="-",  # "<sample_id>-<event_index>"
-        )
-
-        return batch_adata
-
     # --------- Compensation I/O ----------
 
     @property
@@ -1316,18 +1239,7 @@ class ProjectRepository:
             raise ValueError(f"Multiple JSON files found for step run: {step_run_id}")
 
         data = self._read_json(json_files[0])
-        return StepRun(
-            id=data["id"],
-            step_type=data["step_type"],
-            config=data.get("config", {}),
-            inputs=data.get("inputs", {}),
-            outputs=data.get("outputs", {}),
-            per_sample_qc=data.get("per_sample_qc", {}),
-            qc_summary=data.get("qc_summary", {}),
-            project_updates=set(data.get("project_updates", [])),
-            status=data.get("status", "pending"),
-            created_at=data.get("created_at", "")
-        )
+        return StepRun.from_dict(data)
 
     def list_step_run_ids(self) -> list[str]:
         """
@@ -1403,16 +1315,278 @@ class ProjectRepository:
             return json.load(f)
 
     @staticmethod
-    def _write_json(path: Path, data: dict) -> None:
+    def _write_json(path: PathLike, data: dict) -> None:
         """
         Write a JSON-serializable dictionary to a file.
 
         Parameters
         ----------
-        path : Path
+        path : PathLike
             Destination file path.
         data : dict
             Data to serialize to JSON.
         """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
             json.dump(data, f, indent=2)
+
+    # ------------- Gating Strategy Catalog I/O -----------------
+
+    @property
+    def gating_strategies_dir(self) -> Path:
+        """
+        Path to gating strategies directory.
+
+        Returns
+        -------
+        Path
+            Absolute path to 'gating_strategies'.
+        """
+        return self.root / "gating_strategies"
+
+    def strategy_dir(self, strategy: str | GatingStrategyRef) -> Path:
+        """
+        Get the path to a gating strategy directory.
+
+        Parameters
+        ----------
+        strategy: str | GatingStrategyRef
+            Strategy identifier or reference.
+
+        Returns
+        -------
+        Path
+            Absolute path to the gating strategy directory.
+        """
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+        return self.gating_strategies_dir / strategy_id
+
+    def mask_dir(self, strategy: str | GatingStrategyRef, mask: str) -> Path:
+        return self.strategy_dir(strategy) / "masks" / mask
+
+    def gate_node_path(self, strategy: str | GatingStrategyRef, node_id: str) -> Path:
+        """
+        Get the path to a gating node definition file.
+
+        Parameters
+        ----------
+        strategy: str | GatingStrategyRef
+            Strategy identifier or reference.
+        node_id: str
+            Gating node identifier.
+
+        Returns
+        -------
+        Path
+            Absolute path to the gating node definition JSON file.
+        """
+        return self.mask_dir(strategy, node_id) / "node.json"
+
+    def get_gate_node(self, strategy: str | GatingStrategyRef, node_id: str) -> GateNode:
+        """
+        Load a gating node definition by ID from a gating strategy.
+
+        Parameters
+        ----------
+        strategy: str | GatingStrategyRef
+            Strategy identifier or reference.
+        node_id: str
+            Gating node identifier.
+
+        Returns
+        -------
+        GateNode
+            The gating node definition.
+
+        Raises
+        ------
+        KeyError
+            If the node is not found in the strategy.
+        """
+        path = self.gate_node_path(strategy, node_id)
+        data = self._read_json(path)
+        return GateNode.from_dict(data)
+
+    def save_gate_node(self, strategy: str | GatingStrategyRef, node: GateNode, force: bool = False) -> None:
+        """
+        Save a gating node definition to disk.
+
+        Parameters
+        ----------
+        strategy: str | GatingStrategyRef
+            Strategy identifier or reference.
+        node: GateNode
+            Gating node definition to save.
+        """
+        path = self.gate_node_path(strategy, node.id)
+        if path.exists() and not force:
+            raise FileExistsError(f"Gating node already exists at {path.as_posix()}. Use force=True to overwrite.")
+        self._write_json(path, node.to_dict())
+
+    @property
+    def gating_strategy_catalog_path(self) -> Path:
+        """
+        Path to the gating strategy catalog JSON file.
+
+        Returns
+        -------
+        Path
+            Absolute path to 'gating_strategies/catalog.json'.
+        """
+        return self.gating_strategies_dir / "catalog.json"
+
+    def _get_strategy_path(self, strategy: str | GatingStrategyRef) -> Path:
+        """
+        Get the path to a gating strategy definition file.
+
+        Parameters
+        ----------
+        strategy: str | GatingStrategyRef
+            Strategy identifier or reference.
+
+        Returns
+        -------
+        Path
+            Absolute path to the gating strategy definition JSON file.
+        """
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+        return self.gating_strategies_dir / strategy_id / "strategy.json"
+
+    def get_gating_strategy_catalog(self) -> dict[str, GatingStrategyRef]:
+        """
+        Load the gating strategy catalog.
+
+        Returns
+        -------
+        dict[str, GatingStrategyRef]
+            Mapping strategy_id -> GatingStrategyRef.
+        """
+        if not self.gating_strategy_catalog_path.exists():
+            return {}
+        catalog = self._read_json(self.gating_strategy_catalog_path)
+        return {strat_id: GatingStrategyRef.from_dict(config) for strat_id, config in catalog.items()}
+
+    def get_gating_strategy(self, strategy_id: str) -> GatingStrategyRef:
+        """
+        Load a gating strategy by ID (with lazy-loaded definition).
+
+        Parameters
+        ----------
+        strategy_id: str
+            Strategy identifier.
+
+        Returns
+        -------
+        GatingStrategyRef
+            The gating strategy reference with definition path set.
+
+        Raises
+        ------
+        KeyError
+            If the strategy is not found in the catalog.
+        """
+        if not self.gating_strategy_catalog_path.exists():
+            raise KeyError(f"Gating strategy '{strategy_id}' not found in catalog.")
+        catalog = self._read_json(self.gating_strategy_catalog_path)
+        if strategy_id not in catalog:
+            raise KeyError(f"Gating strategy '{strategy_id}' not found in catalog.")
+        return GatingStrategyRef.from_dict(catalog[strategy_id])
+
+    def save_gating_masks(
+        self,
+        strategy: str | GatingStrategyRef,
+        sample: str | SampleRef,
+        masks: Mapping[str, Sequence[bool] | NDArray[np.bool_]],
+        force: bool = False
+    ) -> None:
+        """
+        Save gating mask for a given strategy and sample.
+
+        Parameters
+        ----------
+        strategy : str | GatingStrategyRef
+            Strategy identifier or reference.
+        sample : str | SampleRef
+            Sample identifier or reference.
+        mask : Mapping[str, Sequence[bool]]
+            Gating mask data to save.
+        """
+        sample_id = sample.id if isinstance(sample, SampleRef) else sample
+        for mask_id, mask in masks.items():
+            mask_dir = self.mask_dir(strategy, mask_id)
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            mask_path = mask_dir / f"{sample_id}.npy"
+            if mask_path.exists() and not force:
+                raise FileExistsError(f"Gating mask already exists at {mask_path.as_posix()}. Use force=True to overwrite.")
+            mask_enc = rlencode(mask)
+            np.save(mask_path, mask_enc)
+
+    def load_gating_masks(
+        self,
+        strategy: str | GatingStrategyRef,
+        sample: str | SampleRef,
+        mask_ids: Iterable[str]
+    ) -> dict[str, np.ndarray]:
+        """
+        Load gating mask for a given strategy, sample, and mask ID.
+
+        Parameters
+        ----------
+        strategy : str | GatingStrategyRef
+            Strategy identifier or reference.
+        sample : str | SampleRef
+            Sample identifier or reference.
+        mask_ids : Iterable[str]
+            Mask identifiers.
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Decoded gating mask array.
+        """
+
+        sample_id = sample.id if isinstance(sample, SampleRef) else sample
+        masks: dict[str, np.ndarray] = {}
+        for mask_id in mask_ids:
+            mask_path = self.mask_dir(strategy, mask_id) / f"{sample_id}.npy"
+            if not mask_path.exists():
+                raise FileNotFoundError(f"Gating mask not found at {mask_path.as_posix()}.")
+            mask_enc: NDArray[np.int_] = np.load(mask_path, allow_pickle=True)
+            masks[mask_id] = rldecode(mask_enc)
+        return masks
+
+    def _update_gating_strategy_catalog(self, strategy_refs: Iterable[GatingStrategyRef]) -> dict[str, GatingStrategyRef]:
+        """
+        Merge and persist gating strategy catalog entries.
+
+        Parameters
+        ----------
+        strategy_refs : Iterable[GatingStrategyRef]
+            New or updated gating strategy references to merge into the catalog.
+
+        Returns
+        -------
+        dict[str, GatingStrategyRef]
+            Updated catalog mapping strategy_id -> GatingStrategyRef.
+        """
+        catalog = self.get_gating_strategy_catalog()
+        catalog.update({ref.id: self._save_strategy_ref(ref) for ref in strategy_refs})
+
+        self._write_json(
+            self.gating_strategy_catalog_path,
+            {ref_id: ref.to_dict() for ref_id, ref in catalog.items()}
+        )
+        return catalog
+
+    def _save_strategy_ref(self, ref: GatingStrategyRef) -> GatingStrategyRef:
+        if not isinstance(ref, GatingStrategyRef):
+            raise TypeError("ref must be a GatingStrategyRef instance.")
+        if not ref.created_at:
+            ref.created_at = now_iso()
+        ref.path = self._get_strategy_path(ref).as_posix()
+
+        # Create a copy of the ref data to write
+        ref_data = ref.to_dict()
+        self._write_json(ref.path, ref_data)
+        ref_data["graph"] = None  # Invalidate cached graph
+        return GatingStrategyRef.from_dict(ref_data)

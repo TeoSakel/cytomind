@@ -1,14 +1,10 @@
 from __future__ import annotations
 from typing import Iterable, Sequence, Mapping, Any, TYPE_CHECKING
 
-from cytomind.revisions.base import BaseRevisionHandler
-
 if TYPE_CHECKING:
-    from cytomind.domain.flow import DimensionDef
-    from cytomind.domain.pipeline import RevisionSession
+    from cytomind.revisions.base import BaseRevisionHandler
 else:
-    DimensionDef = object
-    RevisionSession = object
+    BaseRevisionHandler = object
 
 from pathlib import Path
 
@@ -68,11 +64,6 @@ class InteractivePipeline:
             step_type=step_type,
             config=config,
             inputs=inputs,
-            outputs={},
-            qc_summary={},
-            per_sample_qc={},
-            project_updates=set(),
-            status="pending",
             created_at=now_iso(),
         )
 
@@ -220,7 +211,12 @@ class InteractivePipeline:
 
     # --- Convenience Methods for Common Operations ----
 
-    def add_samples(self, samples: Mapping[str, PathLike], config: dict[str, Any] = {}, channel_mapping: dict[str, dict] | None = None) -> StepRun:
+    def add_samples(
+        self,
+        samples: Mapping[str, PathLike],
+        config: Mapping[str, Any] = {},
+        channel_mapping: Mapping[str, Mapping] | None = None
+    ) -> StepRun:
         """
         Initialize a new project by parsing FCS files and building registries.
 
@@ -244,8 +240,8 @@ class InteractivePipeline:
         # Temporarily register minimal samples in project so run can iterate
         samples_dict = {sid: SampleRef(id=sid, fcs=Path(fcs).as_posix()) for sid, fcs in samples.items()}
         batch_dict = {
-            "summary": BatchRef(
-                id="summary",
+            "__all__": BatchRef(
+                id="__all__",
                 sample_ids=list(samples_dict.keys()),
                 tags=["all_samples"],
                 meta={},
@@ -261,8 +257,7 @@ class InteractivePipeline:
         return self.run_step(
             step_type="add_samples",
             config=step_config,
-            inputs={"sample_ids": list(samples_dict.keys()),
-                    "batch_ids": ["summary"]},
+            inputs={"batch_ids": ["__all__"]},
         )
 
     def load_fcs(self, sample_ids: Sequence[str] | None = None) -> StepRun:
@@ -311,7 +306,7 @@ class InteractivePipeline:
             if isinstance(comp_id, Mapping):
                 sample_ids = list(comp_id.keys())
             else:
-                sample_ids = [p.name for p in self.repo.iter_sample_dirs()]
+                raise ValueError("sample_ids must be provided when comp_id is a single string.")
         sample_ids = list(sample_ids)
         step_comp = self.run_step(
             step_type="compensate",
@@ -320,11 +315,127 @@ class InteractivePipeline:
         )
         return step_comp
 
+    def add_gating_strategy(
+        self,
+        strategy_id: str,
+        batch_id: str = "__panel__",
+        description: str = ""
+    ) -> StepRun:
+        """
+        Create a new gating strategy for the specified samples.
+
+        Parameters
+        ----------
+        strategy_id : str
+        batch_id : str
+            Batch ID to associate with the strategy.
+        description : str
+            Optional description of the gating strategy.
+
+        Returns
+        -------
+        StepRun
+            The completed add_gating_strategy step run.
+        """
+
+
+        step_gating = self.run_step(
+            step_type="add_gating_strategy",
+            config={
+                "strategy_id": strategy_id,
+                "description": description,
+            },
+            inputs={"batch_ids": [batch_id]}
+        )
+        return step_gating
+
+    def add_gate(
+        self,
+        strategy_id: str,
+        gate_id: str,
+        gate_type: str,
+        dimensions: Sequence[str] = [],
+        parent_ids: str | Iterable[str] = [],
+        layer: str = "xf",
+        name: str | None = None,
+        use_as_complement: bool = False,
+        fit_on_batch: bool = False,
+        custom_fit: Iterable[str] = [],
+        **gate_params
+    ) -> StepRun:
+        """
+        Add a gate to a gating strategy and compute masks for samples.
+
+        Parameters
+        ----------
+        strategy_id : str
+            ID of the gating strategy to update.
+        gate_id : str
+            Unique identifier for the new gate.
+        gate_type : str
+            Gate class name (e.g., "RectangleGate", "PolygonGate").
+        dimensions : Sequence[str]
+            Dimension/channel IDs the gate operates on.
+        parent_id : str
+            Parent gate ID or "root" for ungated (default: "root").
+            Can be a single ID or comma-separated list for multiple parents.
+        layer : str
+            Data layer to use (default: "xf").
+        name : str | None
+            Human-readable name (default: gate_id).
+        use_as_complement : bool
+            Whether to use gate complement (default: False).
+        fit_on_batch : bool
+            If True, fit gate on pooled batch data (default: False).
+        save_masks : bool
+            Whether to save masks to sample .obs (default: True).
+        **gate_params
+            Gate-specific parameters (e.g., min_vals, max_vals for RectangleGate).
+
+        Returns
+        -------
+        StepRun
+            The completed add_gate step run.
+        """
+        # Get batch_id from strategy
+        gs_ref = self.repo.get_gating_strategy(strategy_id)
+        batch_id = gs_ref.batch_id
+
+        # Convert parent_id to list
+        if isinstance(parent_ids, str):
+            parent_ids = [parent_ids]
+        else:
+            parent_ids = list(parent_ids)
+
+        gate_node = {
+            "id": gate_id,
+            "gate_type": gate_type,
+            "dimensions": list(dimensions),
+            "parent_ids": parent_ids,
+            "layer": layer,
+            "name": name or gate_id,
+            "use_as_complement": use_as_complement,
+            "hyperparams": gate_params,
+        }
+
+        return self.run_step(
+            step_type="add_gate",
+            config={
+                "strategy_id": strategy_id,
+                "gate_node": gate_node,
+                "fit_on_batch": fit_on_batch,
+                "custom_fit": list(custom_fit)
+            },
+            inputs={
+                "batch_ids": [batch_id],
+            },
+        )
+
     def add_layer(
         self,
         layer: str,
         dimensions: Iterable[Mapping[str, Any]] | None = None,
-        sample_ids: Iterable[str] | None = None,
+        batch_id: str = "__panel__",
         default: bool = False
     ) -> StepRun:
         """
@@ -336,8 +447,8 @@ class InteractivePipeline:
             The name of the new data layer to add.
         dimensions : Iterable[Mapping[str, Any]] | None
             A list of dimension definitions to create the new layer. If None, the layer will be created empty.
-        sample_ids : Iterable[str] | None
-            Optional list of sample IDs to which the new layer will be applied. If None, applies to all samples.
+        batch_id: str
+            Batch ID to which the new layer will be applied.
         default : bool
             If True, sets the new layer as the default data layer for the samples. Defaults to False.
 
@@ -346,8 +457,6 @@ class InteractivePipeline:
         StepRun
             The completed add_layer step run.
         """
-        if sample_ids is None:
-            sample_ids = [p.name for p in self.repo.iter_sample_dirs()]
 
         catalog = self.repo.load_dimensions()
         if layer in catalog and dimensions is not None:
@@ -361,14 +470,14 @@ class InteractivePipeline:
         return self.run_step(
             step_type="add_layer",
             config={"layer": layer, "default": default},
-            inputs={"sample_ids": list(sample_ids)},
+            inputs={"batch_ids": [batch_id]},
         )
 
     def add_dimensions(
         self,
         layer: str,
         dimensions: Sequence[Mapping[str, Any]],
-        sample_ids: Sequence[str] | None = None
+        batch_id: str = "__panel__",
     ) -> StepRun:
         """
         Adds dimensions to an existing data layer.
@@ -379,20 +488,18 @@ class InteractivePipeline:
             The data layer to which dimensions will be added.
         dimensions : Sequence[Mapping[str, Any]]
             A list of dimension definitions to add.
-        sample_ids : Sequence[str] | None
-            Optional list of sample IDs to which the new dimensions will be applied. If None, applies to all samples.
+        batch_id: str
+            Batch ID to which the new dimensions will be applied.
 
         Returns
         -------
         StepRun
             The completed add_dimensions step run.
         """
-        if sample_ids is None:
-            sample_ids = [p.name for p in self.repo.iter_sample_dirs()]
         return self.run_step(
             step_type="add_dimensions",
             config={"layer": layer, "dimensions": dimensions},
-            inputs={"sample_ids": list(sample_ids)},
+            inputs={"batch_ids": [batch_id]},
         )
 
     def add_batch(
@@ -407,8 +514,6 @@ class InteractivePipeline:
 
         Parameters
         ----------
-        sample_ids : Iterable[str]
-            List of sample IDs to include in the batch.
         batch_id : str
             Optional batch identifier. If None, auto-generated.
         tags : Iterable[str] | None
