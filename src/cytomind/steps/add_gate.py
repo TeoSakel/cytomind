@@ -240,10 +240,15 @@ class AddGateStep(BaseStep):
         if step.flag == QCFlag.FAIL:
             return {}, qc
 
+        # Store counts in nested dict structure for easier access
+        summary = {
+            "root": len(adata),
+            "parents": {pid: int(parent_mask.sum()) for pid, parent_mask in parent_dict.items()},
+            "gates": {mask_id: int(gate_mask.sum()) for mask_id, gate_mask in mask.items()}
+        }
         output_info = {
-            "n_events": len(adata),
-            "n_pass": {k: int(np.sum(v)) for k, v in mask.items()},
-            "params": gate.to_dict().get("params", {}) if should_fit else None,
+            "summary": summary,
+            "params": gate.param_dict() if should_fit else None,
         }
 
         return output_info, qc
@@ -274,8 +279,7 @@ class AddGateStep(BaseStep):
 
         # Create GateNode from config
         gate_node: GateNode = output_info["gate_node"]
-        gate_data: dict[str, Any] = output_info["gate"].to_dict()
-        gate_node.params = gate_data.get("params", {})
+        gate_node.params = output_info["gate"].param_dict() if output_info.get("fit_on_batch", False) else {}
         for sample_id, sample_info in step_run.sample_outputs.items():
             params = sample_info.pop("params", None)
             if params:
@@ -285,7 +289,7 @@ class AddGateStep(BaseStep):
         strategy.add_node(gate_node)
 
         # For QuadrantGate, create individual GateNodes for each quadrant
-        if gate_node.gate_type == "QuadrantGate":
+        if gate_node.glm_type == "QuadrantGate":
             gate: QuadrantGate = output_info["gate"]
             for qid, loc in gate.locations.items():  # type: ignore[attr-defined]
                 # Create a GateNode for this quadrant
@@ -328,7 +332,7 @@ class AddGateStep(BaseStep):
             gate_name=gate_node.name or gate_node.id,
             dimensions=gate_node.dimensions,
             use_as_complement=gate_node.use_as_complement,
-            **gate_node.hyperparams
+            **gate_node.params.get("hyperparams", {})
         )
 
     def _build_batch_adata(

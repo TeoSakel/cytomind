@@ -1,10 +1,16 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Sequence, Mapping, TYPE_CHECKING
 
-import anndata as ad
 import numpy as np
-import pandas as pd
-from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+    from anndata import AnnData
+    from pandas import DataFrame
+else:
+    NDArray = object
+    AnnData = object
+    DataFrame = object
 
 class Gate(ABC):
     """
@@ -27,8 +33,8 @@ class Gate(ABC):
     def __init__(
         self,
         gate_name: str,
-        dimensions: list[str],
-        hyperparams: dict[str, Any] = {},
+        dimensions: Sequence[str],
+        hyperparams: Mapping[str, Any] = {},
         use_as_complement: bool = False,
         **kwargs
     ) -> None:
@@ -39,20 +45,21 @@ class Gate(ABC):
         ----------
         gate_name : str
             Human-readable name for the gate
-        dimensions : list[str]
+        dimensions : Sequence[str]
             List of dimension/channel IDs that this gate operates on
-        hyperparams : dict[str, Any]
-            Dictionary of hyperparameters for the gate
+        hyperparams : Mapping[str, Any]
+            Dictionary of hyperparameters for the gate used during fitting (e.g., number of clusters for a clustering gate)
         use_as_complement : bool
             If False, mask key is "{gate_name}.pos" (default)
             If True, mask key is "{gate_name}.neg" (complement of the gate)
         """
         self.gate_name = gate_name
-        self.dimensions = dimensions
+        self.dimensions = list(dimensions)
         self.use_as_complement = use_as_complement
-        self._hyperparams: dict[str, Any] = hyperparams.copy()
+        self._hyperparams: dict[str, Any] = dict(hyperparams)
         self._hyperparams.update(kwargs)
         self.params: dict[str, Any] = {}
+        self.diagnostics: dict[str, Any] = {}
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.gate_name}, dims={self.dimensions})"
@@ -71,10 +78,27 @@ class Gate(ABC):
             "use_as_complement": self.use_as_complement,
             "hyperparams": self._hyperparams,
             "params": self.params,
+            "diagnostics": self.diagnostics,
+        }
+
+    def param_dict(self) -> dict[str, Any]:
+        """Extract parameters from gate these include:
+            - hyperparams: user-configured settings that influence fitting (e.g., number of clusters)
+            - params: learned values from fitting (e.g., cluster centers) used to apply the gate
+            - diagnostics: any additional info from fitting (e.g., silhouette score) used for QC or analysis but not needed for applying the gate
+
+        Returns:
+            dict[str, Any]: Dictionary of gate parameters
+        """
+        gate_data = self.to_dict()
+        return {
+            "hyperparams": gate_data["hyperparams"],
+            "params": gate_data["params"],
+            "diagnostics": gate_data["diagnostics"],
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Gate":
+    def from_dict(cls, data: Mapping[str, Any]) -> "Gate":
         """Deserialize gate from dictionary."""
         gate = cls(
             gate_name=data["gate_name"],
@@ -83,6 +107,7 @@ class Gate(ABC):
             **data.get("hyperparams", {}),
         )
         gate.params = data.get("params", {})
+        gate.diagnostics = data.get("diagnostics", {})
         return gate
 
     def copy(self) -> "Gate":
@@ -94,9 +119,10 @@ class Gate(ABC):
             **self._hyperparams,
         )
         new_gate.params = self.params.copy()
+        new_gate.diagnostics = self.diagnostics.copy()
         return new_gate
 
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "Gate":
+    def fit(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "Gate":
         """
         Fit gate parameters from events (optional for parameter-only gates).
 
@@ -125,7 +151,7 @@ class Gate(ABC):
         return self
 
     @abstractmethod
-    def _fit_gate(self, events_slice: pd.DataFrame) -> None:
+    def _fit_gate(self, events_slice: DataFrame) -> None:
         """
         Internal fit implementation for subclasses to override.
 
@@ -139,7 +165,7 @@ class Gate(ABC):
         """
         pass
 
-    def apply(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
+    def apply(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
         """
         Apply gate to events and generate dictionary of boolean masks.
 
@@ -170,7 +196,7 @@ class Gate(ABC):
         return result
 
     @abstractmethod
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: DataFrame) -> dict[str, NDArray[np.bool_]]:
         """
         Internal apply implementation for subclasses to override.
 
@@ -187,7 +213,7 @@ class Gate(ABC):
         """
         pass
 
-    def fit_apply(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
+    def fit_apply(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
         """
         Convenience method to fit and then apply the gate in one step.
 
@@ -205,7 +231,7 @@ class Gate(ABC):
         """
         return self.fit(events, mask).apply(events, mask)
 
-    def _extract_events_slice(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]]) -> tuple[pd.DataFrame, NDArray[np.bool_] | slice]:
+    def _extract_events_slice(self, events: AnnData, mask: dict[str, NDArray[np.bool_]]) -> tuple[DataFrame, NDArray[np.bool_] | slice]:
         """
         Helper method to extract event data for the gate's dimensions,
         applying the provided mask if any.

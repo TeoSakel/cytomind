@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from bisect import bisect_right
-from typing import Any, Iterable, Mapping
+from typing import Any, Sequence, Mapping
 from numpy.typing import NDArray
 
 import anndata as ad
@@ -25,7 +27,7 @@ class RectangleGate(Gate):
     def __init__(
         self,
         gate_name: str,
-        dimensions: list[str],
+        dimensions: Sequence[str],
         min_vals: Mapping[str, float] = {},
         max_vals: Mapping[str, float] = {},
         use_as_complement: bool = False,
@@ -35,18 +37,19 @@ class RectangleGate(Gate):
         ----------
         gate_name : str
             Human-readable name
-        dimensions : list[str]
+        dimensions : Sequence[str]
             Dimension IDs to operate on (must have 1 or more)
         use_as_complement : bool
             If True, returns complement (negative) of the gate
         """
-        super().__init__(gate_name, dimensions, {"min_vals": min_vals, "max_vals": max_vals}, use_as_complement)
+        hyperparams = {"min_vals": dict(min_vals), "max_vals": dict(max_vals)}
+        super().__init__(gate_name, dimensions, hyperparams, use_as_complement)
         self._parse_hyperparams()
 
     def _parse_hyperparams(self) -> None:
         """Parse and validate hyperparameters, setting them in params."""
-        min_vals = self.hyperparams["min_vals"]
-        max_vals = self.hyperparams["max_vals"]
+        min_vals: dict[str, float] = self.hyperparams["min_vals"]
+        max_vals: dict[str, float] = self.hyperparams["max_vals"]
 
         # Validate min_vals
         self._check_thresholds(min_vals)
@@ -62,8 +65,8 @@ class RectangleGate(Gate):
                 )
 
         # Set params
-        self.params["min_vals"] = dict(min_vals)
-        self.params["max_vals"] = dict(max_vals)
+        self.params["min_vals"] = min_vals
+        self.params["max_vals"] = max_vals
 
     def _check_thresholds(self, thresholds: Mapping[str, float]) -> None:
         """Validate threshold dictionary."""
@@ -90,13 +93,6 @@ class RectangleGate(Gate):
         except KeyError:
             raise ValueError("RectangleGate max_vals have not been set. Please fit the gate first.")
 
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "RectangleGate":
-        """
-        RectangleGate doesn't require fitting (no event data to learn from).
-        Just copies hyperparams to params.
-        """
-        return self
-
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For RectangleGate, fit just copies hyperparams to params."""
         pass
@@ -122,15 +118,6 @@ class RectangleGate(Gate):
 
         return {self.gate_name: mask}
 
-    def to_dict(self) -> dict[str, Any]:
-        base = super().to_dict()
-        # Convert numpy arrays to lists for JSON serialization
-        for p in ("hyperparams", "params"):
-            for k in ("center", "covariance_matrix"):
-                if k in base[p] and not isinstance(base[p][k], list):
-                    base[p][k] = base[p][k].tolist()
-        return base
-
 
 @GateRegistry.register("Polygon")
 class PolygonGate(Gate):
@@ -148,8 +135,8 @@ class PolygonGate(Gate):
     def __init__(
         self,
         gate_name: str,
-        dimensions: list[str],
-        vertices: list[tuple[float, float]],
+        dimensions: Sequence[str],
+        vertices: list[list[float]],
         use_as_complement: bool = False,
     ) -> None:
         """
@@ -157,16 +144,17 @@ class PolygonGate(Gate):
         ----------
         gate_name : str
             Human-readable name
-        dimensions : list[str]
+        dimensions : Sequence[str]
             Exactly 2 dimension IDs (x, y)
-        vertices : list[tuple[float, float]]
+        vertices : list[list[float]]
             Ordered list of (x, y) coordinates defining polygon boundary
         use_as_complement : bool
             If True, returns complement (negative) of the gate
         """
+        if len(dimensions) != 2:
+            raise ValueError(f"PolygonGate requires exactly 2 dimensions, got {len(dimensions)}")
+
         super().__init__(gate_name, dimensions, {"vertices": vertices}, use_as_complement)
-        if len(self.dimensions) != 2:
-            raise ValueError(f"PolygonGate requires exactly 2 dimensions, got {len(self.dimensions)}")
         self.vertices = self._hyperparams["vertices"]
 
     @property
@@ -178,7 +166,7 @@ class PolygonGate(Gate):
             raise ValueError("PolygonGate vertices have not been set. Please fit the gate first.")
 
     @vertices.setter
-    def vertices(self, value: Iterable[Iterable[float]]) -> None:
+    def vertices(self, value: Sequence[Sequence[float]]) -> None:
         """Set vertices hyperparameter."""
         try:
             coords = np.asarray(value, dtype=np.float64)
@@ -195,10 +183,6 @@ class PolygonGate(Gate):
             raise ValueError("Vertex coordinates cannot be NaN")
 
         self.params["vertices"] = coords
-
-
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "PolygonGate":
-        return self
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For PolygonGate, fit just copies hyperparams to params."""
@@ -238,9 +222,9 @@ class EllipsoidGate(Gate):
     def __init__(
         self,
         gate_name: str,
-        dimensions: list[str],
-        center: list[float] | NDArray,
-        covariance_matrix: list[list[float]] | NDArray,
+        dimensions: Sequence[str],
+        center: Sequence[float] | NDArray,
+        covariance_matrix: Sequence[Sequence[float]] | NDArray,
         distance_square: float,
         use_as_complement: bool = False,
     ) -> None:
@@ -249,11 +233,11 @@ class EllipsoidGate(Gate):
         ----------
         gate_name : str
             Human-readable name
-        dimensions : list[str]
+        dimensions : Sequence[str]
             Dimension IDs (must have 2 or more)
-        center : list[float] | NDArray
+        center : Sequence[float] | NDArray
             Center of the ellipsoid in each dimension
-        covariance_matrix : list[list[float]] | NDArray
+        covariance_matrix : Sequence[Sequence[float]] | NDArray
             Covariance matrix defining ellipsoid shape
         distance_square : float
             Square of Mahalanobis distance threshold.
@@ -350,12 +334,6 @@ class EllipsoidGate(Gate):
 
         self.params["distance_square"] = value
 
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "EllipsoidGate":
-        """
-        EllipsoidGate requires fitting to learn parameters from event data.
-        """
-        return self
-
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         pass
 
@@ -406,8 +384,8 @@ class QuadrantGate(Gate):
     def __init__(
         self,
         gate_name: str,
-        dividers: Mapping[str, Iterable[float]],
-        quadrants: Mapping[str, Iterable[tuple[str, float]]],
+        dividers: Mapping[str, Sequence[float]],
+        quadrants: Mapping[str, Sequence[tuple[str, float]]],
         **kwargs: Any,
     ) -> None:
         """
@@ -434,7 +412,7 @@ class QuadrantGate(Gate):
         # Validate dividers
         dividers = dict(dividers)
         for dim_id, points in dividers.items():
-            if not isinstance(points, Iterable):
+            if not isinstance(points, Sequence):
                 raise TypeError(f"Division points for '{dim_id}' must be a list/tuple, got {type(points)}")
             points_list = sorted(list(points))
             if len(points_list) != len(set(points_list)):
@@ -484,7 +462,7 @@ class QuadrantGate(Gate):
         except KeyError:
             raise ValueError("QuadrantGate quadrants have not been computed. Please fit the gate first.")
 
-    def _compute_quadrants(self):
+    def _compute_quadrants(self) -> None:
         """
         Convert GatingML 2.0 dividers and locations to computed quadrants with borders.
 
@@ -533,9 +511,6 @@ class QuadrantGate(Gate):
 
         # Store computed quadrants
         self.params["quadrants"] = computed_quadrants
-
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "QuadrantGate":
-        return self
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
@@ -600,7 +575,7 @@ class BooleanGate(Gate):
         expression: str,
         use_as_complement: bool = False,
         **kwargs: Any,
-    ) -> None:
+    ):
         """
         Parameters
         ----------
@@ -651,7 +626,7 @@ class BooleanGate(Gate):
         except KeyError:
             raise ValueError("BooleanGate expression has not been set. Please fit the gate first.")
 
-    def _parse_expression(self) -> "BooleanGate":
+    def _parse_expression(self):
         """
         Parses the provided boolean expression.
         BooleanGate doesn't require fitting (no event data to learn from).
@@ -671,15 +646,6 @@ class BooleanGate(Gate):
 
         self.params["expression"] = expression
         self.params["variables"] = variables
-
-        return self
-
-    def fit(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "BooleanGate":
-        """
-        Parses the provided boolean expression.
-        BooleanGate doesn't require fitting (no event data to learn from).
-        """
-        return self
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return

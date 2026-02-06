@@ -1,7 +1,7 @@
 import json
 import re
 from typing import Any, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 import networkx as nx
@@ -34,7 +34,6 @@ class GateNode:
     glm_type: str | None = None           # GatingML type (optional)
     parent_ids: list[str] = field(default_factory=list)  # Parent node IDs in hierarchy
     use_as_complement: bool = False       # Whether to use gate as complement
-    hyperparams: dict[str, Any] = field(default_factory=dict)  # Gate hyperparameters used to compute params
     params: dict[str, Any] = field(default_factory=dict)  # Gate default parameters
     custom_gates: dict[str, dict[str, Any]] = field(default_factory=dict)  # Sample-specific custom gate parameters
 
@@ -42,6 +41,9 @@ class GateNode:
         pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
         if not re.match(pattern, self.id):
             raise ValueError(f"GateNode id '{self.id}' is not a valid identifier.")
+
+        if self.name is None:
+            self.name = self.id
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -59,19 +61,7 @@ class GateNode:
             Serialized gate node configuration
         """
 
-        return {
-            "id": str(self.id),
-            "gate_type": self.gate_type,
-            "dimensions": self.dimensions,
-            "layer": self.layer,
-            "name": self.name,
-            "glm_type": self.glm_type,
-            "parent_ids": self.parent_ids,
-            "use_as_complement": self.use_as_complement,
-            "hyperparams": self.hyperparams,
-            "params": self.params,
-            "custom_gates": self.custom_gates,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GateNode":
@@ -98,7 +88,6 @@ class GateNode:
             glm_type=data.get("glm_type"),
             parent_ids=data.get("parent_ids", []),
             use_as_complement=data.get("use_as_complement", False),
-            hyperparams=data.get("hyperparams", {}),
             params=data.get("params", {}),
             custom_gates=data.get("custom_gates", {}),
         )
