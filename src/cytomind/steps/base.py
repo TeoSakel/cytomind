@@ -1,10 +1,10 @@
 from __future__ import annotations
 from re import A
 from typing import Any, Mapping, Callable, TypeVar, Sequence, TYPE_CHECKING
-from collections import Counter
 
 import numpy as np
-from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
+from cytomind.domain.qc import EntityQCStatus, QCRunStatus, QCStepStatus, QCFlag
+from cytomind.qc.step import StepQCEvaluator
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -25,17 +25,31 @@ class BaseStep:
     """
     Default: run per sample; subclasses implement run_for_sample.
 
-    Steps own `per_sample_qc` - computation-time QC that captures:
-    - Transient data only available during processing
-    - Detailed metrics from processing algorithms
-    - Structured test records with thresholds and measurements
+    Best Hybrid QC Pattern:
+    Steps emit test records during execution with:
+    - test_type, test_name: categorize the test
+    - metadata: context (gate_id, channel, cutpoint, R², bounds, etc.)
+    - metrics: measured values (proportion_passing, sigma, etc.)
+    - status: "PENDING" (no threshold decisions during execution)
+
+    Example:
+        test = QCTestRecord(
+            test_type="gate_fit",
+            test_name="mindensity_1d",
+            metadata={"gate_id": "cd3", "channel": "CD3", "cutpoint": 2500.3},
+            metrics={"proportion_passing": 0.42, "r_squared": 0.91},
+            status="PENDING",  # Evaluator will classify
+        )
+        step = qc.get_step("FitGate")
+        step.add_reason("GATE_FIT_RESULT", test=test)
+
+    QC Evaluators (run after execution) will:
+    - Apply thresholds based on config
+    - Assign final status (PASS/WARN/FAIL)
+    - Add human-readable messages
 
     Steps should NOT compute user-facing summary_qc for review purposes.
     That responsibility belongs to RevisionHandlers via generate_review_summary().
-
-    The base summarize_qc() provides minimal aggregation (counts of PASS/WARN/FAIL)
-    for simple step completion tracking. For detailed review summaries,
-    use RevisionHandler.generate_review_summary().
     """
     default_config: dict[str, Any] = {}
 
@@ -88,15 +102,12 @@ class BaseStep:
                 output_info, batch_qc = self.prepare_batch(batch_id, step_run)
             except Exception as exc:
                 output_info = {}
-                batch_qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
+                batch_qc = step_run.qc.get_sample_steps(f"batch_{batch_id}")
                 step = batch_qc.get_step(self.__class__.__name__)
                 step.flag = QCFlag.FAIL
                 step.add_reason("PREPARE_BATCH_RUNTIME_ERROR", str(exc))
-                step_run.batch_outputs[batch_id] = output_info
-                step_run.qc_summary[batch_id] = batch_qc
 
             step_run.batch_outputs[batch_id] = output_info
-            step_run.qc_summary[batch_id] = batch_qc
             if batch_qc.overall_flag == QCFlag.FAIL:
                 # Skip processing samples in this batch if preparation failed
                 continue
@@ -114,12 +125,11 @@ class BaseStep:
                     output_info, qc = self.run_sample(sample_id, step_run)
                 except Exception as exc:
                     output_info = {}
-                    qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+                    qc = step_run.qc.get_sample_steps(sample_id)
                     step = qc.get_step(self.__class__.__name__)
                     step.flag = QCFlag.FAIL
                     step.add_reason("RUN_SAMPLE_RUNTIME_ERROR", str(exc))
                 step_run.sample_outputs[sample_id] = output_info
-                step_run.per_sample_qc[sample_id] = qc
 
             # Phase 3: Finalize batch (aggregate per-sample results)
             try:
@@ -132,7 +142,6 @@ class BaseStep:
                 step.add_reason("FINALIZE_BATCH_RUNTIME_ERROR", str(exc))
 
             step_run.batch_outputs[batch_id] = output_info
-            step_run.qc_summary[batch_id] = batch_qc
 
         # If no batches specified but sample_ids provided, process samples directly
         if not batch_ids and input_sample_ids:
@@ -141,16 +150,15 @@ class BaseStep:
                     output_info, qc = self.run_sample(sample_id, step_run)
                 except Exception as exc:
                     output_info = {}
-                    qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+                    qc = step_run.qc.get_sample_steps(sample_id)
                     step = qc.get_step(self.__class__.__name__)
                     step.flag = QCFlag.FAIL
                     step.add_reason("RUN_SAMPLE_RUNTIME_ERROR", str(exc))
 
                 step_run.sample_outputs[sample_id] = output_info
-                step_run.per_sample_qc[sample_id] = qc
 
-        # Aggregate overall QC summary from per-sample QC (dict format)
-        step_run.qc_summary["_overall_"] = self.summarize_qc(step_run.per_sample_qc)
+        # Populate summary in qc.summary
+        step_run.qc.summary = self.summarize_qc(step_run.qc)
         step_run = self.update_project(step_run)
         step_run = self.cleanup_step_run(step_run)
         step_run.status = "completed"
@@ -177,9 +185,9 @@ class BaseStep:
         Returns:
             (output_info, batch_qc) where:
                 output_info: dict with batch context/outputs
-                batch_qc: QCRunStatus for batch-level QC (stored in step_run.qc_summary[batch_id])
+                batch_qc: QCRunStatus for batch-level QC (accessible via step_run.qc.per_sample_steps[f\"batch_{batch_id}\"])
         """
-        qc = QCRunStatus(sample_id=f"batch_{batch_id}", step_run_id=step_run.id)
+        qc = step_run.qc.get_sample_steps(f"batch_{batch_id}")
         try:
             batch = self.project.batches[batch_id]
         except KeyError:
@@ -204,9 +212,9 @@ class BaseStep:
           (output_info, qc_info) for this sample
           where:
             output_info: dict to store under step_run.sample_outputs[sample.id]
-            qc_info: QCRunStatus to store under step_run.per_sample_qc[sample.id]
+            qc_info: QCRunStatus accessible via step_run.qc.per_sample_steps[sample.id]
         """
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -242,25 +250,9 @@ class BaseStep:
         output_info = step_run.batch_outputs.get(batch_id, {})
         return output_info, qc
 
-    def summarize_qc(self, per_sample_qc: Mapping[str, QCRunStatus]) -> dict:
-        sample_qc = [qc for sid, qc in per_sample_qc.items() if sid in self.project.samples]
-        overall = QCFlag.combine(qc.overall_flag for qc in sample_qc)
-        sample_counts = Counter(qc.overall_flag.value for qc in sample_qc)
-
-        # Include per-sample flags for detailed review
-        per_sample_flags = {
-            qc.sample_id: qc.overall_flag.value
-            for qc in sample_qc
-        }
-
-        return {
-            "overall_flag": overall.value,
-            "n_samples": sample_counts.total(),
-            "n_pass": sample_counts["PASS"],
-            "n_warn": sample_counts["WARN"],
-            "n_fail": sample_counts["FAIL"],
-            "per_sample_flags": per_sample_flags,
-        }
+    def summarize_qc(self, entity_qc: EntityQCStatus) -> dict:
+        """Generate summary from EntityQCStatus per-sample data."""
+        return StepQCEvaluator(self.repo).summarize(entity_qc)
 
     def update_project(self, step_run: StepRun) -> StepRun:
         """Apply project_updates accumulated by phases to the project.
@@ -285,23 +277,23 @@ class BaseStep:
 
             # Clean up: keep only IDs of updated entries
             cleaned = updates.copy()
-            if "samples" in updates:
-                cleaned["samples"] = list(updates["samples"].keys())
-            if "batches" in updates:
-                cleaned["batches"] = list(updates["batches"].keys())
-            if "compensations" in updates:
-                cleaned["compensations"] = [c.id if hasattr(c, 'id') else c for c in updates["compensations"]]
+            if "sample" in updates:
+                cleaned["sample"] = list(updates["sample"].keys())
+            if "batch" in updates:
+                cleaned["batch"] = list(updates["batch"].keys())
+            if "compensation" in updates:
+                cleaned["compensation"] = [c.id if hasattr(c, 'id') else c for c in updates["compensation"]]
             if "panel" in updates:
                 cleaned["panel"] = [ch.pnn if hasattr(ch, 'pnn') else ch for ch in updates["panel"]]
-            if "dimensions" in updates:
-                cleaned["dimensions"] = {
+            if "dimension" in updates:
+                cleaned["dimension"] = {
                     layer: [dim.id if hasattr(dim, 'id') else dim for dim in dims]
-                    for layer, dims in updates["dimensions"].items()
+                    for layer, dims in updates["dimension"].items()
                 }
-            if "transformations" in updates:
-                cleaned["transformations"] = list(updates["transformations"].keys())
-            if "gating_strategies" in updates:
-                cleaned["gating_strategies"] = [gs.id if hasattr(gs, 'id') else gs for gs in updates["gating_strategies"]]
+            if "transformation" in updates:
+                cleaned["transformation"] = list(updates["transformation"].keys())
+            if "gating_strategy" in updates:
+                cleaned["gating_strategy"] = [gs.id if hasattr(gs, 'id') else gs for gs in updates["gating_strategy"]]
 
             cleaned_updates.append(cleaned)
 

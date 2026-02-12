@@ -54,13 +54,8 @@ def apply_compensation(raw: AnnData, comp: CompensationRef, invert: bool = False
 class CompensateStep(BaseStep):
 
     # QC/threshold parameters — can be overridden via step_run.config
-    def run_sample(
-        self,
-        sample_id: str,
-        step_run: StepRun,
-    ) -> tuple[dict, QCRunStatus]:
-
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+    def run_sample(self, sample_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -83,7 +78,7 @@ class CompensateStep(BaseStep):
             step_comp.flag = QCFlag.FAIL
             step_comp.add_reason(
                 code="INVALID_COMP_ID",
-                message="comp_id input is neither a single str nor mapping from sample_id to comp_id."
+                message="Invalid compensation ID format in config."
             )
             return {}, qc
 
@@ -166,7 +161,7 @@ class CompensateStep(BaseStep):
         return output_info, qc
 
     def update_project(self, step_run: StepRun) -> StepRun:
-        qc_iter = step_run.per_sample_qc.items()
+        qc_iter = step_run.qc.sample_qc.items()
         samples = {
             sid: self.project.samples[sid]
             for sid, qc in qc_iter if qc.overall_flag != QCFlag.FAIL

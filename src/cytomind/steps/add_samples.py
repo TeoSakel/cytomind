@@ -25,8 +25,7 @@ class AddSamplesStep(BaseStep):
     """
 
     def run_sample(self, sample_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
-
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -201,9 +200,10 @@ class AddSamplesStep(BaseStep):
             return {}, qc
 
         # 1) Gather sample outputs
+        sample_flags = step_run.qc.sample_flags()
         outputs = {
             sid: step_run.sample_outputs[sid] for sid in batch
-            if step_run.per_sample_qc[sid].overall_flag == QCFlag.PASS
+            if sample_flags[sid] == QCFlag.PASS
         }
 
         # 2) Group samples by panel fingerprint
@@ -234,18 +234,17 @@ class AddSamplesStep(BaseStep):
         if len(panel_groups) > 1:
             step_panel_grouping.flag = QCFlag.WARN
             # Identify the primary panel group (largest by sample count)
-            primary_panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
-            primary_sample_ids = panel_groups[primary_panel_hash]
+            panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
+            primary_sample_ids = panel_groups[panel_hash]
 
             step_panel_grouping.add_reason(
                 code="MULTIPLE_PANELS",
                 message=(f"Multiple panel groups detected ({len(panel_groups)}). "
-                         f"Using primary panel (hash={primary_panel_hash[:8]}) "
+                         f"Using primary panel (hash={panel_hash[:8]}) "
                          f"with {len(primary_sample_ids)} samples. "
                          "Revision handler can harmonize panels later."))
 
             # Use primary panel group as canonical
-            panel_hash = primary_panel_hash
             panel = panel_cache[panel_hash]
             sample_ids = primary_sample_ids
 
@@ -256,7 +255,7 @@ class AddSamplesStep(BaseStep):
                     ph: {
                         "sample_ids": sids,
                         "panel": [ch.to_record() for ch in panel_cache[ph]],
-                        "is_primary": ph == primary_panel_hash,
+                        "is_primary": ph == panel_hash,
                         "n_samples": len(sids),
                     }
                     for ph, sids in panel_groups.items()
@@ -265,17 +264,17 @@ class AddSamplesStep(BaseStep):
 
             # Mark samples in non-primary groups with WARN
             for ph, sids in panel_groups.items():
-                if ph != primary_panel_hash:
-                    for sid in sids:
-                        sample_qc = step_run.per_sample_qc.get(sid)
-                        if sample_qc:
-                            sample_step = sample_qc.get_step("panel_group")
-                            sample_step.flag = QCFlag.WARN
-                            sample_step.add_reason(
-                                code="NON_PRIMARY_PANEL",
-                                message=(f"Sample has non-primary panel (group {ph[:8]}). "
-                                         f"Primary panel group is {primary_panel_hash[:8]}. "
-                                         "Panel harmonization may be needed."))
+                if ph == panel_hash:
+                    continue
+                for sid in sids:
+                    sample_qc = step_run.qc.get_sample_steps(sid)
+                    sample_step = sample_qc.get_step("panel_group")
+                    sample_step.flag = QCFlag.WARN
+                    sample_step.add_reason(
+                        code="NON_PRIMARY_PANEL",
+                        message=(f"Sample has non-primary panel (group {ph[:8]}). "
+                                    f"Primary panel group is {panel_hash[:8]}. "
+                                    "Panel harmonization may be needed."))
         else:
             # Single panel group: use it as the canonical project panel
             panel_hash = next(iter(panel_groups.keys()))
@@ -403,15 +402,15 @@ class AddSamplesStep(BaseStep):
         # Append project updates for this batch
         step_run.project_updates.append({
             "panel": panel,
-            "compensations": compensations,  # must be CompensationRef to keep _spill
-            "samples": samples,
-            "batches": batches,
-            "dimensions": dimensions,
+            "compensation": compensations,  # must be CompensationRef to keep _spill
+            "sample": samples,
+            "batch": batches,
+            "dimension": dimensions,
         })
 
         for sid in samples:
             out = step_run.sample_outputs.pop(sid)
-            if step_run.per_sample_qc[sid].overall_flag != QCFlag.PASS:
+            if sample_flags[sid] != QCFlag.PASS:
                 step_run.sample_outputs[sid] = out["sample_meta"]
 
 

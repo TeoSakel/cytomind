@@ -11,7 +11,7 @@ from pandas import DataFrame
 
 from .flow import *
 from .gates import GatingStrategyRef
-from .qc import QCRunStatus
+from .qc import EntityQCStatus
 
 __all__ = ["Project", "BatchRef", "SampleRef", "StepRun", "ResourceSpec", "RevisionSession"]
 
@@ -207,6 +207,11 @@ class StepRun:
         Each dict contains keys for project registries (samples, dimensions, compensations, etc.).
         Applied sequentially by update_project() in the order they were added.
         Each batch can append its own update dict to this list.
+
+    _qc: EntityQCStatus | None = None
+        Quality control status for this step run. Initialized by BaseStep.run() and
+        populated during execution. Contains per-sample QC data (qc.per_sample_steps)
+        and aggregated summary (qc.summary).
     """
     id: str
     step_type: str
@@ -217,24 +222,31 @@ class StepRun:
     sample_outputs: dict[str, Any] = field(default_factory=dict)  # keyed by sample_id
     batch_outputs: dict[str, Any] = field(default_factory=dict)   # keyed by batch_id
     project_updates: list[dict[str, Any]] = field(default_factory=list)  # list of project changes to apply
-    per_sample_qc: dict[str, QCRunStatus] = field(default_factory=dict)
-    qc_summary: dict[str, Any] = field(default_factory=dict)
+    _qc: EntityQCStatus | None = None
+
+    @property
+    def qc(self) -> EntityQCStatus:
+        if self._qc is None:
+            self._qc = EntityQCStatus(
+                entity_type="step",
+                entity_id=self.id,
+                context={}
+            )
+        return self._qc
 
     def to_dict(self) -> dict[str, Any]:
         base = asdict(self)
-        # Serialize QC objects
-        base["per_sample_qc"] = {
-            sid: qc.to_dict() for sid, qc in self.per_sample_qc.items()
-        }
+        # Serialize QC object
+        if self._qc:
+            base["qc"] = self._qc.to_dict()
+        else:
+            base["qc"] = None
         return base
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "StepRun":
-        per_sample_qc_data = data.get("per_sample_qc", {}) or {}
-        per_sample_qc = {
-            sid: QCRunStatus.from_dict(qc_dict)
-            for sid, qc_dict in per_sample_qc_data.items()
-        }
+        qc_data = data.get("qc")
+        qc = EntityQCStatus.from_dict(qc_data) if qc_data else None
         return cls(
             id=data["id"],
             step_type=data["step_type"],
@@ -243,8 +255,7 @@ class StepRun:
             sample_outputs=data.get("sample_outputs", {}),
             batch_outputs=data.get("batch_outputs", {}),
             project_updates=data.get("project_updates", []),
-            per_sample_qc=per_sample_qc,
-            qc_summary=data.get("qc_summary", {}),
+            _qc=qc,
             status=data.get("status", "pending"),
             created_at=data.get("created_at", ""),
         )
@@ -296,8 +307,7 @@ class ResourceSpec:
                 sample_outputs=step_dict.get("sample_outputs", {}),
                 batch_outputs=step_dict.get("batch_outputs", {}),
                 project_updates=step_dict.get("project_updates", []),
-                per_sample_qc=step_dict.get("per_sample_qc", {}),
-                qc_summary=step_dict.get("qc_summary", {}),
+                qc=EntityQCStatus.from_dict(step_dict["qc"]) if step_dict.get("qc") else None,
                 status=step_dict.get("status", "pending"),
                 created_at=step_dict.get("created_at", ""),
             )

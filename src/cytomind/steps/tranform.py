@@ -31,7 +31,7 @@ class AddLayerStep(BaseStep):
         sample_id: str,
         step_run: StepRun,
     ) -> tuple[dict, QCRunStatus]:
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = self._get_qc_run(sample_id, step_run)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -104,7 +104,7 @@ class AddLayerStep(BaseStep):
         # updates sample default layer
         layer: str = step_run.config["layer"]
         samples_to_update: dict[str, SampleRef] = {}
-        for sid, qc in step_run.per_sample_qc.items():
+        for sid, qc in step_run.qc.sample_qc.items():
             if qc.overall_flag != QCFlag.FAIL:
                 sample = self.project.samples[sid]
                 sample.default_layer = layer
@@ -122,8 +122,7 @@ class AddDimensionsStep(BaseStep):
         sample_id: str,
         step_run: StepRun,
     ) -> tuple[dict, QCRunStatus]:
-
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = self._get_qc_run(sample_id, step_run)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -136,7 +135,6 @@ class AddDimensionsStep(BaseStep):
         # 1) Parse config
         layer = step_run.config["layer"]
         new_dims = sorted(step_run.config.get("dimensions", []))
-        final_dim = step_run.config["final_dimensions"]
         if not new_dims:
             step = qc.get_step(f"update_dimensions_{layer}")
             step.flag = QCFlag.PASS

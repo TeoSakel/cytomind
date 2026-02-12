@@ -13,8 +13,7 @@ class LoadFCS(BaseStep):
     """Load FCS files into AnnData format: samples/{sample_id}/raw.h5ad"""
 
     def run_sample(self, sample_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
-
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -89,7 +88,7 @@ class LoadFCS(BaseStep):
     def update_project(self, step_run: StepRun) -> StepRun:
         samples = {
             sid: self.project.samples[sid]
-            for sid, qc in step_run.per_sample_qc.items() if qc.overall_flag != QCFlag.FAIL
+            for sid, qc in step_run.qc.sample_qc.items() if qc.overall_flag != QCFlag.FAIL
         }
         for sid, ref in samples.items():
             ref.n_events = step_run.sample_outputs[sid].get("n_events", 0)

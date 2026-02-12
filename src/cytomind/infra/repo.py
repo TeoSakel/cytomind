@@ -14,6 +14,7 @@ import anndata as ad
 
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef, TransformationRef
 from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef
+from cytomind.domain.qc import EntityQCStatus
 from cytomind.domain.transforms import get_default_transformations
 from cytomind.domain.gates import GateNode, GatingStrategyRef
 from cytomind.utils import now_iso, rlencode, rldecode
@@ -1172,6 +1173,41 @@ class ProjectRepository:
             Absolute path to the step directory.
         """
         return self.steps_dir / step_id
+
+    # ---------- QC I/O ----------
+
+    @property
+    def qc_root(self) -> Path:
+        """Path to project-level QC directory."""
+        return self.root / "qc"
+
+    def qc_entity_dir(self, entity_type: str, entity_id: str) -> Path:
+        """Path to a specific entity QC directory."""
+        return self.qc_root / entity_type / entity_id
+
+    def qc_entity_tables_dir(self, entity_type: str, entity_id: str) -> Path:
+        """Path to entity QC tables directory."""
+        return self.qc_entity_dir(entity_type, entity_id) / "tables"
+
+    def qc_entity_figures_dir(self, entity_type: str, entity_id: str) -> Path:
+        """Path to entity QC figures directory."""
+        return self.qc_entity_dir(entity_type, entity_id) / "figures"
+
+    def qc_entity_status_path(self, entity_type: str, entity_id: str) -> Path:
+        """Path to entity QC run metadata."""
+        return self.qc_entity_dir(entity_type, entity_id) / "status.json"
+
+    def load_qc_entity_status(self, entity_type: str, entity_id: str) -> EntityQCStatus:
+        """Load entity QC run metadata."""
+        path = self.qc_entity_status_path(entity_type, entity_id)
+        if not path.exists():
+            raise FileNotFoundError(f"QC status file not found for {entity_type} {entity_id}: {path.as_posix()}")
+        entity_data = self._read_json(path)
+        return EntityQCStatus.from_dict(entity_data)
+
+    def qc_entity_aggregates_path(self, entity_type: str, entity_id: str) -> Path:
+        """Path to entity QC aggregates file."""
+        return self.qc_entity_dir(entity_type, entity_id) / "aggregates.json"
 
     def revisions_dir(self, step_id: str) -> Path:
         """
