@@ -1,21 +1,22 @@
 from __future__ import annotations
 from typing import Iterable, Sequence, Mapping, Any, TYPE_CHECKING
+from pathlib import Path
+
+from anndata import AnnData
 
 if TYPE_CHECKING:
     from cytomind.revisions.base import BaseRevisionHandler
 else:
     BaseRevisionHandler = object
 
-from pathlib import Path
 
+from cytomind.domain.constants import PathLike
 from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef
 from .repo import ProjectRepository
 from cytomind.steps import StepRegistry
-from cytomind.qc import QCEvaluatorRegistry
+from cytomind.qc import EntityQCEvaluatorRegistry
 from cytomind.revisions import RevisionHandlerRegistry
 from cytomind.utils import now_iso
-
-PathLike = Path | str
 
 
 class InteractivePipeline:
@@ -84,80 +85,52 @@ class InteractivePipeline:
 
         step_run = step_class(repo=self.repo).run(step_run)
         self.repo.save_step_run(step_run)
-
-        # 3. QC Evaluation phase (if evaluator available)
-        qc_evaluator_class = QCEvaluatorRegistry.get(step_run.step_type)
-        if qc_evaluator_class:
-            qc_evaluator = qc_evaluator_class()
-            step_run = qc_evaluator.run_step_qc(self.repo, step_run)
-            self.repo.save_step_run(step_run)
         return step_run
 
     # ---- Review & Revision ----
 
-    def review_step(self, step_run_id: str) -> StepRun:
+    def start_revision(
+        self,
+        entity_type: str,
+        entity_id: str,
+        input_spec: Mapping[str, Any] = {},
+    ) -> BaseRevisionHandler:
         """
-        Get review summary for user inspection.
+        Initialize revision workspace for entity refinement.
 
         Parameters
         ----------
-        step_run_id : str
-            Step to review (e.g., "step_0003")
-
-        Returns
-        -------
-        StepRun
-            User-facing summary with tables, metrics, recommendations
-        """
-        step_run = self.repo.load_step_run(step_run_id)
-        qc_evaluator_class = QCEvaluatorRegistry.get(step_run.step_type)
-
-        if qc_evaluator_class:
-            qc_evaluator = qc_evaluator_class()
-            return qc_evaluator.run_step_qc(self.repo, step_run)
-
-        # Fallback if no evaluator
-        return step_run
-
-    def start_revision(self, step_run_id: str, input_spec: dict[str, Any]) -> BaseRevisionHandler:
-        """
-        Initialize revision workspace for iterative refinement.
-
-        Parameters
-        ----------
-        step_run_id : str
-            Step to revise (e.g., "step_0003")
-        input_spec : dict
-            Specification of inputs for revision handler
+        entity_type : str
+            Type of entity to revise (e.g., "compensation", "gating_strategy")
+        entity_id : str
+            Entity identifier (e.g., "comp_001")
+        input_spec : Mapping[str, Any]
+            User input specification for the revision handler
 
         Returns
         -------
         BaseRevisionHandler
             Initialized handler for managing the revision session
+
+        Raises
+        ------
+        ValueError
+            If no revision handler is registered for the entity type
         """
-        step_run = self.repo.load_step_run(step_run_id)
-
-        # Get handler and QC evaluator
-        revision_handler_class = RevisionHandlerRegistry.get(step_run.step_type)
-        qc_evaluator_class = QCEvaluatorRegistry.get(step_run.step_type)
-
+        # Get handler from registry by entity_type
+        revision_handler_class = RevisionHandlerRegistry.get(entity_type)
         if not revision_handler_class:
-            raise ValueError(f"No revision handler for step type '{step_run.step_type}'")
+            raise ValueError(f"No revision handler registered for entity type '{entity_type}'")
 
-        # Generate session ID
-        rev_dir = self.repo.revisions_dir(step_run.id)
-        num_rev = len(list(rev_dir.iterdir())) + 1 if rev_dir.exists() else 1
-        session_id = f"rev_{num_rev:03d}"
-        workspace = rev_dir / session_id
+        # Generate workspace directory
+        workspace = self.repo.generate_revision_workspace(entity_type, entity_id)
 
-        # Instantiate evaluator and handler
-        qc_evaluator = qc_evaluator_class() if qc_evaluator_class else None
+        # Instantiate handler (it will set up workspace and session)
         handler = revision_handler_class(
-            step_run=step_run,
             main_repo=self.repo,
             workspace=workspace,
-            session=session_id,
-            qc_evaluator=qc_evaluator)
+            entity_id=entity_id,
+        )
 
         # Initialize session
         session = handler.start_revision(input_spec)
@@ -201,6 +174,121 @@ class InteractivePipeline:
             new_step = self._execute_step(new_step)
 
         return new_step
+
+    # ---- QC Analysis ----
+
+    def get_entity_qc_table(
+        self,
+        entity_type: str,
+        entity_id: str,
+        table_type: str,
+        sample_ids: Sequence[str] | None = None,
+    ) -> Any:
+        """
+        Generate a QC table for an entity from its cached QC status.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of entity (e.g., "compensation", "gating_strategy")
+        entity_id : str
+            Entity identifier (e.g., "comp_001")
+        table_type : str
+            Type of table to generate (entity-specific)
+        sample_ids : Sequence[str] | None
+            Optional list of sample IDs to include. If None, includes all samples.
+
+        Returns
+        -------
+        DataFrame
+            Table with entity-specific columns matching the QC output format
+
+        Raises
+        ------
+        ValueError
+            If no QC evaluator is registered for the entity type
+        FileNotFoundError
+            If QC status file not found for the entity
+        """
+        # Get evaluator
+        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
+        if qc_evaluator_class is None:
+            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
+
+        qc_evaluator = qc_evaluator_class()
+
+        # Load QC status from repository
+        qc_status = self.repo.load_qc_entity_status(entity_type, entity_id)
+
+        # Load sample data if sample_ids provided
+        sample_data = None
+        layer = qc_evaluator.required_layer()
+        if sample_ids:
+            if layer:
+                sample_data = ((sid, self.repo.load_sample_adata(sid, layer=layer)) for sid in sample_ids)
+            else:
+                sample_data = ((sid, AnnData()) for sid in sample_ids)
+
+        # Generate table
+        return qc_evaluator.generate_table(qc_status, table_type, sample_data=sample_data)
+
+    def get_entity_qc_figure(
+        self,
+        entity_type: str,
+        entity_id: str,
+        test_key: Any,
+        sample_ids: Sequence[str] | None = None,
+        step_id: str | None = None,
+    ) -> Any:
+        """
+        Generate a QC diagnostic figure for an entity from its cached QC status.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of entity (e.g., "compensation", "gating_strategy")
+        entity_id : str
+            Entity identifier (e.g., "comp_001")
+        test_key : Any
+            Unique test identifier (from QCStepStatus.tests)
+        sample_ids : Sequence[str] | None
+            Optional list of sample IDs to include. If None, includes all samples.
+        step_id : str | None
+            Optional step ID for contextual information
+
+        Returns
+        -------
+        Figure
+            Diagnostic figure for the specified test
+
+        Raises
+        ------
+        ValueError
+            If no QC evaluator is registered for the entity type
+        FileNotFoundError
+            If QC status file not found for the entity
+        """
+        # Get evaluator
+        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
+        if qc_evaluator_class is None:
+            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
+
+        qc_evaluator = qc_evaluator_class()
+
+        # Load QC status from repository
+        qc_status = self.repo.load_qc_entity_status(entity_type, entity_id)
+
+        # Load sample data if sample_ids provided
+        sample_data = None
+        layer = qc_evaluator.required_layer()
+        if sample_ids:
+            if layer:
+                sample_data = ((sid, self.repo.load_sample_adata(sid, layer=layer)) for sid in sample_ids)
+            else:
+                sample_data = ((sid, AnnData()) for sid in sample_ids)
+
+        # Generate figure
+        return qc_evaluator.generate_figure(qc_status, test_key, sample_data=sample_data, step_id=step_id)
 
     # ---- Helpers ----
 

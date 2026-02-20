@@ -4,7 +4,7 @@ Base revision handler with common functionality.
 Provides state persistence, workspace management, and data I/O for iterative refinement.
 """
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
 from abc import ABC, abstractmethod
 from pathlib import Path
 from shutil import rmtree
@@ -14,101 +14,121 @@ import warnings
 import numpy as np
 import anndata as ad
 
-from cytomind.domain.pipeline import StepRun, RevisionSession
+from cytomind.domain.pipeline import RevisionSession, NumpyEncoder
+from cytomind.domain.qc import EntityQCStatus
+from cytomind.qc import EntityQCEvaluatorRegistry
 from cytomind.utils import now_iso
 
 if TYPE_CHECKING:
+    from cytomind.domain.constants import PathLike
     from cytomind.infra.repo import ProjectRepository
-    from cytomind.qc.base import StepQCEvaluator
+    from cytomind.domain.pipeline import StepRun
     from pandas import DataFrame
-    PathLike = str | Path
 else:
     ProjectRepository = object
-    StepQCEvaluator = object
+    StepRun = object
+    DataFrame = object
     PathLike = object
+
 
 class BaseRevisionHandler(ABC):
     """
-    Base class for revision handlers managing iterative refinement.
+    Base class for revision handlers managing iterative refinement of entities.
 
     Revision handlers:
     - Manage a workspace separate from the main project
     - Track iterations of user modifications
     - Use a QC evaluator to assess changes
-    - Produce metadata updates and optional new steps for commit
+    - Produce metadata updates for commit
     - Provide data I/O with workspace-first, main-repo fallback
     - Manage visualization subset caching
 
+    Entity types:
+    - "compensation": Revise compensation matrices
+    - "gating_strategy": Revise gating strategies
+    - "step": Edit step configuration for rerun (use BaseStepRevisionHandler)
+
     Subclasses must implement:
-    - apply_revision(session, user_input) -> dict (qc_summary)
-    - commit(session) -> (metadata_updates, optional_new_step)
+    - apply_revision(user_input) -> None
+    - _commit() -> (metadata_updates, optional_new_step)
+    - get_figure(plot_type, input_params) -> dict
+    - get_table(table_type, input_params) -> DataFrame
     """
 
+    entity_type: str
     _supported_figures: dict[str, Any] = {}
     _supported_tables: dict[str, Any] = {}
 
     def __init__(
         self,
-        step_run: StepRun,
         main_repo: ProjectRepository,
-        workspace: PathLike,
-        session: RevisionSession | str | None = None,
-        qc_evaluator: StepQCEvaluator | None = None,
+        workspace: PathLike | None = None,
+        session: RevisionSession | None = None,
+        entity_id: str | None = None,
         n_subset: int = 10000,
         seed: int = 42,
     ):
         """
-        Initialize revision handler with workspace management.
+        Initialize revision handler with entity context and workspace management.
 
         Parameters
         ----------
-        step_run : StepRun
-            The step being revised
+        entity_id : str | None
+            Specific entity identifier (e.g., "comp_001", "step_0003")
         main_repo : ProjectRepository
             Main repository instance
-        qc_evaluator : StepQCEvaluator | None
-            QC evaluator for assessing changes during revision
+        workspace : PathLike
+            Workspace directory for this revision session
+        entity_context : dict[str, Any] | None
+            Entity-specific context data (e.g., compensation batch, step config)
+        session : RevisionSession | str | None
+            Existing session or session ID to create
+        n_subset : int
+            Default number of events for visualization subsets
+        seed : int
+            Random seed for reproducibility
         """
-        self.step_run = step_run
         self.main_repo = main_repo
+        if workspace is None:
+            workspace = self.main_repo.generate_revision_workspace(self.entity_type, entity_id)
         self.workspace = Path(workspace)
-        self.workspace.mkdir(parents=True, exist_ok=True)
         if self.session_path.exists():
             self.load_session()
             if session is not None:
                 warnings.warn("Session already exists on disk; ignoring provided session identifier.")
-        elif isinstance(session, str):
-            session = RevisionSession(
-                id=session,
-                parent_step_id=step_run.id,
-                parent_step_type=step_run.step_type,
-                state="inactive",
-                created_at=now_iso(),
-                updated_at=now_iso(),
-                handler_state={
-                    "n_subset": n_subset,
-                    "seed": seed,
-                }
-            )
-            self.session = session
         elif isinstance(session, RevisionSession):
+            if session.id != self.workspace.name:
+                raise ValueError(f"Provided session ID '{session.id}' does not match workspace name '{self.workspace.name}'")
             self.session = session
             self.state["n_subset"] = self.state.get("n_subset", n_subset)
             self.state["seed"] = self.state.get("seed", seed)
+            self.save_session()
         else:
-            raise ValueError("Must provide either a session identifier or a RevisionSession instance.")
-        self.qc_evaluator = qc_evaluator
+            self.session = self.create_session()
+            self.session.entity_id = entity_id
+            self.state["n_subset"] = n_subset
+            self.state["seed"] = seed
 
-        # Viz subset caching
-        self._viz_metadata: dict[str, dict[str, Any]] = {}
+        if self.entity_type != self.session.entity_type:
+            raise TypeError(f"Session entity type '{self.session.entity_type}' does not match handler entity type '{self.entity_type}'")
+        if entity_id is not None and self.session.entity_id is not None and entity_id != self.session.entity_id:
+            raise ValueError(f"Provided entity_id '{entity_id}' does not match session entity_id '{self.session.entity_id}'")
+
+        qc_evaluator_class = EntityQCEvaluatorRegistry.get(self.entity_type)
+        if qc_evaluator_class is None:
+            raise TypeError(f"No QC evaluator registered for entity type '{self.entity_type}'")
+        try:
+            self.qc_evaluator = qc_evaluator_class()
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize QC evaluator for entity type: {e}")
+
         self._load_viz_metadata()
 
     # ---- Workspace properties ----
 
     @property
-    def step_id(self) -> str:
-        """Step identifier"""
-        return self.step_run.id
+    def state(self) -> dict[str, Any]:
+        return self.session.handler_state
 
     @property
     def session_path(self) -> Path:
@@ -121,8 +141,52 @@ class BaseRevisionHandler(ABC):
         return self.workspace / "viz_cache"
 
     @property
-    def state(self) -> dict[str, Any]:
-        return self.session.handler_state
+    def qc_cache_dir(self) -> Path:
+        """Directory for QC evaluation caching"""
+        return self.workspace / "qc_cache"
+
+    # ----- JSON I/O Helper -----
+
+    @staticmethod
+    def _write_json(path: PathLike, data: dict) -> None:
+        """
+        Write a JSON-serializable dictionary to a file.
+
+        Uses NumpyEncoder to handle numpy scalar types (int64, float64, etc.)
+        and numpy arrays, converting them to Python native types.
+
+        Parameters
+        ----------
+        path : PathLike
+            Destination file path.
+        data : dict
+            Data to serialize to JSON.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            json.dump(data, f, indent=2, cls=NumpyEncoder)
+
+    # ----- Handle QC evaluation -----
+
+    def load_entity_qc_cache(self, entity_id: str) -> EntityQCStatus:
+        """Load cached QC results for a specific entity."""
+        cache_path = self.qc_cache_dir / f"{entity_id}.json"
+        if cache_path.exists():
+            qc_data = json.loads(cache_path.read_text())
+            return EntityQCStatus.from_dict(qc_data)
+
+        qc_path = self.main_repo.qc_entity_status_path(self.entity_type, entity_id)
+        if qc_path.exists():
+            qc_data = json.loads(qc_path.read_text())
+            return EntityQCStatus.from_dict(qc_data)
+
+        return EntityQCStatus(entity_id=entity_id, entity_type=self.entity_type, generated_at=now_iso())
+
+    def save_entity_qc_cache(self, entity_id: str, qc_status: EntityQCStatus) -> None:
+        """Save QC results for a specific entity to cache."""
+        cache_path = self.qc_cache_dir / f"{entity_id}.json"
+        self._write_json(cache_path, qc_status.to_dict())
 
     # ---- Viz subset management ----
 
@@ -141,8 +205,7 @@ class BaseRevisionHandler(ABC):
     def _save_viz_metadata(self):
         """Persist viz subset metadata."""
         metadata_path = self.viz_metadata_path
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(json.dumps(self._viz_metadata, indent=2))
+        self._write_json(metadata_path, self._viz_metadata)
 
     def get_or_create_viz_subset(
         self,
@@ -176,7 +239,15 @@ class BaseRevisionHandler(ABC):
             n_subset = int(self.state["n_subset"])
         if seed is None:
             seed = int(self.state["seed"])
-        subset_key = f"{sample_id}:{layer}:{n_subset}"
+
+        # Validate sample exists in main repo
+        sample_ref = self.main_repo.load_sample_meta(sample_id)
+        n_total = sample_ref.n_events
+        if n_total <= 0:
+            raise ValueError(f"Sample {sample_id} has no events to subset.")
+        n_subset_cliped = min(n_subset, n_total)
+
+        subset_key = f"{sample_id}:{layer}:{n_subset_cliped}"
 
         # Check if already materialized
         if subset_key in self._viz_metadata:
@@ -185,30 +256,36 @@ class BaseRevisionHandler(ABC):
 
         # Need to materialize
         print(f"Creating viz subset: {subset_key}")
-        sample_ref = self.main_repo.load_sample_meta(sample_id)
 
         # Subsample
-        rng = np.random.RandomState(seed)
-        n_total = sample_ref.n_events
-        if n_total <= 0:
-            raise ValueError(f"Sample {sample_id} has no events to subset.")
-        if n_total <= n_subset:
-            indices = np.arange(n_total)
-        else:
+        if n_total > n_subset:
+            rng = np.random.RandomState(seed)
             indices = rng.choice(n_total, n_subset, replace=False)
             indices.sort()
+        else:
+            indices = slice(None)
+            if n_total != n_subset:
+                warnings.warn(f"Requested subset size {n_subset} exceeds total events {n_total} for sample {sample_id}. Using all events.")
         subset = self.main_repo.load_sample_adata(sample_id, layer=layer, mask=indices)
 
         # Save to disk
         self.viz_cache_dir.mkdir(parents=True, exist_ok=True)
-        subset_path = self.viz_cache_dir / f"{sample_id}_{layer}_{n_subset}.h5ad"
-        subset.write_h5ad(subset_path)
+        subset_path = self.viz_cache_dir / f"{sample_id}_{layer}_{n_subset_cliped}.h5ad"
+        if n_total > n_subset:
+            subset.write_h5ad(subset_path)
+        else:            # If not subsetting, we can create a hard link to save space
+            original_path = self.main_repo.sample_adata_path(sample_id, layer=layer)
+            try:
+                subset_path.hardlink_to(original_path)
+            except OSError:
+                # Fall back to copy if hard link fails (e.g., cross-filesystem)
+                subset.write_h5ad(subset_path)
 
         # Track in metadata
         self._viz_metadata[subset_key] = {
             "seed": seed,
             "n_total": n_total,
-            "n_subset": len(indices),
+            "n_subset": subset.n_obs,
             "created_at": now_iso(),
             "path": subset_path.as_posix()
         }
@@ -299,9 +376,30 @@ class BaseRevisionHandler(ABC):
     # ---- Abstract methods ----
 
     @abstractmethod
+    def start_revision(self, input_spec: Mapping[str, Any] = {}) -> RevisionSession:
+        """
+        Initialize revision workspace for a new session.
+
+        Override to set up handler-specific state (validate samples, copy resources, etc.).
+
+        Parameters
+        ----------
+        input_spec : dict
+            User input specification for revision.
+            Must contain 'sample_ids' key with list of sample IDs to revise,
+            or subclass must discover samples from entity context.
+
+        Returns
+        -------
+        RevisionSession
+            Initialized session
+        """
+        pass
+
+    @abstractmethod
     def apply_revision(
         self,
-        user_input: dict[str, Any],
+        user_input: Mapping[str, Any] = {},
     ) -> None:
         """
         Apply revision modifications and track in history.
@@ -338,7 +436,7 @@ class BaseRevisionHandler(ABC):
         pass
 
     @abstractmethod
-    def get_figure(self, plot_type: str, input_params: dict[str, Any]) -> dict[str, Any]:
+    def get_figure(self, plot_type: str, input_params: Mapping[str, Any] = {}) -> dict[str, Any]:
         """
         Generate a figure for visualization based on plot type and input parameters.
 
@@ -357,7 +455,7 @@ class BaseRevisionHandler(ABC):
         pass
 
     @abstractmethod
-    def get_table(self, table_type: str, input_params: dict[str, Any]) -> DataFrame:
+    def get_table(self, table_type: str, input_params: Mapping[str, Any] = {}) -> DataFrame:
         """
         Generate a table based on table type and input parameters.
 
@@ -409,59 +507,31 @@ class BaseRevisionHandler(ABC):
 
     # ---- Optional lifecycle methods ----
 
-    def start_revision(self, input_spec: dict[str, Any]) -> RevisionSession:
-        """
-        Initialize revision workspace for a new session.
-
-        Override to set up handler-specific state (validate samples, copy resources, etc.).
-
-        Parameters
-        ----------
-        input_spec : dict
-            User input specification for revision
-
-        Returns
-        -------
-        RevisionSession
-            Initialized session
-        """
-        # Default: just return the session
-        if self.session is None:
-            raise RuntimeError("Session not initialized")
-        self.session.state = "active"
-        input_spec = input_spec.copy()
-        self.state["n_subset"] = input_spec.pop("n_subset", self.state.get("n_subset", 10000))
-        self.state["seed"] = input_spec.pop("seed", self.state.get("seed", 42))
-
-        # Validate target samples
-        sample_flags: dict[str, str] = self.step_run.qc_summary["basic_summary"]["per_sample_flags"]
-        processed_samples = [sid for sid, flag in sample_flags.items() if flag != "FAIL"]
-        self.session.target_samples = input_spec.pop("sample_ids", []) or processed_samples
-        for sid in self.session.target_samples:
-            if sid not in sample_flags:
-                raise ValueError(f"Sample {sid} not in original step inputs.")
-            elif sample_flags[sid] == "FAIL":
-                raise ValueError(f"Sample {sid} was not processed successfully in the original step.")
-
-        self.session.input_spec = input_spec
-        now = now_iso()
-        self.session.created_at = now
-        self.session.updated_at = now
-        self.save_session()
-        return self.session
-
     def cleanup_workspace(self) -> None:
         """Clean up visualization cache but keep session info for debugging."""
         if self.viz_cache_dir.exists():
             rmtree(self.viz_cache_dir)
+
+    def create_session(self) -> RevisionSession:
+        """Create a new session with default values."""
+        now = now_iso()
+        return RevisionSession(
+            id=self.workspace.name,
+            entity_type=self.entity_type,
+            entity_id=None,
+            state="initialized",
+            context={},
+            revision_history=[],
+            created_at=now,
+            updated_at=now,
+        )
 
     def save_session(self) -> None:
         """Persist current session state to disk."""
         if self.session is None:
             raise RuntimeError("Session not initialized")
         session_path = self.session_path
-        session_path.parent.mkdir(parents=True, exist_ok=True)
-        session_path.write_text(json.dumps(self.session.to_dict(), indent=2))
+        self._write_json(session_path, self.session.to_dict())
 
     def load_session(self) -> RevisionSession:
         """Load session state from disk."""
