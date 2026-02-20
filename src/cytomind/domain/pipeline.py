@@ -2,10 +2,12 @@
 Structures to hold metadata required for the CytoMind pipeline management.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Any
+import json
 
+import numpy as np
 from anndata import AnnData
 from pandas import DataFrame
 
@@ -13,7 +15,26 @@ from .flow import *
 from .gates import GatingStrategyRef
 from .qc import EntityQCStatus
 
-__all__ = ["Project", "BatchRef", "SampleRef", "StepRun", "ResourceSpec", "RevisionSession"]
+__all__ = ["Project", "BatchRef", "SampleRef", "StepRun", "RevisionSession", "NumpyEncoder"]
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder to handle numpy scalar types and arrays.
+
+    Converts numpy integers and floats to their Python native equivalents
+    for JSON serialization. Arrays are converted to lists.
+    """
+
+    def default(self, o):
+        """Convert numpy types to JSON-serializable Python types."""
+        if isinstance(o, np.integer):
+            return int(o)
+        elif isinstance(o, np.floating):
+            return float(o)
+        elif isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
+
 
 @dataclass
 class Project:
@@ -208,6 +229,13 @@ class StepRun:
         Applied sequentially by update_project() in the order they were added.
         Each batch can append its own update dict to this list.
 
+    evaluable_products : dict[str, dict[str, Any]]
+        Products explicitly marked as ready for QC evaluation by finalize_batch().
+        Structure mirrors project_updates but only contains entities that have been
+        fully processed and are safe to evaluate. Steps populate this during finalize_batch()
+        to distinguish "created in registry" from "actually applicable/ready for QC".
+        Example: AddSamplesStep includes samples but NOT compensations (registered but not applied).
+
     _qc: EntityQCStatus | None = None
         Quality control status for this step run. Initialized by BaseStep.run() and
         populated during execution. Contains per-sample QC data (qc.per_sample_steps)
@@ -222,6 +250,7 @@ class StepRun:
     sample_outputs: dict[str, Any] = field(default_factory=dict)  # keyed by sample_id
     batch_outputs: dict[str, Any] = field(default_factory=dict)   # keyed by batch_id
     project_updates: list[dict[str, Any]] = field(default_factory=list)  # list of project changes to apply
+    evaluable_products: dict[str, dict[str, Any]] = field(default_factory=dict)  # products ready for QC evaluation
     _qc: EntityQCStatus | None = None
 
     @property
@@ -235,13 +264,19 @@ class StepRun:
         return self._qc
 
     def to_dict(self) -> dict[str, Any]:
-        base = asdict(self)
-        # Serialize QC object
-        if self._qc:
-            base["qc"] = self._qc.to_dict()
-        else:
-            base["qc"] = None
-        return base
+        return {
+            "id": self.id,
+            "step_type": self.step_type,
+            "status": self.status,
+            "created_at": self.created_at,
+            "config": self.config,
+            "inputs": self.inputs,
+            "sample_outputs": self.sample_outputs,
+            "batch_outputs": self.batch_outputs,
+            "project_updates": self.project_updates,
+            "evaluable_products": self.evaluable_products,
+            "qc": self._qc.to_dict() if self._qc else None,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "StepRun":
@@ -255,6 +290,7 @@ class StepRun:
             sample_outputs=data.get("sample_outputs", {}),
             batch_outputs=data.get("batch_outputs", {}),
             project_updates=data.get("project_updates", []),
+            evaluable_products=data.get("evaluable_products", {}),
             _qc=qc,
             status=data.get("status", "pending"),
             created_at=data.get("created_at", ""),
@@ -266,100 +302,42 @@ class StepRun:
 # ============================================================================
 
 @dataclass
-class ResourceSpec:
-    """
-    Abstract specification of what resources a revision step needs to read/write.
-
-    The actual paths are resolved by ProjectRepository based on the abstract
-    resource identifiers (sample_id, layer name, metadata file type, etc.).
-    """
-    # Project Metadata
-    samples: dict[str, SampleRef] = field(default_factory=dict)
-    dimensions: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
-    compensations: dict[str, CompensationRef] = field(default_factory=dict)
-    transformations: dict[str, TransformationRef] = field(default_factory=dict)
-    batches: dict[str, BatchRef] = field(default_factory=dict)
-    # Steps to rerun
-    steps: list[StepRun] = field(default_factory=list)  # steps that need to be rerun
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "dimensions": {
-                k: [dim.to_dict() for dim in v]
-                for k, v in self.dimensions.items()
-            },
-            "compensations": {k: v.to_dict() for k, v in self.compensations.items()},
-            "transformations": {k: v.to_dict() for k, v in self.transformations.items()},
-            "batches": self.batches,
-            "steps": [step.to_dict() for step in self.steps],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ResourceSpec":
-        steps_data = data.get("steps", [])
-        steps = []
-        for step_dict in steps_data:
-            step = StepRun(
-                id=step_dict["id"],
-                step_type=step_dict["step_type"],
-                config=step_dict.get("config", {}),
-                inputs=step_dict.get("inputs", {}),
-                sample_outputs=step_dict.get("sample_outputs", {}),
-                batch_outputs=step_dict.get("batch_outputs", {}),
-                project_updates=step_dict.get("project_updates", []),
-                qc=EntityQCStatus.from_dict(step_dict["qc"]) if step_dict.get("qc") else None,
-                status=step_dict.get("status", "pending"),
-                created_at=step_dict.get("created_at", ""),
-            )
-            steps.append(step)
-
-        return cls(
-            samples={sid: SampleRef.from_record(ref) for sid, ref in data.get("samples", {}).items()},
-            dimensions={
-                k: [DimensionDef.from_dict(dim) for dim in v]
-                for k, v in data.get("dimensions", {}).items()
-            },
-            compensations={k: CompensationRef.from_record(v) for k, v in data.get("compensations", {}).items()},
-            transformations={k: TransformationRef.from_record(v) for k, v in data.get("transformations", {}).items()},
-            batches=data.get("batches", []),
-            steps=steps,
-        )
-
-
-@dataclass
 class RevisionSession:
     """
-    Tracks the state of a revision session for a specific step.
+    Tracks the state of a revision session for a specific entity.
 
     A revision session creates an isolated workspace where users can iteratively
-    refine step results until satisfied, then commit changes back to main project.
+    refine entity data until satisfied, then commit changes back to main project.
+
+    Supported entity types:
+    - "compensation": Revise compensation matrices
+    - "gating_strategy": Revise gating strategies
+    - "step": Edit step configuration for rerun
     """
     id: str                              # revision session id (e.g., "rev_001")
-    parent_step_id: str                  # The step being revised (e.g., "step_0003")
-    parent_step_type: str                # Step type (e.g., "compensate")
+    entity_type: str                     # Entity type (e.g., "compensation", "gating_strategy", "step")
     state: str                           # "active" | "ready_to_commit" | "committed" | "cancelled"
-    created_at: str
-    updated_at: str
+    entity_id: str | None = None         # The entity being revised (e.g., "comp_001", "step_0003")
+    created_at: str = ""                 # ISO timestamp of when the revision session was created
+    updated_at: str = ""                 # ISO timestamp of the last update to the revision session
 
     # Handler state
     handler_state: dict[str, Any] = field(default_factory=dict)  # internal state for the revision handler
 
     # User selections for what to revise
-    target_samples: list[str] = field(default_factory=list)
-    input_spec: dict[str, Any] = field(default_factory=dict)  # User's revision specification
+    context: dict[str, Any] = field(default_factory=dict)  # context for the revision (arguments used to generate artifacts etc)
     revision_history: list[dict[str, Any]] = field(default_factory=list)  # History of apply_revision calls
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "parent_step_id": self.parent_step_id,
-            "parent_step_type": self.parent_step_type,
+            "entity_type": self.entity_type,
             "state": self.state,
+            "entity_id": self.entity_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "handler_state": self.handler_state,
-            "target_samples": self.target_samples,
-            "input_spec": self.input_spec,
+            "context": self.context,
             "revision_history": self.revision_history,
         }
 
@@ -367,13 +345,12 @@ class RevisionSession:
     def from_dict(cls, data: dict[str, Any]) -> "RevisionSession":
         return cls(
             id=data["id"],
-            parent_step_id=data["parent_step_id"],
-            parent_step_type=data["parent_step_type"],
+            entity_type=data["entity_type"],
             state=data["state"],
-            created_at=data["created_at"],
-            updated_at=data["updated_at"],
+            entity_id=data.get("entity_id"),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
             handler_state=data.get("handler_state", {}),
-            target_samples=data.get("target_samples", []),
-            input_spec=data.get("input_spec", {}),
+            context=data.get("context", {}),
             revision_history=data.get("revision_history", []),
         )

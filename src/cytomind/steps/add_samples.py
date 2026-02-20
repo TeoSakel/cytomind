@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import Any, Mapping
-from pathlib import Path
 
 import hashlib
 from datetime import datetime
@@ -13,7 +12,6 @@ from cytomind.domain.qc import QCRunStatus, QCFlag
 from .base import BaseStep
 from . import register_step
 
-PathLike = Path | str
 __all__ = ["AddSamplesStep"]
 
 @register_step("add_samples")
@@ -280,10 +278,6 @@ class AddSamplesStep(BaseStep):
             panel_hash = next(iter(panel_groups.keys()))
             panel = panel_cache[panel_hash]
             sample_ids = panel_groups[panel_hash]
-            step_panel_grouping.add_reason(
-                code="INFO",
-                message=f"All {len(sample_ids)} samples share a common panel (hash={panel_hash})."
-            )
             panel_groups_info = None
 
         # 3) Deduplicate compensations by (key, mat_txt)
@@ -305,11 +299,6 @@ class AddSamplesStep(BaseStep):
                     comp_dedupe[dedupe_key].batch.append(sid)
 
         compensations = list(comp_dedupe.values())
-        step_comp_dedup.add_reason(
-            code="INFO",
-            message=(f"Deduplicated {len(compensations)} unique compensation matrices",
-                     f"from {len(outputs)} samples.")
-        )
 
         # 4) Build sample refs
         step_build_samples = qc.get_step("build_sample_refs")
@@ -330,7 +319,6 @@ class AddSamplesStep(BaseStep):
                 rename=sm.get("rename", {}),
                 meta=sm["meta"],
             )
-        step_build_samples.add_reason(code="INFO", message=f"Built {len(samples)} sample references.")
 
         # 5) Create batches
         step_create_batches = qc.get_step("create_batches")
@@ -356,9 +344,6 @@ class AddSamplesStep(BaseStep):
             )
             n_comp_batches += 1
 
-        step_create_batches.add_reason(code="INFO",
-                                       message=f"Created {n_comp_batches} compensation-based batches.")
-
         # 6) Build dimensions for raw layer (one dimension per channel)
         step_build_dims = qc.get_step("build_dimensions")
         panel_dimensions = [
@@ -373,8 +358,6 @@ class AddSamplesStep(BaseStep):
             )
             for ch in panel
         ]
-        step_build_dims.add_reason(code="INFO",
-                                   message=f"Built {len(panel_dimensions)} raw dimensions from panel.")
 
         # Check if any sample is already compensated
         has_compensated_samples = any(s.compensation is not None for s in samples.values())
@@ -396,17 +379,19 @@ class AddSamplesStep(BaseStep):
                 for ch in panel
             ]
             dimensions["comp"] = comp_dimensions
-            step_build_dims.add_reason(code="INFO",
-                                       message=f"Built {len(comp_dimensions)} comp dimensions (samples already compensated).")
 
         # Append project updates for this batch
         step_run.project_updates.append({
             "panel": panel,
-            "compensation": compensations,  # must be CompensationRef to keep _spill
-            "sample": samples,
-            "batch": batches,
-            "dimension": dimensions,
+            "compensations": compensations,  # must be CompensationRef to keep _spill
+            "samples": samples,
+            "batches": batches,
+            "dimensions": dimensions,
         })
+
+        # Populate evaluable_products: these entities are fully initialized and ready for QC
+        # Intentionally exclude compensations (they exist in registry but haven't been applied to sample data)
+        step_run.evaluable_products["panel"] = {"panel": panel_groups_info}
 
         for sid in samples:
             out = step_run.sample_outputs.pop(sid)
@@ -415,8 +400,7 @@ class AddSamplesStep(BaseStep):
 
 
         # Store panel_groups_info in batch_outputs for revision handler
-        output_info = {"panel_groups_info": panel_groups_info}
-        return output_info, qc
+        return {}, qc
 
     def merge_config(self, step_run: StepRun) -> dict:
         batch_ids = step_run.inputs.get("batch_ids", [])

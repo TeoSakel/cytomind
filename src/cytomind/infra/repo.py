@@ -12,15 +12,14 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 
+from cytomind.domain.constants import PathLike, MaskLike
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef, TransformationRef
-from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef
+from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef, RevisionSession, NumpyEncoder
 from cytomind.domain.qc import EntityQCStatus
 from cytomind.domain.transforms import get_default_transformations
 from cytomind.domain.gates import GateNode, GatingStrategyRef
 from cytomind.utils import now_iso, rlencode, rldecode
 
-PathLike = Path | str
-MaskLike = NDArray[np.bool_] | NDArray[np.int_] | slice
 
 class ProjectRepository:
     """A repository for loading/saving project data."""
@@ -1205,6 +1204,12 @@ class ProjectRepository:
         entity_data = self._read_json(path)
         return EntityQCStatus.from_dict(entity_data)
 
+    def save_qc_entity_status(self, qc_status: EntityQCStatus) -> None:
+        """Persist entity QC status to disk."""
+        path = self.qc_entity_status_path(qc_status.entity_type, qc_status.entity_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json(path, qc_status.to_dict())
+
     def qc_entity_aggregates_path(self, entity_type: str, entity_id: str) -> Path:
         """Path to entity QC aggregates file."""
         return self.qc_entity_dir(entity_type, entity_id) / "aggregates.json"
@@ -1355,6 +1360,9 @@ class ProjectRepository:
         """
         Write a JSON-serializable dictionary to a file.
 
+        Uses NumpyEncoder to handle numpy scalar types (int64, float64, etc.)
+        and numpy arrays, converting them to Python native types.
+
         Parameters
         ----------
         path : PathLike
@@ -1365,7 +1373,7 @@ class ProjectRepository:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, cls=NumpyEncoder)
 
     # ------------- Gating Strategy Catalog I/O -----------------
 
@@ -1626,3 +1634,73 @@ class ProjectRepository:
         self._write_json(ref.path, ref_data)
         ref_data["graph"] = None  # Invalidate cached graph
         return GatingStrategyRef.from_dict(ref_data)
+
+    def generate_revision_workspace(self, entity_type: str, entity_id: str | None = None) -> Path:
+        """
+        Generate a new workspace directory for a QC revision of a given entity.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of the entity (e.g., "sample", "batch").
+        entity_id : str | None
+            Optional identifier of the entity. If None, generates a workspace for the entire entity type.
+
+        Returns
+        -------
+        Path
+            Absolute path to the newly created revision workspace directory.
+        """
+        workspace_dir = self.workspaces_dir / entity_type
+        if entity_id is None:
+            entity_id = "{:03d}".format(sum(1 for _ in workspace_dir.iterdir() if _.is_dir()))
+        else:
+            candidate = workspace_dir / entity_id
+            k = 0
+            while candidate.exists():
+                k += 1
+                entity_id = "{}_rev{:03d}".format(entity_id, k)
+                candidate = workspace_dir / entity_id
+        return workspace_dir / entity_id
+
+    @property
+    def workspaces_dir(self) -> Path:
+        """
+        Path to the QC revision workspaces directory.
+
+        Returns
+        -------
+        Path
+            Absolute path to 'workspaces'.
+        """
+        return self.root / "workspaces"
+
+    def load_revision_session(self, entity_type: str, session_id: str) -> RevisionSession:
+        """
+        Load a QC revision session from disk.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of the entity (e.g., "sample", "batch").
+        session_id : str
+            Identifier of the revision session.
+
+        Returns
+        -------
+        RevisionSession
+            Loaded RevisionSession object.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the session file does not exist.
+        json.JSONDecodeError
+            If the session file is not valid JSON.
+        """
+        path = self.workspaces_dir / entity_type / session_id / "session.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Revision session file not found: {path.as_posix()}")
+        data = self._read_json(path)
+        return RevisionSession.from_dict(data)
+

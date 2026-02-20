@@ -1,9 +1,9 @@
 from __future__ import annotations
 from re import A
-from typing import Any, Mapping, Callable, TypeVar, Sequence, TYPE_CHECKING
+from typing import Any, Callable, TypeVar, Sequence, TYPE_CHECKING
 
 import numpy as np
-from cytomind.domain.qc import EntityQCStatus, QCRunStatus, QCStepStatus, QCFlag
+from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
 from cytomind.qc.step import StepQCEvaluator
 
 if TYPE_CHECKING:
@@ -102,7 +102,7 @@ class BaseStep:
                 output_info, batch_qc = self.prepare_batch(batch_id, step_run)
             except Exception as exc:
                 output_info = {}
-                batch_qc = step_run.qc.get_sample_steps(f"batch_{batch_id}")
+                batch_qc = step_run.qc.batch_qc
                 step = batch_qc.get_step(self.__class__.__name__)
                 step.flag = QCFlag.FAIL
                 step.add_reason("PREPARE_BATCH_RUNTIME_ERROR", str(exc))
@@ -157,9 +157,9 @@ class BaseStep:
 
                 step_run.sample_outputs[sample_id] = output_info
 
-        # Populate summary in qc.summary
-        step_run.qc.summary = self.summarize_qc(step_run.qc)
+        # Apply project updates, then evaluate and persist QC
         step_run = self.update_project(step_run)
+        self.evaluate_step_run(step_run)
         step_run = self.cleanup_step_run(step_run)
         step_run.status = "completed"
 
@@ -185,9 +185,9 @@ class BaseStep:
         Returns:
             (output_info, batch_qc) where:
                 output_info: dict with batch context/outputs
-                batch_qc: QCRunStatus for batch-level QC (accessible via step_run.qc.per_sample_steps[f\"batch_{batch_id}\"])
+                batch_qc: QCRunStatus for batch-level QC (accessible via step_run.qc.batch_qc)
         """
-        qc = step_run.qc.get_sample_steps(f"batch_{batch_id}")
+        qc = step_run.qc.batch_qc
         try:
             batch = self.project.batches[batch_id]
         except KeyError:
@@ -232,13 +232,18 @@ class BaseStep:
         - Aggregate results (pooled statistics, batch-level summaries)
         - Populate step_run.project_updates with changes to persist
         - Update step_run.batch_outputs[batch_id] with aggregated results
+        - Populate step_run.evaluable_products with products ready for QC evaluation
         - Add finalize-specific QC steps to the provided qc
+
+        Note: Only add to evaluable_products if the product is fully processed and safe to evaluate.
+        Example: AddSamplesStep adds samples, panel, dimensions, batches but NOT compensations
+        (they are registered but not yet applied to sample data).
 
         Default implementation does nothing (no-op).
 
         Args:
             batch_id: ID of the batch to finalize
-            step_run: shared execution context (read from sample_outputs, write to project_updates)
+            step_run: shared execution context (read from sample_outputs, write to project_updates & evaluable_products)
             qc: QCRunStatus from prepare_batch (add new steps to this)
 
         Returns:
@@ -250,64 +255,84 @@ class BaseStep:
         output_info = step_run.batch_outputs.get(batch_id, {})
         return output_info, qc
 
-    def summarize_qc(self, entity_qc: EntityQCStatus) -> dict:
-        """Generate summary from EntityQCStatus per-sample data."""
-        return StepQCEvaluator(self.repo).summarize(entity_qc)
+    def evaluate_step_run(self, step_run: StepRun) -> None:
+        """
+        Evaluate and persist QC for the step run and its products.
+
+        Uses entity-oriented evaluation:
+        - Step's own QC always uses StepQCEvaluator (entity_type="step")
+        - Product QC delegates to entity-specific evaluators from registry
+        """
+        step_evaluator = StepQCEvaluator(config=self.config)
+
+        # Evaluate and persist product QC
+        for qc_status in step_evaluator.evaluate_step_products(self.repo, step_run):
+            step_run.qc.update_batch_steps(qc_status.batch_qc)
+            for sid, qc in qc_status.sample_qc.items():
+                step_run.qc.update_sample_steps(sid, qc)
+            self.repo.save_qc_entity_status(qc_status)
+
+        # Evaluate step's own QC
+        step_qc = step_evaluator.parse_step(step_run)
+        step_qc = step_evaluator.update_entity_qc(entity=step_run, entity_qc=step_qc)
+        self.repo.save_qc_entity_status(step_qc)
+
 
     def update_project(self, step_run: StepRun) -> StepRun:
         """Apply project_updates accumulated by phases to the project.
 
         The step implementation (prepare_batch/finalize_batch) appends update dicts
-        to project_updates list. This method applies them sequentially, then cleans
-        up the updates to only keep IDs of updated entries.
+        to project_updates list. This method applies them sequentially.
 
-        Subclasses can override to add step-specific cleanup or validation before
+        Subclasses can override to add step-specific validation before
         or after calling super().update_project().
 
         Args:
             step_run: execution context with accumulated project_updates list
 
         Returns:
-            step_run: with project updates applied and cleaned up
+            step_run: with project updates applied
         """
-        # Apply updates and collect cleaned versions
-        cleaned_updates = []
+        # Apply updates to project
         for updates in step_run.project_updates:
             self.repo.update_project_metadata(**updates)
 
-            # Clean up: keep only IDs of updated entries
-            cleaned = updates.copy()
-            if "sample" in updates:
-                cleaned["sample"] = list(updates["sample"].keys())
-            if "batch" in updates:
-                cleaned["batch"] = list(updates["batch"].keys())
-            if "compensation" in updates:
-                cleaned["compensation"] = [c.id if hasattr(c, 'id') else c for c in updates["compensation"]]
-            if "panel" in updates:
-                cleaned["panel"] = [ch.pnn if hasattr(ch, 'pnn') else ch for ch in updates["panel"]]
-            if "dimension" in updates:
-                cleaned["dimension"] = {
-                    layer: [dim.id if hasattr(dim, 'id') else dim for dim in dims]
-                    for layer, dims in updates["dimension"].items()
-                }
-            if "transformation" in updates:
-                cleaned["transformation"] = list(updates["transformation"].keys())
-            if "gating_strategy" in updates:
-                cleaned["gating_strategy"] = [gs.id if hasattr(gs, 'id') else gs for gs in updates["gating_strategy"]]
-
-            cleaned_updates.append(cleaned)
-
-        # Replace full updates with cleaned versions
-        step_run.project_updates = cleaned_updates
         return step_run
 
     def cleanup_step_run(self, step_run: StepRun) -> StepRun:
         """
         Cleanup any temporary data in step_run before persisting.
 
-        Default implementation does nothing. Subclasses can override
-        to remove large intermediate data structures if needed.
+        Removes custom objects from project_updates and keeps only IDs
+        to avoid JSON serialization issues. Subclasses can override
+        to remove additional large intermediate data structures if needed.
+
+        Args:
+            step_run: execution context to cleanup
+
+        Returns:
+            step_run: with custom objects replaced by IDs
         """
+        # Clean up project_updates: keep only IDs of updated entries
+        for updates in step_run.project_updates:
+            if "samples" in updates:
+                updates["samples"] = list(updates["samples"].keys())
+            if "batches" in updates:
+                updates["batches"] = list(updates["batches"].keys())
+            if "compensations" in updates:
+                updates["compensations"] = [c.id for c in updates["compensations"]]
+            if "panel" in updates:
+                updates["panel"] = [ch.pnn for ch in updates["panel"]]
+            if "dimensions" in updates:
+                updates["dimensions"] = {
+                    layer: [dim.id for dim in dims]
+                    for layer, dims in updates["dimensions"].items()
+                }
+            if "transformations" in updates:
+                updates["transformations"] = list(updates["transformations"].keys())
+            if "gating_strategies" in updates:
+                updates["gating_strategies"] = [gs.id for gs in updates["gating_strategies"]]
+
         return step_run
 
     # --- utility methods for steps -----

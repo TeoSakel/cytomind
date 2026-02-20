@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Mapping, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cytomind.domain.flow import CompensationRef
@@ -12,6 +12,7 @@ else:
     SampleRef = object
     StepRun = object
 
+from cytomind.domain.pipeline import StepRun
 from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
 from .base import BaseStep
 from . import register_step
@@ -53,9 +54,20 @@ def apply_compensation(raw: AnnData, comp: CompensationRef, invert: bool = False
 @register_step("compensate")
 class CompensateStep(BaseStep):
 
-    # QC/threshold parameters — can be overridden via step_run.config
+    default_config = {"store_raw": True}  # whether to store raw data if we have to undo compensation to recover it
+
     def run_sample(self, sample_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
+
+        # Init results
+        output_info: dict[str, Any] = {
+            "input_files": [],
+            "output_files": [],
+            "comp_applied": None,
+            "raw_recovered": False
+        }
         qc = step_run.qc.get_sample_steps(sample_id)
+
+        # 0) Validate sample exists in project
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -63,10 +75,7 @@ class CompensateStep(BaseStep):
             step.flag = QCFlag.FAIL
             step.add_reason(code="SAMPLE_NOT_FOUND",
                             message=f"Sample {sample_id} not found in project.")
-            return {}, qc
-
-        input_files: list[str] = []
-        output_files: list[str] = []
+            return output_info, qc
 
         # 1) Load compensation
         step_comp = qc.get_step("load_compensation")
@@ -80,7 +89,7 @@ class CompensateStep(BaseStep):
                 code="INVALID_COMP_ID",
                 message="Invalid compensation ID format in config."
             )
-            return {}, qc
+            return output_info, qc
 
         try:
             comp = self.project.compensations[comp_id]
@@ -90,11 +99,12 @@ class CompensateStep(BaseStep):
                 code="COMP_NOT_FOUND",
                 message=f"Compensation {comp_id} not found in project."
             )
-            return {}, qc
-        input_files.append(self.repo.spillover_path(comp.id).as_posix())
+            return output_info, qc
+        output_info["input_files"].append(self.repo.spillover_path(comp.id).as_posix())
 
         # 2) Check if sample is already compensated
         comp_adata_path = self.repo.sample_adata_path(sample.id, layer='comp')
+        raw_adata_path = self.repo.sample_adata_path(sample.id, layer='raw')
         if sample.compensation is not None and sample.compensation == comp.id:
             if not comp_adata_path.exists():
                 step_apply = qc.get_step("load_compensated_data")
@@ -104,39 +114,40 @@ class CompensateStep(BaseStep):
                     message=(f"Sample {sample.id} is marked as compensated with compensation {comp.id}, "
                              "but 'comp' layer data is missing.")
                 )
-                return {}, qc
+                return output_info, qc
             step_apply = qc.get_step("apply_compensation")
             step_apply.flag = QCFlag.PASS
             step_apply.add_reason(
                 code="INFO",
                 message=f"Sample {sample.id} is already compensated with compensation {comp.id}."
             )
-            output_files.append(comp_adata_path.as_posix())
-            output_info = {"input_files": input_files,
-                           "output_files": output_files,
-                           "comp_applied": (sample.id, comp.id)}
+            if self.config["store_raw"] and not raw_adata_path.exists():
+                self._undo_compensation(sample, qc)  # create raw layer (useful for qc/revision)
+                output_info["raw_recovered"] = True
             return output_info, qc
 
         # 3) Get Raw Data
-        raw_path = self.repo.sample_adata_path(sample.id, layer='raw')
-        if raw_path.exists():
-            raw, step_raw = self.run_step(
+        if raw_adata_path.exists():
+            raw, _ = self.run_step(
                 qc,
                 "load_anndata_raw",
                 self.repo._load_sample_layer,
                 reason_code_fail="LOAD_ANNDATA_ERROR",
-                sample=sample,
+                sample_id=sample.id,
                 layer='raw',
                 backed=False
             )
-            input_files.append(raw_path.as_posix())
+            output_info["input_files"].append(raw_adata_path.as_posix())
         else:
             # If raw is missing, attempt to produce it by undoing any existing compensation
-            raw, step_raw  = self._undo_compensation(sample, qc)
-            input_files.append(comp_adata_path.as_posix())
+            raw, step_save_raw  = self._undo_compensation(sample, qc)
+            output_info["input_files"].append(comp_adata_path.as_posix())
+            if self.config["store_raw"] and step_save_raw.flag == QCFlag.PASS:
+                output_info["output_files"].append(raw_adata_path.as_posix())
+                output_info["raw_recovered"] = True
 
         if raw is None:
-            return {}, qc
+            return output_info, qc
 
         adata, step_apply = self.run_step(
             qc,
@@ -147,17 +158,23 @@ class CompensateStep(BaseStep):
             comp=comp,
         )
         if not adata:
-            return {}, qc
+            return output_info, qc
 
         step_save = self.save_adata(sample, adata, qc, layer="comp")[1]
         if step_save.flag == QCFlag.FAIL:
-            return {}, qc
-        output_files.append(self.repo.sample_adata_path(sample.id, layer='comp').as_posix())
+            return output_info, qc
+        output_info["output_files"].append(self.repo.sample_adata_path(sample.id, layer='comp').as_posix())
 
         sample.compensation = comp.id
-        output_info = {"input_files": input_files,
-                       "output_files": output_files,
-                       "comp_applied": (sample.id, comp.id)}
+        output_info["comp_applied"] = comp.id
+
+        # Populate evaluable_products for QC evaluation
+        if "compensation" not in step_run.evaluable_products:
+            step_run.evaluable_products["compensation"] = {}
+        if comp.id not in step_run.evaluable_products["compensation"]:
+            step_run.evaluable_products["compensation"][comp.id] = {"sample_ids": []}
+        step_run.evaluable_products["compensation"][comp.id]["sample_ids"].append(sample.id)
+
         return output_info, qc
 
     def update_project(self, step_run: StepRun) -> StepRun:
@@ -229,12 +246,22 @@ class CompensateStep(BaseStep):
             return None, step_load_comp
 
         # 3) Invert compensation
-        return self.run_step(
+        raw, step_invert = self.run_step(
             qc,
             "invert_compensation",
             apply_compensation,
-            reason_code_fail="COMP_RUN_ERROR",
+            reason_code_fail="COMP_INVERT_ERROR",
             raw=comp_adata,
             comp=comp,
             invert=True,
         )
+
+        if raw is not None and self.config["store_raw"]:
+            # If raw is recovered successfully try to store for future revisions
+            _, step_save_raw = self.save_adata(sample, raw, qc, layer="raw")
+            if step_save_raw.flag == QCFlag.FAIL:
+                step_save_raw.flag = QCFlag.WARN  # warn instead of fail since we still have the compensated data
+            return raw, step_save_raw
+        else:
+            return raw, step_invert
+

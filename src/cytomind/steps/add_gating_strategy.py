@@ -75,7 +75,15 @@ class AddGatingStrategyStep(BaseStep):
             glm_version=glm_version,
         )
         strategy.init_graph()
-        step_run.project_updates.append({"gating_strategies": [strategy]})
+        step_run.project_updates.append({"gating_strategy": [strategy]})
+
+        # Populate evaluable_products: new gating strategy is ready for evaluation
+        step_run.evaluable_products["gating_strategies"] = {
+            strategy_id: {
+                "gate_ids": [],  # no gates added yet, just the strategy itself
+                "parent_ids": [],
+            }
+        }
 
         return {}, qc
 

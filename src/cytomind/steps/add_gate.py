@@ -166,7 +166,7 @@ class AddGateStep(BaseStep):
         Returns:
             (output_info, qc) tuple
         """
-        qc = QCRunStatus(sample_id=sample_id, step_run_id=step_run.id)
+        qc = step_run.qc.get_sample_steps(sample_id)
 
         # Get sample using run_step
         try:
@@ -287,6 +287,7 @@ class AddGateStep(BaseStep):
 
         # Add the gate node with its attributes
         strategy.add_node(gate_node)
+        gate_ids = [gate_node.id]
 
         # For QuadrantGate, create individual GateNodes for each quadrant
         if gate_node.glm_type == "QuadrantGate":
@@ -307,8 +308,14 @@ class AddGateStep(BaseStep):
                 )
                 # Add node with attributes to graph
                 strategy.add_node(quadrant_node)
+                gate_ids.append(quadrant_node.id)
 
-        step_run.project_updates.append({"gating_strategies": [strategy]})
+        step_run.project_updates.append({"gating_strategy": [strategy]})
+
+        # Populate evaluable_products: gating strategy is now updated with new gate(s)
+        # Include metadata about parent dependencies for QC validation
+        step_run.evaluable_products["gate_node"] = {gid: {"strategy_id": strategy_id} for gid in gate_ids}
+
         output_info["gate_node"] = gate_node.to_dict()
         output_info["strategy_id"] = strategy_id
         del output_info["gate"]
