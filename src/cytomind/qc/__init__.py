@@ -21,18 +21,17 @@ class EntityQCEvaluatorRegistry:
         """
         Decorator to register a QC evaluator for an entity type.
 
-        Works for both domain entities (compensation, gating_strategy) and
-        step entities (compensate, universal_gates, etc.).
+        Register evaluators by entity type (not step type).
+
+        For entity-oriented design:
+        - Domain entities (compensation, gating_strategy) register by entity type
+        - Steps always use StepQCEvaluator (entity_type="step")
+        - Products created by steps are evaluated by their entity-type evaluators
 
         Usage:
             @EntityQCEvaluatorRegistry.register("compensation")
             class CompensationQCEvaluator(EntityQCEvaluator):
                 entity_type = "compensation"
-                ...
-
-            @EntityQCEvaluatorRegistry.register("compensate")  # step type
-            class CompensationStepQCEvaluator(EntityQCEvaluator):
-                entity_type = "step"
                 ...
         """
 
@@ -54,6 +53,4 @@ class EntityQCEvaluatorRegistry:
 
 
 # Import evaluators to trigger registration
-from . import compensation  # noqa: E402, F401
-from .step import StepQCEvaluator
-from . import gates  # noqa: E402, F401
+from . import compensation, step

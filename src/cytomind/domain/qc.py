@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Hashable, Mapping, Iterable, Sequence, Any, TYPE_CHECKING
+from typing import Mapping, Iterable, Sequence, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from numpy import floating
@@ -52,8 +52,9 @@ class QCTestRecord:
     - QC criteria to be adjusted and re-evaluated without re-running pipeline
     - Centralized threshold management in evaluators
     """
-    test_type: str                                                          # "gate_fit", "compensation_channel", etc.
-    test_name: str                                                          # unique name for this test instance
+    id: tuple                                                               # unique identifier for this test record
+    test_type: str                                                          # refer to EntityQCEvalutor that generates this test
+    test_name: str                                                          # the name of the test within the QC evaluator
     metadata: dict[str, Any] = field(default_factory=dict)                  # context (gate_id, channel, cutpoint, bounds, etc.)
     metrics: dict[str, Numeric] = field(default_factory=dict)               # measured values (proportion_passing, r_squared, p_neg, etc.)
     thresholds: dict[str, Sequence[Numeric]] = field(default_factory=dict)  # threshold parameters (set by evaluator)
@@ -75,10 +76,11 @@ class QCTestRecord:
         return QCFlag.from_str(self.status)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "QCTestRecord":
+    def from_dict(cls, data: Mapping[str, Any]) -> "QCTestRecord":
         return cls(
             test_type=data["test_type"],
             test_name=data["test_name"],
+            id=tuple(data["id"]),
             metadata=data.get("metadata", {}),
             metrics=data.get("metrics", {}),
             thresholds=data.get("thresholds", {}),
@@ -96,17 +98,17 @@ class QCStepStatus:
     flag: QCFlag = QCFlag.PASS
     # reasons: mapping reason_code -> {"messages": list[str], "tests": list[QCTestRecord]}
     reasons: dict[str, dict[str, set]] = field(default_factory=dict)
-    tests: dict[Hashable, QCTestRecord] = field(default_factory=dict)
+    tests: dict[tuple, QCTestRecord] = field(default_factory=dict)
 
-    def add_test(self, key: Hashable, test: QCTestRecord) -> None:
-        self.tests[key] = test
+    def add_test(self, test: QCTestRecord) -> None:
+        self.tests[test.id] = test
         self.flag = QCFlag.combine([self.flag, QCFlag.from_str(test.status)])
 
     def add_reason(
         self,
         code: str,
         message: str | Iterable[str] = [],
-        test: Mapping[Hashable, QCTestRecord] = {},
+        tests: Iterable[QCTestRecord] = [],
     ) -> None:
         """Add a reason code with optional message and/or test record to this step's QC."""
         if code not in self.reasons:
@@ -118,13 +120,13 @@ class QCStepStatus:
         else:
             self.reasons[code]["messages"].update(message)
 
-        for key, test_record in test.items():
-            self.reasons[code]["tests"].add(key)
-            self.add_test(key, test_record)
+        for test in tests:
+            self.reasons[code]["tests"].add(test.id)
+            self.add_test(test)
 
     def to_dict(self) -> dict[str, Any]:
         # serialize tests to dicts
-        serialized_reasons: dict[str, dict] = {}
+        serialized_reasons: dict[str, dict[str, list[str]]] = {}
         for code, detail in self.reasons.items():
             serialized_reasons[code] = {
                 "messages": list(detail.get("messages", set())),
@@ -133,16 +135,16 @@ class QCStepStatus:
         return {
             "flag": self.flag.value,
             "reasons": serialized_reasons,
-            "tests": {key: test.to_dict() for key, test in self.tests.items()},
+            "tests": [test.to_dict() for test in self.tests.values()],
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "QCStepStatus":
         reasons = data.get("reasons", {}) or {}
-        tests = {key: QCTestRecord.from_dict(test_dict) for key, test_dict in data.get("tests", {}).items()}
+        tests = {tuple(test["id"]): QCTestRecord.from_dict(test) for test in data.get("tests", [])}
         for reason_detail in reasons.values():
             reason_detail["messages"] = set(reason_detail.get("messages", []))
-            reason_detail["tests"] = set(reason_detail.get("tests", []))
+            reason_detail["tests"] = set(map(tuple, reason_detail.get("tests", [])))
             for test_key in reason_detail["tests"]:
                 if test_key not in tests:
                     raise ValueError(f"Reason references test key {test_key} which is not in tests dict")
@@ -163,15 +165,24 @@ class QCRunStatus:
     """
     steps: OrderedDict[str, QCStepStatus] = field(default_factory=OrderedDict)
 
+    @property
+    def flag(self) -> QCFlag:
+        """Combined flag from all steps."""
+        flags = [step.flag for step in self.steps.values()]
+        return QCFlag.combine(flags) if flags else QCFlag.PASS
+
     def get_step(self, step_name: str) -> QCStepStatus:
         """Get or create a step status."""
         if step_name not in self.steps:
             self.steps[step_name] = QCStepStatus()
         return self.steps[step_name]
 
-    def add_step(self, step_name: str, status: QCStepStatus) -> None:
-        """Add a step status."""
-        self.steps[step_name] = status
+    def update(self, other: QCRunStatus) -> None:
+        existing = [step_name for step_name in other.steps if step_name in self.steps]
+        if existing:
+            raise ValueError(f"Steps {existing} already exist. Use get_step() to modify existing steps or ensure no overlap when updating.")
+        for step_name, step_status in other.steps.items():
+            self.steps[step_name] = step_status
 
     def __getitem__(self, key: str) -> QCStepStatus:
         """Access step by name."""
@@ -192,6 +203,9 @@ class QCRunStatus:
     def __contains__(self, key: str) -> bool:
         """Check if step exists."""
         return key in self.steps
+
+    def __bool__(self):
+        return bool(self.steps)
 
     @property
     def overall_flag(self) -> QCFlag:
@@ -250,7 +264,9 @@ class EntityQCStatus:
     batch_qc: QCRunStatus = field(default_factory=QCRunStatus)  # optional batch-level QC
     sample_qc: dict[str, QCRunStatus] = field(default_factory=dict)  # sample_id -> QCRunStatus
     summary: dict[str, Any] = field(default_factory=dict)  # aggregated metrics
+    artifacts: dict[str, Any] = field(default_factory=dict)  # QC artifacts (plots, tables, etc.)
     generated_at: str = ""
+    updated_at: str = ""
 
     def get_sample_steps(self, sample_id: str) -> QCRunStatus:
         """Get or create QCRunStatus for a sample."""
@@ -258,17 +274,25 @@ class EntityQCStatus:
             self.sample_qc[sample_id] = QCRunStatus()
         return self.sample_qc[sample_id]
 
-    def iter_sample_tests(self, sample_id: str) -> Iterable[tuple[str, Hashable, QCTestRecord]]:
+    def iter_sample_tests(self, sample_id: str) -> Iterable[tuple[str, tuple, QCTestRecord]]:
         """Iterate over all tests for a specific sample and all steps."""
         for step_name, step in self.sample_qc[sample_id].steps.items():
             for test_key, test in step.tests.items():
                 yield step_name, test_key, test
 
+    def update_sample_steps(self, sample_id: str, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]]) -> None:
+        sample_steps = self.get_sample_steps(sample_id)
+        if not isinstance(steps, QCRunStatus):
+            steps = QCRunStatus(OrderedDict(steps))
+        sample_steps.update(steps)
+
+    def update_batch_steps(self, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]]) -> None:
+        if not isinstance(steps, QCRunStatus):
+            steps = QCRunStatus(OrderedDict(steps))
+        self.batch_qc.update(steps)
+
     @property
     def overall_flag(self) -> QCFlag:
-        """Combined flag from summary or computed from all samples/steps."""
-        if "overall_flag" in self.summary:
-            return QCFlag.from_str(self.summary["overall_flag"])
         # Combine across all samples and steps
         all_flags = [
             step.flag
@@ -318,6 +342,7 @@ class EntityQCStatus:
             "sample_qc": serialized_per_sample,
             "summary": self.summary,
             "generated_at": self.generated_at,
+            "updated_at": self.updated_at,
         }
 
         return result
@@ -325,39 +350,24 @@ class EntityQCStatus:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "EntityQCStatus":
         """Deserialize from dict."""
-        status = data.get("status")
-        if status is None:
-            status = {
-                "batch_qc": data.get("batch_qc", {}),
-                "sample_qc": data.get("sample_qc", {}),
-                "steps": data.get("steps", {}),
-            }
-        status = status or {}
 
         # Handle batch qc
-        batch_qc_data = status.get("batch_qc", {})
+        batch_qc_data = data.get("batch_qc", {})
         batch_qc = QCRunStatus.from_dict(batch_qc_data) if batch_qc_data else QCRunStatus()
 
         # Handle per-sample steps (new format)
-        per_sample_raw = status.get("sample_qc", {})
+        per_sample_raw = data.get("sample_qc", {})
         per_sample_steps: dict[str, QCRunStatus] = {}
         for sample_id, sample_steps_dict in per_sample_raw.items():
             per_sample_steps[sample_id] = QCRunStatus.from_dict(sample_steps_dict)
 
-        # Handle legacy flat steps format
-        legacy_steps_raw = status.get("steps", {})
-        if legacy_steps_raw and not per_sample_raw:
-            # Legacy single-sample format: convert to per-sample
-            sample_id = data.get("sample_id", "")
-            if sample_id:
-                per_sample_steps[sample_id] = QCRunStatus.from_dict(legacy_steps_raw)
-
         return cls(
-            entity_type=data.get("entity_type", ""),
-            entity_id=data.get("entity_id", ""),
+            entity_type=data["entity_type"],
+            entity_id=data["entity_id"],
             context=data.get("context", {}),
             summary=data.get("summary", {}),
-            generated_at=data.get("generated_at", ""),
             batch_qc=batch_qc,
             sample_qc=per_sample_steps,
+            generated_at=data.get("generated_at", ""),
+            updated_at=data.get("updated_at", ""),
         )

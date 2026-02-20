@@ -4,28 +4,27 @@ Entity QC evaluators and registry.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
-from typing import Any, Hashable, Mapping, TYPE_CHECKING
+from typing import Any, Hashable, Iterable, Mapping, Iterator, TYPE_CHECKING
+import warnings
 
-from matplotlib.pylab import f
+from anndata import AnnData
+
+from cytomind.infra.repo import ProjectRepository
+from cytomind.domain.qc import EntityQCStatus, QCTestRecord
+from cytomind.utils import now_iso
 
 from . import EntityQCEvaluatorRegistry
 
 if TYPE_CHECKING:
-    from cytomind.infra.repo import ProjectRepository
+    from cytomind.domain.constants import PathLike
     from cytomind.domain.pipeline import StepRun
-    from cytomind.domain.qc import EntityQCStatus, QCTestRecord
-    from anndata import AnnData
-    from pathlib import Path
-    PathLike = Path | str
+    from pandas import DataFrame
     from plotly.graph_objects import Figure
 else:
-    ProjectRepository = object
     StepRun = object
-    EntityQCStatus = object
-    QCTestRecord = object
-    AnnData = object
     PathLike = object
     Figure = object
+    DataFrame = object
 
 
 class QCTester(ABC):
@@ -49,29 +48,26 @@ class QCTester(ABC):
     - Use **kwargs for entity-specific dimensions (donors, parents, receivers, etc.)
     """
 
-    test_type: str  # type of test (e.g. "compensation", "gate_fit", etc.)
-    test_name: str  # name of the test (e.g. "donor_high_correlation", "gate_event_count", etc.)
+    test_type: str                           # Evaluator type
+    test_name: str                           # name of the test
+    key_fields: tuple[str, ...]              # Fields from metadata that uniquely identify this test instance (used for make_key)
     default_config: dict[str, Any] = {}      # Default config parameters for the tester
     default_thresholds: dict[str, Any] = {}  # Default thresholds for classifying test results
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         cfg = dict(self.default_config)
-        if config:
-            cfg.update(config)
+        for key in cfg:
+            if key in config:
+                cfg[key] = config[key]
         self.metadata = cfg
         thres = dict(self.default_thresholds)
-        if thresholds:
-            thres.update(thresholds)
+        for key in thres:
+            if key in thresholds:
+                thres[key] = thresholds[key]
         self.thresholds = thres
 
-    def _check_test_record(self, test: QCTestRecord):
-        if test.test_type != self.test_type:
-            raise ValueError(f"Test record has type '{test.test_type}' but expected '{self.test_type}'")
-        if test.test_name != self.test_name:
-            raise ValueError(f"Test record has name '{test.test_name}' but expected '{self.test_name}'")
-
     @abstractmethod
-    def fit(self, entity: Any, adata: AnnData,  **kwargs) -> tuple[Hashable, QCTestRecord]:
+    def fit(self, entity: Any, adata: AnnData,  **kwargs) -> QCTestRecord:
         """
         Compute test metrics from AnnData.
 
@@ -86,17 +82,13 @@ class QCTester(ABC):
 
         Returns
         -------
-        key : Hashable
-            Unique identifier for this test instance (from make_key())
         test : QCTestRecord
             Test record with:
+            - id: unique identifier for this test instance (used for storing results)
             - test_type, test_name: from class attributes
             - metadata: context from kwargs
             - metrics: computed values
             - status: "PENDING"
-        plot_data_dict : dict[str, Any]
-            Additional data for plotting (empty dict if plot_data=False)
-            Can include masks, histograms, fitted curves, etc.
         """
         pass
 
@@ -130,11 +122,11 @@ class QCTester(ABC):
         plot_data: bool = False,
         classify_kwargs: dict[str, Any] = {},
         **kwargs
-    ) -> tuple[Hashable, QCTestRecord]:
+    ) -> QCTestRecord:
         """Convenience method to run fit and classify sequentially."""
-        key, test = self.fit(entity, adata, plot_data=plot_data, **kwargs)
+        test = self.fit(entity, adata, plot_data=plot_data, **kwargs)
         classified_test = self.classify(test, **classify_kwargs)
-        return key, classified_test
+        return classified_test
 
     @abstractmethod
     def plot(self, adata: AnnData, test: QCTestRecord, output_path: PathLike | None = None, **kwargs) -> Figure:
@@ -163,43 +155,35 @@ class QCTester(ABC):
         """
         pass
 
-    @abstractmethod
-    def make_key(self, test: QCTestRecord) -> Hashable:
-        """
-        Generate unique key for this test instance.
+    def key_dict(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        d: dict[str, Any] = {"test_type": self.test_type, "test_name": self.test_name}
+        d.update({field: metadata[field] for field in self.key_fields})
+        return d
 
-        Parameters
-        ----------
-        test : QCTestRecord
-            Test record from fit() with status="PENDING"
-
-        Returns
-        -------
-        Hashable
-            Unique key for storing test in QCStepStatus.tests
-            Examples: channel_name, gate_id, (donor_channel, receiver_channel)
-        """
-        pass
+    def make_key(self, metadata: Mapping[str, Any]) -> tuple:
+        return tuple((self.test_type, self.test_name) + \
+            tuple(metadata[field] for field in self.key_fields))
 
     @classmethod
     def from_dict(cls, test: QCTestRecord | Mapping[str, Any]) -> QCTester:
         """Factory method to create tester from dict config."""
-        if isinstance(test, QCTestRecord):
-            test_dict = {
-                "test_type": test.test_type,
-                "test_name": test.test_name,
-                **test.metadata,
-                **test.thresholds,
-            }
-        else:
-            test_dict = dict(test)
-        if test_dict["test_type"] != cls.test_type:
-            raise ValueError(f"Cannot create tester of type '{cls.test_type}' from test record with type '{test_dict['test_type']}'")
-        if test_dict["test_name"] != cls.test_name:
-            raise ValueError(f"Cannot create tester of type '{cls.test_type}' with name '{cls.test_name}' from test record with name '{test_dict['test_name']}'")
+        test = test if isinstance(test, QCTestRecord) else QCTestRecord.from_dict(test)  # Validate required fields and types
+        cls._check_test_record(test)  # Validate required fields and types
+        return cls(config=test.metadata, thresholds=test.thresholds)
 
-        thres = test_dict.pop("thresholds", {})
-        return cls(config=test_dict, thresholds=thres)
+    @classmethod
+    def _check_test_record(cls, test: QCTestRecord | Mapping[str, Any]):
+        if not isinstance(test, QCTestRecord):
+            test = QCTestRecord.from_dict(test)  # Validate required fields and types
+
+        if test.test_type != cls.test_type:
+            raise ValueError(f"Test record has type '{test.test_type}' but expected '{cls.test_type}'")
+        if test.test_name != cls.test_name:
+            raise ValueError(f"Test record has name '{test.test_name}' but expected '{cls.test_name}'")
+        for field in cls.key_fields:
+            if field not in test.metadata:
+                raise ValueError(f"Test record is missing key field '{field}' in metadata")
+
 
 class EntityQCEvaluator(ABC):
     """
@@ -216,37 +200,146 @@ class EntityQCEvaluator(ABC):
     - Thresholds are configurable and can be adjusted post-execution
     """
 
-    entity_type: str = ""
+    entity_type: str
     default_config: dict[str, Any] = {}
+    tester_registry: dict[str, type[QCTester]] = {}  # Test available for this entity type, keyed by test_name
 
-    def __init__(self, repo: ProjectRepository, config: Mapping[str, Any] | None = None):
-        self.repo = repo
-        self.project = repo.load_project()
+    def __init__(self, config: Mapping[str, Any] | None = None):
         cfg = dict(self.default_config)
         if config:
             cfg.update(config)
         self.config = cfg
+        self.test_types = set(tester.test_type for tester in self.tester_registry.values())
+
+    def update_entity_qc(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus | None = None,
+        sample_data: Iterable[tuple[str, AnnData]] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> EntityQCStatus:
+        entity_qc = entity_qc or EntityQCStatus(entity_id=entity.id, entity_type=self.entity_type, generated_at=now_iso())
+        entity_qc = self.update_sample_qc(entity, entity_qc, sample_data, context=context)
+        entity_qc.summary.update(self.basic_summary(entity_qc))
+        summary_dict = self.summarize_entity_qc(entity_qc)
+        if "status" in summary_dict:
+            raise ValueError("Summary dict cannot contain reserved key 'status'")
+        if "aggregated_flag_counts" in summary_dict:
+            raise ValueError("Summary dict cannot contain reserved key 'aggregated_flag_counts'")
+        entity_qc.summary.update(summary_dict)
+        return entity_qc
 
     @abstractmethod
-    def run_entity_qc(
+    def update_sample_qc(
         self,
-        entity_id: str,
+        entity: Any,
+        entity_qc: EntityQCStatus,
+        sample_data: Iterable[tuple[str, AnnData]] | None = None,
         *,
-        sample_ids: list[str] | None = None,
-        context: dict[str, Any] | None = None,
+        context: dict[str, Any] = {},
     ) -> EntityQCStatus:
-        """Run QC for a specific entity instance."""
+        """Update the QC for a specific entity instance.
+
+        This method is stateless - it takes the entity, QC status, and sample data
+        and updates the per_sample_qc and batch_qc based on the tests defined for this entity type.
+
+        Parameters
+        ----------
+        entity : Any
+            The entity to evaluate (type depends on entity_type).
+        entity_qc : EntityQCStatus | None
+            Optional existing QC status to update. If None, creates a new one.
+        sample_data : Iterable[tuple[str, AnnData]] | None
+            Iterable of tuples mapping sample_id to AnnData for evaluation.
+            If None, no samples will be evaluated.
+        context : dict[str, Any] | None
+            Optional metadata to attach to the QC status.
+
+        Returns
+        -------
+        EntityQCStatus
+            Updated QC status with test results and summary.
+        """
         pass
 
-    def run_product_qc(
+    @abstractmethod
+    def summarize_entity_qc(
+        self,
+        entity_qc: EntityQCStatus,
+    ) -> dict[str, Any]:
+        """Generate user-facing summary for review UI.
+
+        Transforms detailed QC data into formatted tables, metrics,
+        and recommendations suitable for user review.
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            QC status with detailed test records
+
+        Returns
+        -------
+        dict
+            User-facing summary with tables, metrics, recommendations
+        """
+        pass
+
+
+    def parse_step(
         self,
         step_run: StepRun,
-    ) -> dict[str, EntityQCStatus]:
+        entity_id: str | None = None,
+    ) -> EntityQCStatus:
+        """
+        Parse QC information from step execution and create initial EntityQCStatus.
+
+        This method is called by the step evaluator to extract QC data generated
+        during step execution (e.g., gate fitting metrics, compensation application results)
+        and populate the EntityQCStatus for an entity created by the step.
+
+        The step_run.qc contains fine-grained execution data that should be captured
+        in the entity's QCStatus before full entity-level QC evaluation runs.
+
+        Parameters
+        ----------
+        step_run : StepRun
+            Step execution context with qc data from computation phases
+        entity_id : str | None
+            Optional entity identifier when parsing QC for step products.
+
+        Returns
+        -------
+        EntityQCStatus
+            Initial EntityQCStatus with data parsed from step execution.
+
+        Subclasses should override to extract entity-specific test records and metrics
+        from step_run.qc and populate an EntityQCStatus.
+        """
+        target_id = entity_id or step_run.id
+        return EntityQCStatus(entity_id=target_id, entity_type=self.entity_type, generated_at=now_iso())
+
+    def evaluate_step_products(
+        self,
+        repo: ProjectRepository,
+        step_run: StepRun,
+    ) -> Iterator[EntityQCStatus]:
         """
         Optional hook: Evaluate products created by this entity.
 
-        For step entities: evaluate compensations, gating strategies, etc. created by step.
+        For step entities: parse step-level QC data and optionally run full entity evaluation.
         For other entities: no-op (return empty dict).
+
+        Workflow:
+        1. Extract entities from step_run.evaluable_products (only includes products actually ready for QC)
+        2. Call parse_step() for each entity to create initial EntityQCStatus with
+           computation-stage data (fitting results, metrics, etc.)
+        3. Optionally run additional run_entity_qc() for full evaluation
+
+        Note: Products in project_updates but not in evaluable_products are skipped.
+        This distinguishes "entities registered in project" from "entities actually ready to evaluate".
+        Example: Compensations created by AddSamplesStep are in project_updates but not evaluable_products
+        (they haven't been applied to sample data yet).
 
         Parameters
         ----------
@@ -255,46 +348,35 @@ class EntityQCEvaluator(ABC):
 
         Returns
         -------
-        dict[str, EntityQCStatus]
-            Mapping product_entity_id -> EntityQCStatus
+        Iterator[EntityQCStatus]
+            Iterator over EntityQCStatus objects for each product entity
         """
-        results: dict[str, EntityQCStatus] = {}
-        sample_ids = step_run.inputs.get("sample_ids")
+        # Loop through evaluable products only (products explicitly marked as ready for QC)
+        for entity_type, entities in step_run.evaluable_products.items():
 
-        # Loop through all project updates
-        for update in step_run.project_updates:
-            # Loop through each key-value pair in the update
-            for entity_type, payload in update.items():
+            # Check if evaluator exists for this entity type
+            evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
+            if not evaluator_class:
+                warnings.warn(f"No EntityQCEvaluator registered for entity type '{entity_type}'. Skipping QC evaluation for these products.")
+                continue
 
-                # Check if evaluator exists for this entity type
-                evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
-                if not evaluator_class:
-                    continue
-
-                # Extract entity IDs from payload (handle both list and dict formats)
-                if isinstance(payload, dict):
-                    entity_ids = list(payload.keys())
+            evaluator = evaluator_class()  # TODO: consider passing entity-specific config if needed
+            for entity_id, context in entities.items():
+                if "sample_ids" in context:
+                    sample_ids: list[str] = context.pop("sample_ids")
                 else:
-                    entity_ids = [
-                        e.id if hasattr(e, 'id') else e
-                        for e in payload
-                    ]
+                    sample_ids = list(step_run.sample_outputs.keys())  # Default to all samples in step outputs if not specified in context
+                qc_status = evaluator.parse_step(step_run, entity_id)
+                entity = evaluator.load_entity(repo, entity_id)  # Load full entity for evaluation
+                layer = evaluator.required_layer(entity)
+                if layer:
+                    sample_data = ((sid, repo.load_sample_adata(sid, layer=layer)) for sid in sample_ids)
+                else:
+                    sample_data = ((sid, AnnData()) for sid in sample_ids)
+                qc_status = evaluator.update_entity_qc(entity=entity, entity_qc=qc_status, sample_data=sample_data, context=context)
+                yield qc_status
 
-                # Run QC for each entity
-                evaluator = evaluator_class(self.repo, config=self.config)
-                for entity_id in entity_ids:
-                    qc_status = evaluator.run_entity_qc(
-                        entity_id,
-                        sample_ids=sample_ids,
-                        context={"trigger": "step", "step_id": step_run.id},
-                    )
-                    if qc_status:
-                        results[entity_id] = qc_status
-
-        return results
-
-
-    def summarize(
+    def basic_summary(
         self,
         entity_qc: EntityQCStatus,
     ) -> dict[str, Any]:
@@ -306,10 +388,6 @@ class EntityQCEvaluator(ABC):
 
         Parameters
         ----------
-        repo : ProjectRepository
-            Repository for reading data
-        entity_id : str
-            ID of the entity
         entity_qc : EntityQCStatus
             QC status with detailed test records
 
@@ -321,13 +399,12 @@ class EntityQCEvaluator(ABC):
         if entity_qc.entity_type != self.entity_type:
             raise TypeError(f"EntityQCEvaluator for '{self.entity_type}' cannot summarize QC for entity type '{entity_qc.entity_type}'")
 
-        sample_qc = entity_qc.sample_qc
         per_sample_flags = {sid: flag.value for sid, flag in entity_qc.sample_flags().items()}
-        sample_counts = Counter(qc.overall_flag.value for qc in sample_qc.values())
+        sample_counts = Counter(qc.overall_flag.value for qc in entity_qc.sample_qc.values())
 
         # Build test summary by counting status for each test_name
-        test_summary: dict[str, dict[Hashable, dict[str, int]]] = {}
-        for sample_id in sample_qc:
+        test_summary: dict[str, dict[tuple, dict[str, int]]] = {}
+        for sample_id in entity_qc.sample_qc:
             for step_name, test_key, test in entity_qc.iter_sample_tests(sample_id):
                 if step_name not in test_summary:
                     test_summary[step_name] = {test_key: {"PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0}}
@@ -336,13 +413,181 @@ class EntityQCEvaluator(ABC):
                 test_summary[step_name][test_key][test.status] += 1
 
         return {
-            "overall": entity_qc.overall_flag.value,
-            "batch": entity_qc.batch_qc.overall_flag.value if entity_qc.batch_qc else None,
-            "n_samples": sample_counts.total(),
-            "n_pass": sample_counts["PASS"],
-            "n_warn": sample_counts["WARN"],
-            "n_severe": sample_counts["SEVERE"],
-            "n_fail": sample_counts["FAIL"],
-            "per_sample_flags": per_sample_flags,
-            "test_summary": test_summary,
+            "status": {
+                "overall": entity_qc.overall_flag.value,
+                "batch": entity_qc.batch_qc.overall_flag.value if entity_qc.batch_qc else None,
+                "per_sample": per_sample_flags,
+            },
+            "aggregated_flag_counts": {
+                "overall": dict(sample_counts),
+                "by_test": {step_name: list(test_dict.items()) for step_name, test_dict in test_summary.items()},
+            }
         }
+
+    @abstractmethod
+    def generate_table(
+        self,
+        entity_qc: EntityQCStatus,
+        table_type: str,
+        sample_data: Iterable[tuple[str, AnnData]]| None = None,
+        table_dir: PathLike | None = None,
+    ) -> DataFrame:
+        """Generate a table from cached EntityQCStatus on demand.
+
+        Reconstructs the specified table type from the stored test records
+        in the QC status. This allows generating different views of the QC
+        data without re-running tests.
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            The QC status object containing test records.
+        table_type : str
+            Type of table to generate (entity-specific).
+        sample_data : Mapping[str, AnnData] | None
+            Optional mapping of sample_id to AnnData. If provided, implementations
+            may filter results to only include samples in this mapping.
+            If None, returns all available data.
+
+        Returns
+        -------
+        DataFrame
+            Table with entity-specific columns matching the QC output format.
+        """
+        pass
+
+    @abstractmethod
+    def generate_figure(
+        self,
+        entity_qc: EntityQCStatus,
+        test_key: Any,
+        sample_data: Iterable[tuple[str, AnnData]]| None = None,
+        step_id: str | None = None,
+        figure_dir: PathLike | None = None,
+        **kwargs: Any,
+    ) -> Figure:
+        """Generate a diagnostic figure on demand.
+
+        Creates a visualization identified by test_key. The interpretation of test_key
+        is entity-specific:
+        - For compensation: test_key is a test identifier (channel name, donor/receiver pair)
+        - For gates: test_key identifies which gate/test to visualize
+        - For step: test_key can be a specific test identifier or a visualization type
+          (e.g., "heatmap" for a step-level overview)
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            The QC status object containing test records and data.
+        test_key : Any
+            Entity-specific identifier for which figure to generate.
+            Could be a test record key, visualization type, or other lookup value.
+        sample_data : Mapping[str, AnnData] | None
+            Optional mapping of sample_id to AnnData for plotting.
+            Meaning and requirement depends on entity type.
+        step_id : str | None
+            Optional step ID to narrow scope of search/visualization.
+            Meaning depends on entity type.
+        **kwargs : Any
+            Additional entity-specific plotting options.
+
+        Returns
+        -------
+        Figure
+            Plotly figure object ready to be serialized or displayed.
+        """
+        pass
+
+    @abstractmethod
+    def required_layer(self, entity: Any = None) -> str | None:
+        """Return the name of the AnnData layer required for this evaluator's tests.
+
+        This is used to determine which layer to load for each sample when running
+        entity QC. If the required layer is not present in a sample's AnnData, the
+        evaluator should skip tests for that sample and mark it as "SKIP" with an
+        appropriate message.
+
+        Returns
+        -------
+        str | None
+            Name of the required AnnData layer (e.g., "raw_counts", "compensated", "gate_mask").
+            If None, no layer is required.
+        """
+        pass
+
+    @abstractmethod
+    def load_entity(self, repo: ProjectRepository, entity_id: Hashable) -> Any:
+        """Load the entity object from the repository given its ID.
+
+        This method is used to retrieve the full entity (e.g., GateNode, CompensationRef)
+        for a given entity_id when running QC. The implementation should handle loading
+        the appropriate data structure based on the entity type.
+
+        Parameters
+        ----------
+        repo : ProjectRepository
+            Repository instance to load data from.
+        entity_id : str
+            Unique identifier of the entity to load.
+
+        Returns
+        -------
+        Any
+            The loaded entity object (type depends on entity_type).
+        """
+        pass
+
+    def _parse_test_key(
+        self,
+        test_key: tuple | Mapping[str, str],
+    ) -> tuple[type[QCTester], dict[str, Any]]:
+        """Parse and validate a test_key, extracting tester_class and normalizing the key.
+
+        Parameters
+        ----------
+        test_key : tuple | Mapping[str, str]
+            Test key as either (test_type, test_name, ...) tuple or mapping with 'test_type' and 'test_name'.
+
+        Returns
+        -------
+        tuple[type[QCTester], dict[str, Any]]
+            (tester_class, normalized_test_key_dict)
+            The test_type and test_name can be retrieved from test_key_dict or tester_class attributes.
+
+        Raises
+        ------
+        ValueError
+            If test_key format is invalid or test_type is unsupported.
+        KeyError
+            If test_name is not in registry.
+        """
+        # Parse test_key to extract test_type and test_name
+        if isinstance(test_key, Mapping):
+            test_key_dict = dict(test_key)  # Make a copy to avoid mutating input
+            try:
+                test_type = test_key_dict["test_type"]
+                test_name = test_key_dict["test_name"]
+            except KeyError as e:
+                raise ValueError(f"Invalid test_key mapping. Missing required key: {e.args[0]}")
+        elif isinstance(test_key, tuple):
+            test_type = str(test_key[0])
+            test_name = str(test_key[1])
+            test_key_dict = None
+        else:
+            raise ValueError("test_key must be either a tuple or a mapping with 'test_type' and 'test_name' keys.")
+
+        # Validate test_type
+        if test_type not in self.test_types:
+            raise ValueError(f"Unsupported test_type '{test_type}'. Expected one of: {self.test_types}")
+
+        # Look up tester_class
+        try:
+            tester_class = self.tester_registry[test_name]
+        except KeyError:
+            raise ValueError(f"Unknown test name '{test_name}'. Available: {list(self.tester_registry.keys())}")
+
+        # Normalize test_key to dict if it was a tuple
+        if test_key_dict is None:
+            test_key_dict = dict(zip(("test_type", "test_name") + tester_class.key_fields, test_key))
+
+        return tester_class, test_key_dict
