@@ -104,12 +104,16 @@ class CompensationRef:
     @property
     def spill(self) -> DataFrame:
         if isinstance(self._spill, DataFrame):
+            if self._spill.index is None:
+                self._spill.index = self._spill.columns
             return self._spill
 
         if self.path is not None:
             csv_path = Path(self.path)
             if csv_path.exists():
-                self._spill = read_csv(csv_path, index_col=False)
+                df = read_csv(csv_path, index_col=False)
+                df.index = df.columns
+                self._spill = df
             else:
                 raise FileNotFoundError(f"Compensation spill file not found: {self.path}")
         else:

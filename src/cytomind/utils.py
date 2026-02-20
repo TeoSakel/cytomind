@@ -89,6 +89,10 @@ def now_iso() -> str:
 def spillover_df_to_string(df: pd.DataFrame, fmt: str = ".6g") -> str:
 
     # Validate Shape
+    if df.shape[1] == df.shape[0] + 1 and df.dtypes[0] == object:
+        # Case 1: first column is index (detector names) and rest are spill
+        df = df.set_index(df.columns[0])
+
     if df.shape[0] != df.shape[1]:
         raise ValueError("Spillover matrix must be square")
 
