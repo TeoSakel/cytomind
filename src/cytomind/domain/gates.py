@@ -11,8 +11,6 @@ from .constants import GML_VERSION
 
 __all__ = ["GatingStrategyRef", "GateNode"]
 
-PathLike = str | Path
-
 @dataclass
 class GateNode:
     """

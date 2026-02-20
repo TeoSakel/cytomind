@@ -4,11 +4,14 @@ from typing import Any, Sequence, Mapping, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from cytomind.domain.constants import MaskLike
     from numpy.typing import NDArray
+    BooleanMask = NDArray[np.bool_]
     from anndata import AnnData
     from pandas import DataFrame
 else:
-    NDArray = object
+    MaskLike = object
+    BooleanMask = object
     AnnData = object
     DataFrame = object
 
@@ -122,7 +125,7 @@ class Gate(ABC):
         new_gate.diagnostics = self.diagnostics.copy()
         return new_gate
 
-    def fit(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> "Gate":
+    def fit(self, events: AnnData, mask: dict[str, MaskLike] = {}) -> "Gate":
         """
         Fit gate parameters from events (optional for parameter-only gates).
 
@@ -134,7 +137,7 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, NDArray[np.bool_]]
+        mask : dict[str, MaskLike]
             Dictionary of boolean masks from parent gates.
             - {}: empty dict (default), no masking applied
             - {key: mask_array}: single entry, applies that mask
@@ -165,7 +168,7 @@ class Gate(ABC):
         """
         pass
 
-    def apply(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
+    def apply(self, events: AnnData, mask: dict[str, MaskLike] = {}) -> dict[str, BooleanMask]:
         """
         Apply gate to events and generate dictionary of boolean masks.
 
@@ -173,7 +176,7 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, NDArray[np.bool_]]
+        mask : dict[str, MaskLike]
             Dictionary of boolean masks from parent gates.
             - {}: empty dict (default), no masking applied
             - {key: mask_array}: single entry, applies that mask
@@ -181,7 +184,7 @@ class Gate(ABC):
 
         Returns
         -------
-        dict[str, NDArray[np.bool_]]
+        dict[str, BooleanMask]
             Dictionary mapping region/quadrant IDs to boolean masks
         """
         events_slice, parent_mask = self._extract_events_slice(events, mask)
@@ -196,7 +199,7 @@ class Gate(ABC):
         return result
 
     @abstractmethod
-    def _apply_gate(self, events_slice: DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: DataFrame) -> dict[str, BooleanMask]:
         """
         Internal apply implementation for subclasses to override.
 
@@ -207,13 +210,13 @@ class Gate(ABC):
 
         Returns
         -------
-        dict[str, NDArray[np.bool_]]
+        dict[str, BooleanMask]
             Dictionary mapping region/quadrant IDs to boolean masks.
             Single-region gates should use a consistent key like "default".
         """
         pass
 
-    def fit_apply(self, events: AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
+    def fit_apply(self, events: AnnData, mask: dict[str, MaskLike] = {}) -> dict[str, BooleanMask]:
         """
         Convenience method to fit and then apply the gate in one step.
 
@@ -221,17 +224,17 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, NDArray[np.bool_]]
+        mask : dict[str, MaskLike]
             Dictionary of boolean masks from parent gates (default: empty dict)
 
         Returns
         -------
-        dict[str, NDArray[np.bool_]]
+        dict[str, BooleanMask]
             Dictionary mapping region/quadrant IDs to boolean masks
         """
         return self.fit(events, mask).apply(events, mask)
 
-    def _extract_events_slice(self, events: AnnData, mask: dict[str, NDArray[np.bool_]]) -> tuple[DataFrame, NDArray[np.bool_] | slice]:
+    def _extract_events_slice(self, events: AnnData, mask: dict[str, MaskLike]) -> tuple[DataFrame, MaskLike | slice]:
         """
         Helper method to extract event data for the gate's dimensions,
         applying the provided mask if any.
@@ -240,12 +243,12 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, NDArray[np.bool_]]
+        mask : dict[str, MaskLike]
             Dictionary of boolean masks from parent gates.
 
         Returns
         -------
-        tuple[pd.DataFrame, NDArray[np.bool_] | slice]
+        tuple[pd.DataFrame, MaskLike | slice]
             DataFrame of events filtered to this gate's dimensions and mask
         """
         if not mask:  # empty dict
