@@ -198,18 +198,97 @@ class EntityQCEvaluator(ABC):
     - Steps emit test records with metrics and status="PENDING" during execution
     - Evaluators classify pending records, apply thresholds, assign final status
     - Thresholds are configurable and can be adjusted post-execution
+
+    Test Registration:
+    - Subclasses implement get_tests() → dict[str, type[QCTester]]
+    - Composition via super().get_tests() and dict.update() for inheritance
+    - Tests route to per-sample or batch evaluation based on test_type
     """
 
     entity_type: str
     default_config: dict[str, Any] = {}
-    tester_registry: dict[str, type[QCTester]] = {}  # Test available for this entity type, keyed by test_name
 
     def __init__(self, config: Mapping[str, Any] | None = None):
         cfg = dict(self.default_config)
         if config:
             cfg.update(config)
         self.config = cfg
-        self.test_types = set(tester.test_type for tester in self.tester_registry.values())
+
+    @property
+    def test_types(self) -> set[str]:
+        """Return the set of test types for this evaluator."""
+        return self.get_test_types()
+
+    def get_test_types(self, entity: Any = None) -> set[str]:
+        """Return the set of test types for this evaluator.
+
+        Parameters
+        ----------
+        entity : Any, optional
+            Entity for which to get test types (used by subclasses for entity-specific tests).
+
+        Returns
+        -------
+        set[str]
+            Set of test type identifiers
+        """
+        tests = self.get_tests(entity=entity)
+        return set(tester.test_type for tester in tests.values())
+
+    def get_tests(self, entity: Any = None) -> dict[str, type[QCTester]]:
+        """
+        Return dictionary of test classes for this evaluator.
+
+        Subclasses compose tests via:
+            tests = super().get_tests(entity=entity)  # Get parent tests
+            tests.update({"new_test": NewTestClass})  # Add own tests
+            return tests
+
+        Parameters
+        ----------
+        entity : Any, optional
+            Entity for which to get tests (used by subclasses for entity-specific tests).
+            Compensation and step evaluators will ignore this parameter.
+
+        Returns
+        -------
+        dict[str, type[QCTester]]
+            Mapping of test_name → QCTester subclass
+        """
+        return {}
+
+    @abstractmethod
+    def update_batch_qc(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus,
+        all_samples: Iterable[tuple[str, AnnData]] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> EntityQCStatus:
+        """
+        Update batch-level QC tests (run once across all samples).
+
+        Store results in entity_qc.batch_qc. Subclasses that have no batch tests
+        can implement as no-op.
+
+        Parameters
+        ----------
+        entity : Any
+            The entity being evaluated
+        entity_qc : EntityQCStatus
+            QC status to update with batch test results
+        all_samples : Iterable[tuple[str, AnnData]] | None
+            Iterable of (sample_id, adata) tuples for all samples
+        context : dict[str, Any]
+            Optional evaluation context
+
+        Returns
+        -------
+        EntityQCStatus
+            Updated entity_qc with batch test results in batch_qc
+        """
+        pass
 
     def update_entity_qc(
         self,
@@ -221,6 +300,7 @@ class EntityQCEvaluator(ABC):
     ) -> EntityQCStatus:
         entity_qc = entity_qc or EntityQCStatus(entity_id=entity.id, entity_type=self.entity_type, generated_at=now_iso())
         entity_qc = self.update_sample_qc(entity, entity_qc, sample_data, context=context)
+        entity_qc = self.update_batch_qc(entity, entity_qc, sample_data, context=context)  # TODO: problem if sample_data is iterator and is consumed by sample_qc?
         entity_qc.summary.update(self.basic_summary(entity_qc))
         summary_dict = self.summarize_entity_qc(entity_qc)
         if "status" in summary_dict:
@@ -577,14 +657,15 @@ class EntityQCEvaluator(ABC):
             raise ValueError("test_key must be either a tuple or a mapping with 'test_type' and 'test_name' keys.")
 
         # Validate test_type
-        if test_type not in self.test_types:
-            raise ValueError(f"Unsupported test_type '{test_type}'. Expected one of: {self.test_types}")
+        if test_type not in self.get_test_types():
+            raise ValueError(f"Unsupported test_type '{test_type}'. Expected one of: {self.get_test_types()}")
 
-        # Look up tester_class
+        # Look up tester_class from get_tests()
+        tests = self.get_tests(entity=None)
         try:
-            tester_class = self.tester_registry[test_name]
+            tester_class = tests[test_name]
         except KeyError:
-            raise ValueError(f"Unknown test name '{test_name}'. Available: {list(self.tester_registry.keys())}")
+            raise ValueError(f"Unknown test name '{test_name}'. Available: {list(tests.keys())}")
 
         # Normalize test_key to dict if it was a tuple
         if test_key_dict is None:

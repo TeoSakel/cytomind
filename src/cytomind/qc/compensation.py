@@ -971,12 +971,25 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         "transform_func": "logicle",
     }
 
-    tester_registry: dict[str, type[QCTester]] = {
+    def get_tests(self, entity: CompensationRef | None = None) -> dict[str, type[QCTester]]:
+        """Return dictionary of test classes for compensation QC.
+
+        Parameters
+        ----------
+        entity : Any, optional
+            Entity parameter (ignored for compensation evaluator).
+
+        Returns
+        -------
+        dict[str, type[QCTester]]
+            Mapping of test_name → QCTester subclass
+        """
+        return {
             "negative_fluorescence": NegativeFluorescenceTest,
             "very_negative_fluorescence": VeryNegativeFluorescenceTest,
             "negative_enrichment": NegativeEnrichmentTest,
             "high_donor_correlation": HighDonorCorrelationTest,
-    }
+        }
 
     def required_layer(self, entity: CompensationRef | None = None) -> str:
         return "comp"
@@ -1026,6 +1039,36 @@ class CompensationQCEvaluator(EntityQCEvaluator):
                 sample_id=sample_id,
             )
 
+        return entity_qc
+
+    def update_batch_qc(
+        self,
+        entity: CompensationRef,
+        entity_qc: EntityQCStatus,
+        all_samples: Iterable[tuple[str, AnnData]] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> EntityQCStatus:
+        """Update batch-level QC tests for compensation.
+
+        Compensation has no batch-level tests, so this is a no-op.
+
+        Parameters
+        ----------
+        entity : CompensationRef
+            The compensation entity being evaluated
+        entity_qc : EntityQCStatus
+            QC status to update
+        all_samples : Iterable[tuple[str, AnnData]] | None
+            Iterable of (sample_id, adata) tuples (unused)
+        context : dict[str, Any]
+            Optional evaluation context (unused)
+
+        Returns
+        -------
+        EntityQCStatus
+            Unchanged entity_qc (no batch tests for compensation)
+        """
         return entity_qc
 
     def summarize_entity_qc(self, entity_qc: EntityQCStatus) -> dict[str, Any]:
@@ -1198,10 +1241,12 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         else:
             sample_filter = set(sid for sid, _ in sample_data)
 
-        if table_type not in self.test_types:
-            raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {self.test_types}.")
+        test_types = self.get_test_types()
+        if table_type not in test_types:
+            raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
 
         records = []
+        tests = self.get_tests(entity=None)
         for sample_id, sample_run in entity_qc.sample_qc.items():
             if sample_id not in sample_filter:
                 continue
@@ -1211,9 +1256,9 @@ class CompensationQCEvaluator(EntityQCEvaluator):
                     if test.test_type != table_type:
                         continue
                     try:
-                        tester_class = self.tester_registry[test.test_name]
+                        tester_class = tests[test.test_name]
                     except KeyError:
-                        valid_names = [key for key, val in self.tester_registry.items() if val.test_type == table_type]
+                        valid_names = [key for key, val in tests.items() if val.test_type == table_type]
                         raise KeyError(f"Unknown test_name '{test.test_name}' for table_type '{table_type}'. Valid names are: {valid_names}")
 
                     tester = tester_class.from_dict(test)

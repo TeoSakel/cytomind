@@ -30,6 +30,23 @@ class StepQCEvaluator(EntityQCEvaluator):
 
     entity_type = "step"
 
+    def get_tests(self, entity: StepRun | None = None) -> dict[str, type]:
+        """Return dictionary of test classes for step QC.
+
+        Steps have no tests of their own; QC data comes from execution phases.
+
+        Parameters
+        ----------
+        entity : Any, optional
+            Entity parameter (ignored for step evaluator).
+
+        Returns
+        -------
+        dict[str, type]
+            Empty dict (no tests for step QC)
+        """
+        return {}
+
     def required_layer(self, entity: StepRun | None = None) -> str | None:
         return None
 
@@ -65,6 +82,38 @@ class StepQCEvaluator(EntityQCEvaluator):
         -------
         EntityQCStatus
             QC status for the step run.
+        """
+        if entity_qc is not None:
+            return entity_qc
+        return entity.qc
+
+    def update_batch_qc(
+        self,
+        entity: StepRun,
+        entity_qc: EntityQCStatus | None = None,
+        all_samples: Iterable[tuple[str, Any]] | None = None,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> EntityQCStatus:
+        """Update batch-level QC tests for step.
+
+        Steps have no batch-level tests, so this is a no-op.
+
+        Parameters
+        ----------
+        entity : StepRun
+            The step run being evaluated (unused)
+        entity_qc : EntityQCStatus | None
+            QC status to update
+        all_samples : Iterable[tuple[str, Any]] | None
+            Iterable of (sample_id, data) tuples (unused)
+        context : dict[str, Any] | None
+            Optional evaluation context (unused)
+
+        Returns
+        -------
+        EntityQCStatus
+            Unchanged entity_qc (no batch tests for steps)
         """
         if entity_qc is not None:
             return entity_qc
