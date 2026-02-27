@@ -6,8 +6,6 @@ subset materialization and on-demand feedback generation.
 """
 from __future__ import annotations
 from typing import Any, Iterable, Mapping, TYPE_CHECKING
-from pathlib import Path
-from shutil import rmtree
 
 import numpy as np
 import pandas as pd
@@ -29,9 +27,13 @@ from cytomind.visualization import (
 from cytomind.utils import now_iso
 
 if TYPE_CHECKING:
-    from cytomind.domain.pipeline import RevisionSession
+    from cytomind.domain.constants import MaskLike
+    from cytomind.domain.pipeline import RevisionSession, Project
 else:
     RevisionSession = object
+    Project = object
+    MaskLike = object
+
 
 @RevisionHandlerRegistry.register("compensation")
 class CompensationRevisionHandler(BaseRevisionHandler):
@@ -42,136 +44,8 @@ class CompensationRevisionHandler(BaseRevisionHandler):
     """
 
     entity_type = "compensation"
-    _supported_figures = {
-        "comp_heatmap": {
-            "description": "Spillover matrix heatmap",
-            "input_params": {
-                "sample_id": "string",
-                "comp_id": "string (default: 'current')",
-                "show_markers": "bool (default: False)",
-                "colorscale": "any (default: 'RdBu')",
-                "kwargs": "additional arguments passed to heatmap",
-            }
-        },
-        "heatmap2d": {
-            "description": "2D histogram density with marginals",
-            "input_params": {
-                "sample_id": "string",
-                "donor": "string (channel name)",
-                "receiver": "string (channel name)",
-                "comp_id": "string (default: 'current')",
-                "n_subset": "int (default: 10000)",
-                "transformation": "string (default: 'logicle')",
-                "show_markers": "bool (default: False)",
-                "width": "int (default: 750)",
-                "height": "int (default: 750)",
-                "kwargs": "additional arguments passed to heatmap2d_with_marginals",
-            }
-        },
-        "scatter2d": {
-            "description": "2D scatter plot with grid-based density coloring and marginals",
-            "input_params": {
-                "sample_id": "string",
-                "donor": "string (channel name)",
-                "receiver": "string (channel name)",
-                "comp_id": "string (default: 'current')",
-                "n_subset": "int (default: 10000)",
-                "transformation": "string (default: 'logicle')",
-                "show_markers": "bool (default: False)",
-                "coloraxis_log": "bool (default: False)",
-                "nbins": "int bins for 2D grid density (default: 50)",
-                "marker_size": "int marker size (default: 5)",
-                "width": "int (default: 800)",
-                "height": "int (default: 700)",
-                "kwargs": "additional arguments passed to scatter2d_density",
-            }
-        },
-        "channel_histogram": {
-            "description": "Histogram for a single channel",
-            "input_params": {
-                "sample_id": "string",
-                "channel": "string (channel name)",
-                "comp_id": "string can be 'current', 'active', 'parent' or actual comp_id (default: 'current')",
-                "n_subset": "int number of events to use",
-                "transformation": "string transformation to apply to data (default: 'identity')",
-                "show_markers": "bool (default: False)",
-                "kwargs": "additional arguments passed to plotly.histogram1d",
-            }
-        },
-        "heatmap2d_tuner": {
-            "description": "Interactive 2D histogram with spillover coefficient tuner",
-            "input_params": {
-                "sample_id": "string",
-                "comp_id": "string can be 'current', 'active', 'parent' or actual comp_id (default: 'current')",
-                "donor": "string: channel name",
-                "receiver": "string: channel name",
-                "n_subset": "int number of events to use",
-                "transformation": "string transformation to apply to data (default: 'identity')",
-                "show_markers": "bool (default: False)",
-                "coef_min": "float minimum allowed coefficient (default: -0.5)",
-                "coef_max": "float maximum allowed coefficient (default: 0.5)",
-                "n_steps": "int number of steps (default: 41)",
-                "nbins": "int number of bins per dimension (default: 128)",
-                "colorscale": "any colorscale (default: 'viridis')",
-            }
-        },
-        "qc_test_plot": {
-            "description": "QC test diagnostic plot",
-            "input_params": {
-                "sample_id": "string",
-                "comp_id": "string (default: 'current')",
-                "test_key": "hashable: unique test identifier",
-                "step_id": "string: optional step ID to narrow down test search",
-                "kwargs": "additional arguments passed to test plotter",
-            }
-        },
-        "pairplot": {
-            "description": "Pairplot with histograms on diagonal and scatter plots in lower triangle",
-            "input_params": {
-                "sample_id": "string",
-                "comp_id": "string (default: 'current')",
-                "n_subset": "int (default: 10000)",
-                "transformation": "string (default: 'logicle')",
-                "show_markers": "bool (default: False)",
-                "nbins": "int (default: 50)",
-                "colorscale": "any (default: 'viridis')",
-                "width": "int (default: 1200)",
-                "height": "int (default: 1200)",
-                "kwargs": "additional arguments passed to build_pairplot",
-            }
-        },
-    }
-
-    _supported_tables = {
-        "spillover": {
-            "description": "Spillover matrix table",
-            "input_params": {
-                "sample_id": "string | None. If None, `comp_id` must be an explicit compensation ID.",
-                "comp_id": "string can be 'current', 'active', 'parent' or actual comp_id (default: 'current')",
-            },
-        },
-        "channel_tests": {
-            "description": "QC metrics table for individual channels",
-            "input_params": {
-                "sample_id": "string(s)",
-                "comp_id": "string can be 'current', 'active', 'parent' or actual comp_id (default: 'current')",
-            },
-        },
-        "pairwise_tests": {
-            "description": "QC metrics table for channel pairs",
-            "input_params": {
-                "sample_id": "string(s)",
-                "comp_id": "string can be 'current', 'active', 'parent' or actual comp_id (default: 'current')",
-            },
-        },
-    }
 
     # -- Properties for accessing workspace state ----
-
-    @property
-    def comp_dir(self) -> Path:
-        """Get or create the compensation storage directory."""
-        return self.workspace / "compensations"
 
     @property
     def samples(self) -> dict[str, dict[str, Any]]:
@@ -189,6 +63,9 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         self,
         sample_id: str,
         layer: str,
+        mask_id: str = "root",
+        mask: MaskLike = slice(None),
+        select: list[str] | slice = slice(None),
         n_subset: int | None = None,
         seed: int | None = None,
     ) -> ad.AnnData:
@@ -204,52 +81,59 @@ class CompensationRevisionHandler(BaseRevisionHandler):
 
         # Use default behavior if not raw layer or if raw layer exists
         try:
-            return super().get_or_create_viz_subset(sample_id, layer, n_subset, seed)
+            return super().get_or_create_viz_subset(
+                sample_id=sample_id,
+                layer=layer,
+                mask_id=mask_id,
+                mask=mask,
+                select=select,
+                n_subset=n_subset,
+                seed=seed
+            )
         except FileNotFoundError as e:
             if layer != "raw":
                 raise e
 
         # Raw layer doesn't exist - need to create it from comp layer
-        subset_key = f"{sample_id}:{layer}:{n_subset}"
-        print(f"Creating raw viz subset from comp layer: {subset_key}")
-
-        comp_path = self.main_repo.sample_adata_path(sample_id, layer="comp")
-        if not comp_path.exists():
-            raise ValueError(
-                f"Sample {sample_id} has neither raw nor comp data - cannot create viz subset"
+        print(f"Raw layer not found for sample {sample_id}, attempting to create from comp layer...")
+        try:
+            adata_comp_subset = super().get_or_create_viz_subset(
+                sample_id=sample_id,
+                layer="comp",
+                mask_id=mask_id,
+                mask=mask,
+                select=slice(None),  # load all channels for compensation application
+                n_subset=n_subset,
+                seed=seed
             )
-
-        # Sample indices first, then load only the subset
-        sample_ref = self.main_repo.load_sample_meta(sample_id)
-        rng = np.random.RandomState(seed)
-        n_total = sample_ref.n_events
-        if n_total <= 0:
-            raise ValueError(f"Sample {sample_id} has no events to subset.")
-        if n_total <= n_subset:
-            indices = slice(None)
-        else:
-            indices = rng.choice(n_total, n_subset, replace=False)
-            indices.sort()
-
-        # Load only the subset from comp layer
-        adata_comp_subset = self.main_repo.load_sample_adata(sample_id, layer="comp", mask=indices)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Neither raw nor comp layer found for sample {sample_id}"
+            ) from e
 
         # Get the compensation matrix that was used
         comp_id = self.samples[sample_id]["active_compensation"]
-        try:
+        if comp_id == "raw":
+            # In theory this should never happen but just in case
+            adata_raw_subset = adata_comp_subset
+        else:
+            # Undo the compensation to get raw data subset
             comp_ref = self.get_comp_ref(comp_id)
             adata_raw_subset = apply_compensation(adata_comp_subset, comp_ref, invert=True)
-        except KeyError:
-            # Compensation not available, assuming identity/raw case
-            adata_raw_subset = adata_comp_subset
 
         # Save using the base class save_viz_object method (without additional subsetting)
-        return self.save_viz_object(
-            key=subset_key,
+        comp_key = self.workspace.make_viz_data_key(sample_id, layer="comp", mask_id=mask_id, n_subset=n_subset)
+        comp_viz_info = self.workspace._viz_metadata[comp_key]
+        self.workspace.save_viz_subset(
             adata=adata_raw_subset,
+            sample_id=sample_id,
+            layer="raw",
+            mask_id=mask_id,
             seed=seed,
-            n_subset=None  # Already subsetted, don't subset again
+            overwrite=True,
+            n_total=comp_viz_info["n_total"],
         )
+        return adata_raw_subset[:, select]
 
     def load_viz_data_compensated(self, sample_id: str, comp_id: str, n_subset: int) -> ad.AnnData:
         """Load a visualization subset for a sample with on-the-fly compensation applied.
@@ -269,49 +153,28 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             Compensated visualization subset
         """
         comp_id = self._resolve_compensation(sample_id, comp_id)
+        seed = self.state["seed"]
 
-        # Load raw subset (creates if doesn't exist) and apply compensation on the fly
         if comp_id == self.samples[sample_id]["active_compensation"]:
-            # If the requested compensation is the same as the active one, we can load directly from comp layer
-            comp_subset = self.get_or_create_viz_subset(sample_id, "comp", n_subset, self.state["seed"])
+            # If the requested compensation is the same as the active one,
+            # we can load directly from comp layer of main repo
+            comp_subset = self.get_or_create_viz_subset(
+                sample_id=sample_id,
+                layer="raw" if comp_id == "raw" else "comp",
+                n_subset=n_subset,
+                seed=seed
+            )
         else:
-            raw_subset = self.get_or_create_viz_subset(sample_id, "raw", n_subset, self.state["seed"])
-            if comp_id == "raw": # Identity compensation, no need to apply
-                comp_subset = raw_subset
-            else:
-                comp_ref = self.get_comp_ref(comp_id)
-                comp_subset = apply_compensation(raw_subset, comp_ref, invert=False)
+            raw_subset = self.get_or_create_viz_subset(
+                sample_id=sample_id,
+                layer="raw",
+                n_subset=n_subset,
+                seed=seed
+            )
+            comp_ref = self.get_comp_ref(comp_id)
+            comp_subset = apply_compensation(raw_subset, comp_ref, invert=False)
 
         return comp_subset
-
-    def load_compensated_data(self, sample_id: str, comp_id: str) -> ad.AnnData:
-        """Load the full compensated dataset for a sample (no subsetting).
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        comp_id : str
-            Compensation ID to apply
-
-        Returns
-        -------
-        ad.AnnData
-            Full compensated dataset
-        """
-        comp_id = self._resolve_compensation(sample_id, comp_id)
-
-        # Load raw data and apply compensation on the fly
-        if comp_id == self.samples[sample_id]["active_compensation"]:
-            # If the requested compensation is the same as the active one, we can load directly from comp layer
-            return self.main_repo.load_sample_adata(sample_id, layer="comp")
-
-        raw_adata = self.main_repo.load_sample_adata(sample_id, layer="raw")
-        if comp_id == "raw": # Identity compensation, no need to apply
-            return raw_adata
-        else:
-            comp_ref = self.get_comp_ref(comp_id)
-            return apply_compensation(raw_adata, comp_ref, invert=False)
 
     # --- Protocol methods (revision lifecycle) ----
 
@@ -338,22 +201,30 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         RevisionSession
             Initialized session with handler state
         """
-        if self.session is not None and self.session.state in ("active", "committed"):
+        if self.session.status in ("active", "committed"):
             raise RuntimeError("Revision session already active or committed; cannot start a new revision.")
 
-        project = self.main_repo.load_project()
 
         input_spec = dict(input_spec)
         self.state["n_subset"] = input_spec.pop("n_subset", self.state["n_subset"])
         self.state["seed"] = input_spec.pop("seed", self.state["seed"])
 
         # Get fluorescence channels from raw panel
-        raw_panel = project.dimensions.get("raw", [])
+        project: Project = self.workspace.load_data("project")
+        raw_panel = project.layers.get("raw", [])
         fluoro_markers = {dim.id: dim.marker for dim in raw_panel if dim.type == "fluorescence"}
+        self.state["fluoro_markers"] = fluoro_markers
+
+        if self.session.entity_id is not None:
+            sample_set: set[str] = set(project.compensations[self.session.entity_id].batch)
+        else:
+            sample_set: set[str] = set(project.samples.keys())
 
         # Get sample info
-        samples = {}
+        samples: dict[str, dict[str, Any]] = {}
         for sid, sample in project.samples.items():
+            if sid not in sample_set:
+                continue
             samples[sid] = {
                 "n_events": sample.n_events,
                 "active_compensation": sample.compensation or "raw",
@@ -361,32 +232,24 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             }
 
         # Copy all available compensation matrices from main repo to use as options
-        self.comp_dir.mkdir(parents=True, exist_ok=True)
-        compensations = {}
+        compensations: dict[str, dict[str, Any]] = {}
         for comp_id, comp_ref in project.compensations.items():
-            compensations[comp_id] = {
-                "id": comp_id,
-                "name": comp_ref.name,
-                "source": comp_ref.source,
-                "path": comp_ref.path,
-                "parent": None,  # Default compensations have no parent
-                "is_new": False,
-                "batch": comp_ref.batch.copy(),
-            }
-
-        # Initialize handler state
-        self.state.update({
-            "fluoro_markers": fluoro_markers,
-            "samples": samples,
-            "compensations": compensations,
-        })
+            comp_info = comp_ref.to_dict()
+            comp_info["parent"] = None  # Default compensations have no parent
+            comp_info["is_new"] = False
+            compensations[comp_id] = comp_info
+        # Add edge case for raw compensation if not already present
+        compensations["raw"] = self._get_identity_compensation().to_dict()
+        compensations["raw"]["id"] = "raw"
+        compensations["raw"]["parent"] = None
+        compensations["raw"]["is_new"] = False
 
         # Update session metadata
+        self.update_state(samples=samples, compensations=compensations)
         self.session.context = input_spec
         now = now_iso()
-        self.session.state = "active"
+        self.session.status = "active"
         self.session.created_at = now
-        self.session.updated_at = now
         self.save_session()
         return self.session
 
@@ -417,7 +280,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         if "comp_id" not in user_input and "spillover" not in user_input:
             raise ValueError("user_input must contain either an existing 'comp_id' or 'spillover'")
 
-        comp_id = self.update_sample_compensation(
+        comp_id = self._update_sample_compensation(
                 sample_id,
                 spill_df=user_input.get("spillover"),
                 comp_name=user_input.get("name"),
@@ -444,6 +307,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         })
         self.session.updated_at = now
         self.save_session()
+        # TODO: return the qc_summary
 
     def _commit(self) -> tuple[dict[str, Any], StepRun | None]:
         """
@@ -460,12 +324,14 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             (metadata_updates, new_step)
         """
 
+        # Collect all the compensation changes that need to be committed to the main repo
         comp_refs = {
             sid: self.get_comp_ref(sinfo["compensation"])
             for sid, sinfo in self.samples.items()
             if sinfo["compensation"] != sinfo["active_compensation"]
         }
 
+        # Collect all the compensation references that need to be added to the main repo (new comps created in this revision)
         new_comps = {}
         for ref in comp_refs.values():
             if ref.id in new_comps or not self.compensations.get(ref.id, {}).get("is_new", True):
@@ -480,17 +346,9 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             created_at=now_iso(),
         )
 
-        self.session.state = "committed"
-        self.session.updated_at = now_iso()
-        self.save_session()
-
         return {"compensations": list(new_comps.values())}, step_run
 
-    def cleanup_workspace(self) -> None:
-        super().cleanup_workspace()
-        rmtree(self.comp_dir)
-
-    def update_sample_compensation(self, sample_id: str, spill_df: pd.DataFrame | None = None, comp_name: str | None = None, comp_id: str | None = None) -> str:
+    def _update_sample_compensation(self, sample_id: str, spill_df: pd.DataFrame | None = None, comp_name: str | None = None, comp_id: str | None = None) -> str:
         """Update the compensation assigned to a sample, either by selecting an existing comp or adding a new one from spill_df.
 
         Parameters
@@ -514,12 +372,8 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         if spill_df is not None:
             if not comp_name:
                 comp_name = self._make_name_from_parent(current_comp_id, sample_id)
-            elif any(c["name"] == comp_name for c in self.compensations.values()):
-                raise ValueError(f"Compensation name '{comp_name}' already exists in workspace; please choose a unique name")
 
-            new_comp_id = self.add_compensation(spill_df, comp_name)
-            self.compensations[new_comp_id]["parent"] = current_comp_id
-            self.compensations[new_comp_id]["batch"].append(sample_id)
+            new_comp_id = self._add_compensation(spill_df, comp_name, parent=current_comp_id, batch=[sample_id])
             if comp_id and comp_id != new_comp_id:
                 raise ValueError(f"Cannot specify both spill_df and comp_id; new comp_id {new_comp_id} does not match provided comp_id {comp_id}")
             self.samples[sample_id]["compensation"] = new_comp_id
@@ -541,35 +395,15 @@ class CompensationRevisionHandler(BaseRevisionHandler):
 
     def current_comp(self, sample_id: str) -> str:
         """Get the current compensation id mapped to a sample in the workspace."""
-        sample_info = self.samples.get(sample_id)
-        if not sample_info:
-            raise KeyError(f"Sample {sample_id} not found in workspace")
-        return sample_info.get("compensation", "raw")
-
-    def spillover_path(self, comp_id: str) -> Path:
-        return self.comp_dir / f"{comp_id}.csv"
+        return self.samples[sample_id].get("compensation", "raw")
 
     def get_comp_ref(self, comp_id: str) -> CompensationRef:
         """Load compensation from workspace (not main repo)."""
-        try:
-            comp_info = self.state["compensations"][comp_id]
-        except KeyError:
-            if comp_id == "raw":
-                return self._get_identity_compensation()
-            raise KeyError(f"Compensation {comp_id} not found in workspace")
+        if comp_id in self.compensations:
+            return CompensationRef.from_dict(self.compensations[comp_id])
+        raise KeyError(f"Compensation {comp_id} not found in workspace")
 
-        spill_df = pd.read_csv(comp_info["path"], index_col=False)
-        spill_df.index = spill_df.columns
-
-        return CompensationRef(
-            id=comp_info["id"],
-            name=comp_info["name"],
-            source=comp_info["source"],
-            batch=comp_info["batch"],
-            _spill=spill_df,
-        )
-
-    def add_compensation(self, spill_df: pd.DataFrame, name: str | None) -> str:
+    def _add_compensation(self, spill_df: pd.DataFrame, name: str | None, parent: str | None = None, batch: list[str] = []) -> str:
         """Add a new compensation to the workspace from a spillover matrix.
 
         Validates the spillover matrix and creates a new compensation entry in the workspace.
@@ -590,24 +424,20 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             # First column is index (detector names) and rest are spill
             spill_df = spill_df.set_index(spill_df.columns[0])
 
-        comp_id = CompensationRef.generate_id(spill_df)
-        if comp_id in self.compensations:
-            raise ValueError(f"Compensation with ID '{comp_id}' already exists in workspace")
+        if name and any(c["name"] == name for c in self.compensations.values()):
+            raise ValueError(f"Compensation name '{name}' already exists in workspace; please choose a unique name")
 
-        comp_path = self.spillover_path(comp_id)
-        spill_df.to_csv(comp_path, index=False)
+        comp_ref = CompensationRef.from_dataframe(df=spill_df, name=name, batch=batch)
+        if comp_ref.id in self.compensations:
+            raise ValueError(f"Compensation with ID '{comp_ref.id}' already exists in workspace")
 
-        self.compensations[comp_id] = {
-            "id": comp_id,
-            "name": name or comp_id,
-            "source": "user",
-            "path": comp_path.as_posix(),
-            "parent": None,
-            "is_new": True,
-            "batch": [],
-        }
+        comp_info = comp_ref.to_dict()
+        comp_info["source"] = "user"
+        comp_info["parent"] = parent
+        comp_info["is_new"] = True
+        self.update_state(compensations={comp_ref.id: comp_info})
 
-        return comp_id
+        return comp_ref.id
 
     def _make_name_from_parent(self, parent_comp_id: str, sample_id: str) -> str:
         parent_info = self.compensations[parent_comp_id]
@@ -621,7 +451,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
     def _resolve_compensation(self, sample_id: str, comp_id: str = "current") -> str:
         """Resolve a a special/relative compensation ID to a concrete compensation ID that can be used to retrieve the compensation references.
 
-        Supports the same special values as `get_spillover_table`:
+        Supports the same special values as `table_spillover`:
         - 'current' -> the compensation currently mapped in `comp_map`
         - 'parent'  -> the parent of the current compensation
         - 'active'  -> the compensation originally declared on the sample metadata
@@ -656,52 +486,19 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             raise KeyError(f"Channel {channel} not found in fluorescence marker information. Available channels: {list(self.state['fluoro_markers'].keys())}")
 
     def _get_identity_compensation(self) -> CompensationRef:
-        """Create identity compensation matrix for raw (uncompensated) data."""
-
-        # Get fluorescence channels
         fluoro_channels: list[str] = list(self.state["fluoro_markers"].keys())
-
-        # Create identity matrix
         n_channels = len(fluoro_channels)
-        identity_matrix = pd.DataFrame(
-            np.eye(n_channels),
-            index=fluoro_channels,
-            columns=fluoro_channels
+        identity_matrix = pd.DataFrame(np.eye(n_channels), columns=fluoro_channels)
+        return CompensationRef.from_dataframe(
+            df=identity_matrix,
+            name="raw_identity",
+            source = "identity",
+            batch=[]
         )
-
-        comp_ref = CompensationRef(
-            id="raw",
-            name="Raw (Identity)",
-            source="identity",
-            batch=[sid for sid, sinfo in self.samples.items() if sinfo["compensation"] == "raw"],
-            _spill=identity_matrix,
-        )
-
-        comp_path = self.comp_dir / "identity.csv"
-        comp_ref.spill.to_csv(comp_path, index=False)
-        self.compensations["raw"] = {
-            "id": comp_ref.id,
-            "name": comp_ref.name,
-            "source": comp_ref.source,
-            "path": comp_path.as_posix(),
-            "parent": None,  # Default compensations have no parent
-            "is_new": True,
-            "batch": comp_ref.batch.copy(),
-        }
-
-        self.save_session()
-        return comp_ref
 
     # --- Table implementations ----
 
-    def get_table(self, table_type: str, input_params: Mapping[str, Any] = {}) -> pd.DataFrame:
-        if table_type == "spillover":
-            return self.get_spillover_table(**input_params)
-        if table_type == "channel_tests" or table_type == "pairwise_tests":
-            return self.get_test_table(table_type=table_type, **input_params)
-        raise ValueError(f"Unknown table type: {table_type}")
-
-    def get_test_table(self, table_type: str, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
+    def _table_tests(self, table_type: str, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
         """Get channel QC table for a sample under a specific compensation.
 
         Uses cached EntityQCStatus and generates the table on demand using the
@@ -754,66 +551,68 @@ class CompensationRevisionHandler(BaseRevisionHandler):
 
         return df
 
-    def get_spillover_table(self, sample_id: str, comp_id: str = "current") -> pd.DataFrame:
-        """Get a specific spillover table for a sample from workspace.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        comp_id : str
-            Which spillover to retrieve:
-                - "current",
-                - "parent" (parent of current),
-                - "active" (compensation from sample metadata),
-                - "raw" (identity matrix)
-
-        Returns
-        -------
-        pd.DataFrame
-            Spillover table with id, name, source, spill, or None if not found
+    def table_compensation_channel(self, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
+        """Channel-level QC test results under a specific compensation.
+        @spec
+        summary: QC test results for each fluorescence channel
+        description: Returns a table of pass/warn/fail status for each QC test on individual channels, aggregated across all provided samples under the specified compensation
+        params:
+          sample_ids: str or Iterable[str] | None | Sample ID(s) to retrieve channel test results for
+          comp_id: str | "current" | Which compensation to evaluate: "current" (mapped in workspace), "parent" (parent of current), "active" (from sample metadata), or "raw" (identity matrix)
         """
-        comp_id_resolved = self._resolve_compensation(sample_id, comp_id)
+        return self._table_tests(table_type="compensation_channel", sample_ids=sample_ids, comp_id=comp_id)
+
+    def table_compensation_pair(self, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
+        """Pairwise channel QC test results under a specific compensation.
+        @spec
+        summary: QC test results for channel pairs
+        description: Returns a table of pass/warn/fail status for pairwise tests (e.g., spillover, linearity) aggregated across all provided samples under the specified compensation
+        params:
+          sample_ids: str or Iterable[str] | None | Sample ID(s) to retrieve pairwise test results for
+          comp_id: str | "current" | Which compensation to evaluate: "current" (mapped in workspace), "parent" (parent of current), "active" (from sample metadata), or "raw" (identity matrix)
+        """
+        return self._table_tests(table_type="compensation_pair", sample_ids=sample_ids, comp_id=comp_id)
+
+    def table_spillover(self, sample_id: str | None = None, comp_id: str = "current") -> pd.DataFrame:
+        """Spillover matrix for a sample's compensation.
+        @spec
+        summary: Spillover coefficients matrix for compensation
+        description: Returns the spillover matrix (donor channels as columns, receiver channels as rows) for the specified compensation
+        params:
+          sample_id: str | None | Sample ID to retrieve spillover relative to (current, parent, active)
+          comp_id: str | "current" | Which compensation to retrieve: "current" (mapped in workspace), "parent" (parent of current), "active" (from sample metadata), or "raw" (identity matrix)
+        """
+        if sample_id is None:
+            if comp_id in ("current", "parent", "active"):
+                raise ValueError(f"comp_id value '{comp_id}' is not valid when sample_id is None; please provide a sample_id to resolve the compensation or use an explicit comp_id")
+            comp_id_resolved = comp_id
+        else:
+            comp_id_resolved = self._resolve_compensation(sample_id, comp_id)
         comp_ref = self.get_comp_ref(comp_id_resolved)
-        df = comp_ref.spill
-        df.index = df.columns
-        return df
+        return comp_ref.spill
 
     # ---- Figure implementations ----
 
-    def get_figure(self, plot_type: str, input_params: Mapping[str, Any] = {}) -> dict[str, Any]:
-        if plot_type == "comp_heatmap":
-            return self.comp_heatmap(**input_params)
-
-        if plot_type == "heatmap2d":
-            return self.heatmap2d(**input_params)
-
-        if plot_type == "scatter2d":
-            return self.scatter2d(**input_params)
-
-        if plot_type == "channel_histogram":
-            return self.channel_histogram(**input_params)
-
-        if plot_type == "heatmap2d_tuner":
-            return self.heatmap2d_tuner(**input_params)
-
-        if plot_type == "qc_test_plot":
-            return self.qc_test_plot(**input_params)
-
-        if plot_type == "pairplot":
-            return self.pairplot(**input_params)
-
-        raise ValueError(f"Unknown plot type: {plot_type}")
-
-    def comp_heatmap(
+    def figure_spillover(
         self,
-        sample_id: str | None,
+        sample_id: str | None = None,
         comp_id: str = "current",
         show_markers: bool = False,
         show_diagonal: bool = True,
         colorscale: Any = "RdGy",
         **kwargs
     ) -> dict[str, Any]:
+        """Spillover matrix heatmap visualization.
+        @spec
+        summary: Interactive spillover matrix heatmap
+        description: Displays the spillover matrix as a color-coded heatmap showing compensation coefficients.
+        params:
+          sample_id: str or None | None | Sample to resolve relative compensation (current, parent, active)
+          comp_id: str | "current" | Compensation ID (if sample_id provided, resolves relative to sample: current, parent, active)
+          show_markers: bool | False | Display marker labels instead of channel names
+          show_diagonal: bool | True | Show diagonal spillover (self-compensation) coefficients
+          colorscale: Any | "RdGy" | Plotly colorscale for heatmap
+        """
 
         comp_id_resolved = comp_id if not sample_id else self._resolve_compensation(sample_id, comp_id)
         comp_ref = self.get_comp_ref(comp_id_resolved)
@@ -854,7 +653,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             }
         }
 
-    def heatmap2d(
+    def figure_heatmap2d(
         self,
         sample_id: str,
         donor: str,
@@ -865,32 +664,20 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         show_markers: bool = False,
         **kwargs,
     ):
-        """2D histogram density with marginals; handler prepares data then plots.
-
-        Loads the raw subset, applies the selected compensation and transform,
-        then delegates histogram computations and Plotly figure construction to
-        the shared visualization module.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        donor : str
-            Donor channel name
-        receiver : str
-            Receiver channel name
-        compensation_id : str, optional
-            Compensation ID to apply (defaults to current from comp_map)
-        n_subset : int
-            Number of events to load (default: 10000)
-        nbins : int
-            Number of bins for histogram (default: 120)
-        colorscale : Any
-            Plotly colorscale (default: "Viridis")
-        transformation : str
-            Transformation to apply: "logicle", "linear", or "asinh" (default: "logicle")
-        show_markers : bool
-            Whether to display marker labels instead of channel labels (default: False)
+        """2D histogram with marginal distributions.
+        @spec
+        summary: Density heatmap of two channel relationship
+        description: Creates a 2D histogram showing the relationship between a donor and receiver channel with marginal histograms on both axes.
+        params:
+          sample_id: str | Required | Sample to visualize
+          donor: str | Required | Donor channel name
+          receiver: str | Required | Receiver channel name
+          compensation_id: str | "current" | Compensation ID (if sample_id provided, resolves relative to sample: current, parent, active)
+          n_subset: int or None | from state | Number of events to load and visualize
+          transformation: str | "logicle" | Data transformation: "logicle", "linear", "asinh"
+          show_markers: bool | False | Display marker labels instead of channel names
+          nbins: int | 120 | Number of bins for histogram
+          colorscale: Any | "Viridis" | Plotly colorscale for heatmap
         """
 
         n_subset = n_subset if n_subset is not None else int(self.state["n_subset"])
@@ -924,7 +711,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             "metadata": {},
         }
 
-    def scatter2d(
+    def figure_scatter2d(
         self,
         sample_id: str,
         donor: str,
@@ -938,34 +725,21 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         marker_size: int = 5,
         **kwargs,
     ):
-        """2D scatter plot with grid-based density coloring and marginals.
-
-        Loads the compensated subset, applies the selected transformation,
-        then creates a scatter plot with points colored by the bin density (count of points
-        in their grid cell).
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        donor : str
-            Donor channel name
-        receiver : str
-            Receiver channel name
-        compensation_id : str, optional
-            Compensation ID to apply (defaults to current from comp_map)
-        n_subset : int
-            Number of events to load (default: 10000)
-        transformation : str
-            Transformation to apply: "logicle", "identity", "asinh" (default: "logicle")
-        coloraxis_log : bool
-            Whether to apply a log transform to density values (default: False)
-        show_markers : bool
-            Whether to display marker labels instead of channel labels (default: False)
-        nbins : int
-            Number of bins for 2D grid density calculation (default: 50)
-        marker_size : int
-            Marker size in pixels (default: 5)
+        """2D scatter plot with density-based coloring.
+        @spec
+        summary: Scatter plot colored by local event density
+        description: Creates a scatter plot of two channels where each point is colored by the density of events in its grid cell.
+        params:
+          sample_id: str | Required | Sample to visualize
+          donor: str | Required | Donor channel name
+          receiver: str | Required | Receiver channel name
+          compensation_id: str | "current" | Compensation ID (if sample_id provided, resolves relative to sample: current, parent, active)
+          n_subset: int or None | from state | Number of events to load and visualize
+          transformation: str | "logicle" | Data transformation: "logicle", "identity", "asinh"
+          coloraxis_log: bool | False | Apply log transform to density values
+          show_markers: bool | False | Display marker labels instead of channel names
+          nbins: int | 50 | Number of bins for 2D grid density calculation
+          marker_size: int | 5 | Marker size in pixels
         """
 
         n_subset = n_subset if n_subset is not None else int(self.state["n_subset"])
@@ -1002,18 +776,31 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             "metadata": {},
         }
 
-    def channel_histogram(
+    def figure_channel_histogram(
         self,
         sample_id: str,
         channel: str,
         compensation_id: str = "current",
         n_subset: int | None = None,
         transformation: str = "logicle",
-        upper_bound: float | None = None,
+        upper_percentile: float = 100.,
         show_markers: bool = False,
         **kwargs,
     ):
-        """Histogram from raw subset with on-the-fly compensation and transform."""
+        """1D histogram for a single channel.
+        @spec
+        summary: Distribution histogram for one fluorescence channel
+        description: Displays the distribution of events across a single channel after compensation and transformation.
+        params:
+          sample_id: str | Required | Sample to visualize
+          channel: str | Required | Channel name to visualize
+          compensation_id: str | "current" | Compensation ID (if sample_id provided, resolves relative to sample: current, parent, active)
+          n_subset: int or None | from state | Number of events to load and visualize
+          transformation: str | "logicle" | Data transformation: "logicle", "identity", "asinh"
+          upper_percentile: float | 100. | Optional upper percentile to cap values before plotting
+          show_markers: bool | False | Display marker labels instead of channel names
+          nbins: int | 100 | Number of histogram bins
+        """
 
         n_subset = n_subset if n_subset is not None else int(self.state["n_subset"])
         comp_subset = self.load_viz_data_compensated(sample_id, compensation_id, n_subset)
@@ -1023,8 +810,9 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         # Extract channel values
         channel_idx = comp_subset.var.index.get_loc(channel)
         values = np.asarray(comp_subset.X[:, channel_idx])
-        if upper_bound is not None:
-            values = values[values <= upper_bound]
+        if upper_percentile < 100.0:
+            upper_bound = np.percentile(values, upper_percentile)
+            values = np.minimum(values, upper_bound)
 
         channel_label = self._marker_label(channel) if show_markers else channel
 
@@ -1032,7 +820,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             values,
             title=f"{channel_label} - {sample_id}",
             xaxis_title=channel_label,
-            yaxis_title="Count",
+            yaxis_title="Frequency",
             **kwargs,
         )
 
@@ -1051,7 +839,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             "metadata": { }
         }
 
-    def heatmap2d_tuner(
+    def figure_heatmap2d_tuner(
         self,
         sample_id: str,
         donor: str,
@@ -1066,46 +854,38 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         nbins: int = 128,
         colorscale: Any = "viridis",
     ) -> dict[str, Any]:
-        """Interactive 2D histogram with a slider to tune spillover coefficient.
-
-        The slider adjusts the donor->receiver spillover entry in the workspace
-        compensation and shows the resulting compensated distribution.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID.
-        donor : str
-            Donor channel name (column in spill matrix).
-        receiver : str
-            Receiver channel name (row in spill matrix).
-        compensation_id : str
-            Compensation to start from (default: current mapping).
-        n_subset : int
-            Number of events to visualize.
-        transformation : str
-            Transform to apply before binning (e.g., "logicle", "identity").
-        show_markers : bool
-            Whether to display marker labels instead of channel labels (default: False)
-        coef_min, coef_max : float
-            Slider coefficient range (absolute spillover value).
-        n_steps : int
-            Number of discrete slider steps.
-        nbins : int
-            Number of histogram bins for both axes.
-        colorscale : Any
-            Plotly colorscale for the heatmap.
+        """Interactive 2D histogram with spillover coefficient slider.
+        @spec
+        summary: Tunable 2D histogram for coefficient refinement
+        description: Creates an interactive 2D histogram with a slider to adjust the spillover coefficient between a donor and receiver channel.
+        params:
+          sample_id: str | Required | Sample to visualize
+          donor: str | Required | Donor channel name (column in spillover matrix)
+          receiver: str | Required | Receiver channel name (row in spillover matrix)
+          compensation_id: str | "current" | Compensation ID (if sample_id provided, resolves relative to sample: current, parent, active)
+          n_subset: int or None | from state | Number of events to load and visualize
+          transformation: str | "logicle" | Data transformation: "logicle", "identity", "asinh"
+          show_markers: bool | False | Display marker labels instead of channel names
+          coef_min: float | -0.5 | Minimum spillover coefficient for slider range
+          coef_max: float | 0.5 | Maximum spillover coefficient for slider range
+          n_steps: int | 41 | Number of discrete steps in the slider
+          nbins: int | 128 | Number of histogram bins for both axes
+          colorscale: Any | "viridis" | Plotly colorscale for heatmap
         """
 
         # Resolve compensation and load a raw subset (creating one if needed)
         comp_id_resolved = self._resolve_compensation(sample_id, compensation_id)
         comp_ref = self.get_comp_ref(comp_id_resolved)
         n_subset = n_subset if n_subset is not None else int(self.state["n_subset"])
-        raw_subset = self.get_or_create_viz_subset(sample_id, "raw", n_subset, self.state["seed"])
+        raw_subset = self.get_or_create_viz_subset(
+            sample_id=sample_id,
+            layer="raw",
+            n_subset=n_subset,
+            seed=self.state["seed"]
+        )
 
         # Determine current coefficient; default to 0 if missing
-        spill_df = comp_ref.spill.copy()
-        spill_df.index = spill_df.columns  # assume channels are same for index/columns
+        spill_df = comp_ref.spill
 
         try:
             current_coef = float(spill_df.at[receiver, donor]) # pyright: ignore[reportArgumentType]
@@ -1140,7 +920,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
                 id=f"{comp_ref.id}_tune",
                 name=comp_ref.name,
                 source=comp_ref.source,
-                _spill=mod_spill,
+                _spill=mod_spill.to_dict(orient="list"), # pyright: ignore[reportArgumentType]
             )
             comp_subset = apply_compensation(raw_subset, mod_ref, invert=False)
             if comp_subset.X is None:
@@ -1260,33 +1040,26 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             },
         }
 
-    def qc_test_plot(
+    def figure_qc_test_plot(
         self,
         test_key: tuple | Mapping[str, str],
         sample_id: str | None,
         step_id: str | None = None,
+        n_subset: int | None = None,
         **kwargs
     ) -> dict[str, Any]:
-        """Generate QC test diagnostic plot from cached EntityQCStatus.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        test_key : tuple or mapping
-            Unique test identifier (from QCStepStatus.tests) or row dictionary from test table.
-        step_id : str | None
-            Optional step ID to narrow down test search
-        **kwargs
-            Additional arguments passed to test plotter
-
-        Returns
-        -------
-        dict
-            Dict with 'plotly' key containing the figure and 'metadata' with test info
+        """QC test diagnostic visualization.
+        @spec
+        summary: Diagnostic plot for a specific QC test result
+        description: Renders the diagnostic visualization for a single QC test with the test's evaluation status and metrics overlaid
+        params:
+          test_key: tuple or dict | Required | Unique test identifier: tuple from QCStatus or dict with compensation_id, test_type, test_name
+          sample_id: str | Required | Sample ID (required in test_key if not provided)
+          step_id: str or None | None | Optional step ID to narrow down test search
+          n_subset: int | None | Number of events to load for diagnostic plot (defaults to state value if None)
         """
         # Use evaluator's helper to parse and validate test_key
-        tester_class, test_key_dict = self.qc_evaluator._parse_test_key(test_key)
+        _, test_key_dict = self.qc_evaluator._parse_test_key(test_key)
 
         # Extract sample_id and compensation_id from test_key
         if sample_id is None:
@@ -1321,7 +1094,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             },
         }
 
-    def pairplot(
+    def figure_pairplot(
         self,
         sample_id: str,
         comp_id: str = "current",
@@ -1334,37 +1107,20 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         height: int = 1200,
         **kwargs,
     ) -> dict[str, Any]:
-        """Generate a pairplot with scatter plots in lower triangle and histograms on diagonal.
-
-        Loads compensated data and creates a grid visualization of all channel pairs.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample ID
-        comp_id : str
-            Compensation ID to apply (default: "current")
-        n_subset : int
-            Number of events to load (default: from state, typically 10000)
-        transformation : str
-            Transformation to apply: "logicle", "identity", "asinh" (default: "logicle")
-        show_markers : bool
-            Whether to display marker labels instead of channel labels (default: False)
-        nbins : int
-            Number of bins for histograms (default: 50)
-        colorscale : Any
-            Plotly colorscale for density scatter plots (default: "viridis")
-        width : int
-            Figure width in pixels (default: 1200)
-        height : int
-            Figure height in pixels (default: 1200)
-        **kwargs
-            Additional arguments passed to build_pairplot
-
-        Returns
-        -------
-        dict
-            Dict with 'plotly' key containing the figure and 'metadata'
+        """Matrix of scatter plots showing all channel-pair relationships.
+        @spec
+        summary: Pairplot matrix of all fluorescence channels
+        description: Creates a grid of 2D scatter plots for all pairs of fluorescence channels, with 1D histograms on the diagonal. Provides a comprehensive view of multi-channel relationships after compensation and transformation
+        params:
+          sample_id: str | Required | Sample to visualize
+          comp_id: str | "current" | Compensation to apply: "current", "parent", "active", or "raw"
+          n_subset: int or None | from state | Number of events to load and visualize
+          transformation: str | "logicle" | Data transformation: "logicle", "identity", "asinh"
+          show_markers: bool | False | Display marker labels instead of channel names
+          nbins: int | 50 | Number of bins for histograms
+          colorscale: Any | "viridis" | Plotly colorscale for density scatter plots
+          width: int | 1200 | Figure width in pixels
+          height: int | 1200 | Figure height in pixels
         """
 
         n_subset = n_subset if n_subset is not None else int(self.state["n_subset"])

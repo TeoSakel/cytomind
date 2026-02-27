@@ -14,7 +14,7 @@ def build_histogram1d(
     transformation: str = "identity",
     title: str | None = None,
     xaxis_title: str | None = None,
-    yaxis_title: str | None = "Count",
+    yaxis_title: str | None = "Frequency",
     width: int = 700,
     height: int = 500,
 ) -> go.Figure:
@@ -42,7 +42,17 @@ def build_histogram1d(
 
     data = apply_transform(values, transformation=transformation)
 
-    trace = go.Histogram(x=data, nbinsx=nbins)
+    if yaxis_title is None:
+        yaxis_title = "Frequency"
+
+    histnorm = None
+    yaxis_title_lower = yaxis_title.lower()
+    if "count" in yaxis_title_lower:
+        histnorm = None
+    elif "frequency" in yaxis_title_lower:
+        histnorm = "probability"
+
+    trace = go.Histogram(x=data, nbinsx=nbins, histnorm=histnorm)
     if color:
         trace.marker = dict(color=color, line=dict(color="black", width=1))
     else:
