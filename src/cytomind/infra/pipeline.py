@@ -5,12 +5,13 @@ from pathlib import Path
 from anndata import AnnData
 
 if TYPE_CHECKING:
+    from cytomind.domain.constants import PathLike
     from cytomind.revisions.base import BaseRevisionHandler
 else:
+    PathLike = object
     BaseRevisionHandler = object
 
 
-from cytomind.domain.constants import PathLike
 from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef
 from .repo import ProjectRepository
 from cytomind.steps import StepRegistry
@@ -32,7 +33,6 @@ class InteractivePipeline:
             Optional project name.
         """
         self.repo = ProjectRepository(project_root, name=name)
-        self._active_revision_handlers: dict[str, BaseRevisionHandler] = {}
 
     # ---- Step lifecycle ----
 
@@ -92,7 +92,8 @@ class InteractivePipeline:
     def start_revision(
         self,
         entity_type: str,
-        entity_id: str,
+        session_id: str | None = None,
+        entity_id: str | None = None,
         input_spec: Mapping[str, Any] = {},
     ) -> BaseRevisionHandler:
         """
@@ -102,7 +103,9 @@ class InteractivePipeline:
         ----------
         entity_type : str
             Type of entity to revise (e.g., "compensation", "gating_strategy")
-        entity_id : str
+        session_id : str | None
+            Optional specific session identifier to load or create (e.g., "comp_001", "step_0003").
+        entity_id : str | None
             Entity identifier (e.g., "comp_001")
         input_spec : Mapping[str, Any]
             User input specification for the revision handler
@@ -122,21 +125,62 @@ class InteractivePipeline:
         if not revision_handler_class:
             raise ValueError(f"No revision handler registered for entity type '{entity_type}'")
 
+
         # Generate workspace directory
-        workspace = self.repo.generate_revision_workspace(entity_type, entity_id)
+        workspace = self.repo.generate_revision_workspace(entity_type=entity_type, session_id=entity_id)
 
         # Instantiate handler (it will set up workspace and session)
         handler = revision_handler_class(
             main_repo=self.repo,
-            workspace=workspace,
+            workspace_root=workspace,
             entity_id=entity_id,
         )
 
         # Initialize session
         session = handler.start_revision(input_spec)
 
-        # Store handler for later use
-        self._active_revision_handlers[session.id] = handler
+        return handler
+
+    def load_revision_handler(self, entity_type: str, session_id: str) -> BaseRevisionHandler:
+        """
+        Load an existing revision handler from the repository.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of entity being revised
+        session_id : str
+            Session identifier
+
+        Returns
+        -------
+        BaseRevisionHandler
+            Loaded revision handler
+
+        Raises
+        ------
+        FileNotFoundError
+            If session file does not exist
+        """
+        handler_class = RevisionHandlerRegistry.get(entity_type)
+        if not handler_class:
+            raise ValueError(f"No revision handler registered for entity type '{entity_type}'")
+
+        # Calculate workspace path
+        try:
+            workspace_path: Path = self.repo.load_project_metadata(
+                "revision_workspace",
+                entity_type=entity_type,
+                session_id=session_id
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(f"No revision session found for entity_type '{entity_type}' with session_id '{session_id}'.")
+
+        # Create handler
+        handler = handler_class(
+            main_repo=self.repo,
+            workspace_root=workspace_path,
+        )
 
         return handler
 
@@ -154,20 +198,12 @@ class InteractivePipeline:
         StepRun | None
             New step run if handler returned a new step to execute, else None
         """
-        session = handler.session
-        if session is None:
-            raise RuntimeError("Session not initialized")
-
         # Get metadata updates and optional new step
-        metadata_updates, new_step = handler._commit()
+        metadata_updates, new_step = handler.commit()
 
         # Apply metadata to main project
-        self.repo.update_project_metadata(**metadata_updates)
-
-        # Clean up
-        handler.cleanup_workspace()
-        if session.id in self._active_revision_handlers:
-            del self._active_revision_handlers[session.id]
+        if metadata_updates:
+            self.repo.update_project_metadata(**metadata_updates)
 
         # If handler produced a new step, run it
         if new_step:
@@ -176,6 +212,49 @@ class InteractivePipeline:
         return new_step
 
     # ---- QC Analysis ----
+
+    def list_entity_qc_artifacts(self, entity_type: str, entity_id: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        """
+        List available QC artifacts for a given entity.
+
+        Combines class-level artifact declarations with test-derived plots
+        from registered tests for the evaluator.
+
+        Parameters
+        ----------
+        entity_type : str
+            Type of entity (e.g., "compensation", "gating_strategy")
+        entity_id : str
+            Entity identifier (e.g., "comp_001")
+
+        Returns
+        -------
+        dict[str, list[dict[str, Any]]]
+            Dictionary with "tables" and "figures" keys, each containing a list of artifact specs.
+            Each artifact spec includes at minimum:
+            - "type": str - identifier for the artifact
+            - "description": str - human-readable description
+            For test plots, also includes: "test_name", "test_type", "plot_type"
+
+        Raises
+        ------
+        ValueError
+            If no QC evaluator is registered for the entity type
+        KeyError
+            If entity not found in repository
+        """
+        # Get evaluator
+        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
+        if qc_evaluator_class is None:
+            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
+
+        qc_evaluator = qc_evaluator_class()
+
+        # Load entity reference for evaluator to determine entity-dependent artifacts
+        entity_ref = qc_evaluator.load_entity(self.repo, entity_id) if entity_id else None
+
+        # List artifacts (combines class-level declarations with test-derived plots)
+        return qc_evaluator.list_artifacts(entity_ref=entity_ref)
 
     def get_entity_qc_table(
         self,
@@ -326,16 +405,9 @@ class InteractivePipeline:
 
         # The step will create SampleRef instances internally, but we need placeholders for BaseStep.run
         # Temporarily register minimal samples in project so run can iterate
-        samples_dict = {sid: SampleRef(id=sid, fcs=Path(fcs).as_posix()) for sid, fcs in samples.items()}
-        batch_dict = {
-            "__all__": BatchRef(
-                id="__all__",
-                sample_ids=list(samples_dict.keys()),
-                tags=["all_samples"],
-                meta={},
-            )
-        }
-        self.repo.update_project_metadata(samples=samples_dict, batches=batch_dict)
+        sample_refs = [SampleRef(id=sid, fcs=Path(fcs).as_posix()) for sid, fcs in samples.items()]
+        batch_refs = [BatchRef(id="__all__", sample_ids={sref.id for sref in sample_refs}, tags={"all_samples"}, meta={}) ]
+        self.repo.update_project_metadata(samples=sample_refs, batches=batch_refs)
 
         # Add channel_mapping to config if provided
         step_config = dict(config)
@@ -363,7 +435,7 @@ class InteractivePipeline:
             The completed load_fcs step run.
         """
         if sample_ids is None:
-            sample_ids = [p.name for p in self.repo.iter_sample_dirs()]
+            sample_ids = list(self.repo.load_project().samples.keys())
         return self.run_step(
             step_type="load_fcs",
             config={},
@@ -373,7 +445,8 @@ class InteractivePipeline:
     def compensate_samples(
         self,
         comp_id: str | Mapping[str, str],
-        sample_ids: Sequence[str] | None = None
+        sample_ids: Sequence[str] | None = None,
+        store_raw: bool = False
     ) -> StepRun:
         """
         Compensates the specified samples using the given compensation ID(s).
@@ -384,6 +457,8 @@ class InteractivePipeline:
             The compensation ID or a mapping from sample ID to compensation ID.
         sample_ids : Sequence[str] | None
             Optional list of sample IDs to compensate. If None, compensates all samples.
+        store_raw : bool
+            Whether to store raw data (default: False).
 
         Returns
         -------
@@ -398,7 +473,7 @@ class InteractivePipeline:
         sample_ids = list(sample_ids)
         step_comp = self.run_step(
             step_type="compensate",
-            config={"comp_id": comp_id},
+            config={"comp_id": comp_id, "store_raw": store_raw},
             inputs={"sample_ids": sample_ids}
         )
         return step_comp
@@ -486,7 +561,7 @@ class InteractivePipeline:
             The completed add_gate step run.
         """
         # Get batch_id from strategy
-        gs_ref = self.repo.get_gating_strategy(strategy_id)
+        gs_ref = self.repo.load_gating_strategy(strategy_id)
         batch_id = gs_ref.batch_id
 
         # Convert parent_id to list
@@ -546,11 +621,11 @@ class InteractivePipeline:
             The completed add_layer step run.
         """
 
-        catalog = self.repo.load_dimensions()
-        if layer in catalog and dimensions is not None:
+        project = self.repo.load_project()
+        if layer in project.layers and dimensions is not None:
             raise ValueError(f"Data layer {layer!r} already exists use add_dimensions instead.")
 
-        if layer not in catalog:
+        if layer not in project.layers:
             if dimensions is None:
                 raise ValueError(f"Data layer {layer!r} does not exist. Provide dimensions to create it.")
             self.repo.add_data_layer(layer, dimensions=dimensions)
@@ -619,20 +694,42 @@ class InteractivePipeline:
         if not batch_id or batch_id in project.batches:
             raise ValueError(f"Batch ID {batch_id!r} is invalid or already exists.")
 
-        sample_ids = list(sample_ids)
-        if len(sample_ids) != len(set(sample_ids)):
+        sample_list = list(sample_ids)
+        sample_set = set(sample_list)
+        if len(sample_list) != len(sample_set):
             raise ValueError("Duplicate sample IDs in batch.")
-        if len(sample_ids) < 2:
+        if len(sample_set) < 2:
             raise ValueError("At least two samples are required to create a batch.")
 
         batch = BatchRef(
             id=batch_id,
-            sample_ids=sample_ids,
-            tags=list(tags or []),
+            sample_ids=sample_set,
+            tags=set(tags or []),
             meta=dict(meta),
         )
 
         # Add batch to project and persist
-        project.batches[batch.id] = batch
-        self.repo.update_project_metadata(batches=project.batches)
+        self.repo.update_project_metadata(batches=[batch])
         return batch
+
+    # TODO: move this to Project?
+    def get_steps_history(self) -> list[dict[str, str]] :
+        summary: list[dict[str, str]] = []
+        for step_dir in self.repo.steps_dir.iterdir():
+            try:
+                step_run = self.repo.load_step_run(step_run_id=step_dir.name)
+            except (FileNotFoundError, ValueError):
+                continue
+            try:
+                flag = step_run.qc.overall_flag.value
+            except:
+                flag = "None"
+            summary.append({
+                "created_at": step_run.created_at,
+                "type": step_run.step_type,
+                "id": step_run.id,
+                "status": step_run.status,
+                "flag": flag
+            })
+        return summary
+

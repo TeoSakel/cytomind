@@ -100,7 +100,7 @@ class AddSamplesStep(BaseStep):
         infidetectors = [f"{ch.pnn}:{ch.pns}" for ch in panel if ch.type == "fluorescence"]
 
         comp_id: str | None = None
-        comps_parsed = []
+        comps_parsed: list[dict[str, Any]] = []
         for key, mat_txt in _iter_comp_records_from_metadata(fcs.metadata):
             try:
                 mat = fk.Matrix(mat_txt, detectors)
@@ -123,12 +123,13 @@ class AddSamplesStep(BaseStep):
                     )
                     return {}, qc
             comp_id_temp = _make_compensation_id(key, mat_txt)
+            spill = mat.as_dataframe().rename(columns=lambda x: x.split(":")[0])
             comps_parsed.append({
                 "id": comp_id_temp,
                 "name": f"{sample.id}_{key}",
                 "key": key,
                 "mat_txt": mat_txt,
-                "spill": mat.as_dataframe().rename(columns=lambda x: x.split(":")[0]),
+                "_spill": spill.to_dict(orient="list"), # pyright: ignore[reportArgumentType]
             })
             comp_id = comp_id_temp  # last one is the main comp
 
@@ -198,25 +199,25 @@ class AddSamplesStep(BaseStep):
             return {}, qc
 
         # 1) Gather sample outputs
-        sample_flags = step_run.qc.sample_flags()
+        sample_flags = step_run.qc.sample_flags
         outputs = {
             sid: step_run.sample_outputs[sid] for sid in batch
             if sample_flags[sid] == QCFlag.PASS
         }
 
-        # 2) Group samples by panel fingerprint
-        step_panel_grouping = qc.get_step("group_by_panel")
+        # 2) Extract Panel information and group samples by panel structure
+        step_panel = qc.get_step("group_by_panel")
         panel_groups: dict[str, list[str]] = {}  # panel_hash -> [sample_ids]
         panel_cache: dict[str, list[ChannelRef]] = {}  # panel_hash -> panel
 
         for sample_id, out in outputs.items():
             panel_records = out.get("panel", [])
             if not panel_records:
-                step_panel_grouping.flag = QCFlag.WARN
-                step_panel_grouping.add_reason(code="MISSING_PANEL",
-                                              message=f"Sample {sample_id} has no panel data; skipping.")
+                step_panel.flag = QCFlag.WARN
+                step_panel.add_reason(code="MISSING_PANEL",
+                                      message=f"Sample {sample_id} has no panel data; skipping.")
                 continue
-            panel = [ChannelRef.from_record(ch) for ch in panel_records]
+            panel = [ChannelRef.from_dict(ch) for ch in panel_records]
             panel_hash = _compute_panel_hash(panel)
 
             if panel_hash not in panel_groups:
@@ -225,122 +226,107 @@ class AddSamplesStep(BaseStep):
             panel_groups[panel_hash].append(sample_id)
 
         if not panel_groups:
-            step_panel_grouping.add_reason("NO_PANELS", "No valid panels extracted from any sample.")
+            step_panel.flag = QCFlag.FAIL
+            step_panel.add_reason("NO_PANELS", "No valid panels extracted from any sample.")
             return {}, qc
 
-        # Check for multiple panel groups
-        if len(panel_groups) > 1:
-            step_panel_grouping.flag = QCFlag.WARN
-            # Identify the primary panel group (largest by sample count)
-            panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
-            primary_sample_ids = panel_groups[panel_hash]
+        # Identify the primary panel group (largest by sample count)
+        panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
+        panel = panel_cache[panel_hash]
+        sample_ids = panel_groups[panel_hash]
 
-            step_panel_grouping.add_reason(
+        if len(panel_groups) > 1:
+            step_panel.flag = QCFlag.WARN
+            step_panel.add_reason(
                 code="MULTIPLE_PANELS",
                 message=(f"Multiple panel groups detected ({len(panel_groups)}). "
-                         f"Using primary panel (hash={panel_hash[:8]}) "
-                         f"with {len(primary_sample_ids)} samples. "
-                         "Revision handler can harmonize panels later."))
+                         f"Primary panel is {panel_hash[:8]} with {len(sample_ids)} samples.")
+            )
 
-            # Use primary panel group as canonical
-            panel = panel_cache[panel_hash]
-            sample_ids = primary_sample_ids
-
-            # Store all panel groups for revision handler
-            panel_groups_info = {
-                "primary_hash": panel_hash,
-                "groups": {
-                    ph: {
-                        "sample_ids": sids,
-                        "panel": [ch.to_record() for ch in panel_cache[ph]],
-                        "is_primary": ph == panel_hash,
-                        "n_samples": len(sids),
-                    }
-                    for ph, sids in panel_groups.items()
-                },
-            }
-
-            # Mark samples in non-primary groups with WARN
-            for ph, sids in panel_groups.items():
-                if ph == panel_hash:
-                    continue
-                for sid in sids:
-                    sample_qc = step_run.qc.get_sample_steps(sid)
-                    sample_step = sample_qc.get_step("panel_group")
-                    sample_step.flag = QCFlag.WARN
-                    sample_step.add_reason(
-                        code="NON_PRIMARY_PANEL",
-                        message=(f"Sample has non-primary panel (group {ph[:8]}). "
-                                    f"Primary panel group is {panel_hash[:8]}. "
-                                    "Panel harmonization may be needed."))
-        else:
-            # Single panel group: use it as the canonical project panel
-            panel_hash = next(iter(panel_groups.keys()))
-            panel = panel_cache[panel_hash]
-            sample_ids = panel_groups[panel_hash]
-            panel_groups_info = None
+        panel_groups_info = {
+            "primary_hash": panel_hash,
+            "groups": {
+                ph: {
+                    "sample_ids": sids,
+                    "panel": [ch.to_record() for ch in panel_cache[ph]],
+                    "is_primary": ph == panel_hash,
+                    "n_samples": len(sids),
+                }
+                for ph, sids in panel_groups.items()
+            },
+        }
 
         # 3) Deduplicate compensations by (key, mat_txt)
         step_comp_dedup = qc.get_step("deduplicate_compensations")
         comp_dedupe: dict[tuple[str, str], CompensationRef] = {}
         for out in outputs.values():
-            sid = out["sample_meta"]["id"]
-            for comp_rec in out.get("compensations", []):
+            sid: str = out["sample_meta"]["id"]
+            sid_comps: list[dict[str, Any]] = out.get("compensations", [])
+            for comp_rec in sid_comps:
                 dedupe_key = (comp_rec["key"], comp_rec["mat_txt"])
                 if dedupe_key not in comp_dedupe:
-                    comp_dedupe[dedupe_key] = CompensationRef(
-                        id=comp_rec["id"],
-                        name=comp_rec["name"],
-                        source="fcs",
-                        batch=[sid],
-                        _spill=comp_rec["spill"],
-                    )
+                    comp_rec["source"] = "fcs"
+                    comp_rec["batch"] = [sid]
+                    comp_dedupe[dedupe_key] = CompensationRef.from_dict(comp_rec)
                 else:
                     comp_dedupe[dedupe_key].batch.append(sid)
 
-        compensations = list(comp_dedupe.values())
+        compensations = list(comp_dedupe.values()) if comp_dedupe else []
 
         # 4) Build sample refs
         step_build_samples = qc.get_step("build_sample_refs")
-        samples: dict[str, SampleRef] = {}
+        samples: list[SampleRef] = []
         for out in outputs.values():
-            sm = out.get("sample_meta")
-            if not sm:
-                step_build_samples.flag = QCFlag.WARN
-                step_build_samples.add_reason(code="MISSING_SAMPLE_META",
-                                             message="Sample output missing 'sample_meta'; skipping.")
-                continue
-            samples[sm["id"]] = SampleRef(
-                id=sm["id"],
-                fcs=sm["fcs"],
-                default_layer=sm["default_layer"],
-                n_events=sm["n_events"],
-                compensation=sm["compensation"],
-                rename=sm.get("rename", {}),
-                meta=sm["meta"],
+            sm: dict[str, Any] = out["sample_meta"]
+            samples.append(
+                SampleRef(
+                    id=sm["id"],
+                    fcs=sm["fcs"],
+                    default_layer=sm["default_layer"],
+                    n_events=sm["n_events"],
+                    compensation=sm["compensation"],
+                    rename=sm.get("rename", {}),
+                    meta=sm["meta"],
+                )
             )
 
         # 5) Create batches
         step_create_batches = qc.get_step("create_batches")
-        batches = {
-            "__panel__": BatchRef(
+        batches = []
+        batches.append(
+            BatchRef(
                 id="__panel__",
-                sample_ids=sample_ids,
-                tags=["panel_group"],
-                meta={"panel_hash": panel_hash},
+                sample_ids=set(sample_ids),
+                tags={"panel_group"},
+                meta={"panel_hash": panel_hash}
             )
-        }
+        )
+
+        for ph, sids in panel_groups.items():
+            if ph == panel_hash:
+                continue
+            batch_id = f"panel_{ph}"
+            batches.append(
+                BatchRef(
+                    id=batch_id,
+                    sample_ids=set(sids),
+                    tags={"panel_group"},
+                    meta={"panel_hash": ph, "is_primary": False},
+                )
+            )
 
         # Create batches for each non-trivial compensation group
         n_comp_batches = 0
         for comp_ref in compensations:
             if len(comp_ref.batch) <= 1:
                 continue  # skip trivial batches
-            batches[comp_ref.id] = BatchRef(
-                id=comp_ref.id,
-                sample_ids=comp_ref.batch,
-                tags=["compensation_group"],
-                meta={"comp_id": comp_ref.id},
+            batches.append(
+                BatchRef(
+                    id=comp_ref.id,
+                    sample_ids=set(comp_ref.batch),
+                    tags={"compensation_group"},
+                    meta={"comp_id": comp_ref.id},
+                )
             )
             n_comp_batches += 1
 
@@ -359,12 +345,9 @@ class AddSamplesStep(BaseStep):
             for ch in panel
         ]
 
-        # Check if any sample is already compensated
-        has_compensated_samples = any(s.compensation is not None for s in samples.values())
-
         # Build dimensions dict - always include raw, optionally include comp
-        dimensions = {"raw": panel_dimensions}
-        if has_compensated_samples:
+        layers = {"raw": panel_dimensions}
+        if any(sref.compensation is not None for sref in samples):
             # Create comp dimensions (same as raw but with use_comp=True)
             comp_dimensions = [
                 DimensionDef(
@@ -378,25 +361,32 @@ class AddSamplesStep(BaseStep):
                 )
                 for ch in panel
             ]
-            dimensions["comp"] = comp_dimensions
+            layers["comp"] = comp_dimensions
 
         # Append project updates for this batch
+        panel_catalog = {
+            f"panel_{ph}": panel_cache[ph]
+            for ph in panel_groups
+            if ph != panel_hash
+        }
+        panel_catalog["panel"] = panel
+
         step_run.project_updates.append({
-            "panel": panel,
-            "compensations": compensations,  # must be CompensationRef to keep _spill
+            "panel_catalog": panel_catalog,
+            "compensations": compensations,
             "samples": samples,
             "batches": batches,
-            "dimensions": dimensions,
+            "layers": layers,
         })
 
         # Populate evaluable_products: these entities are fully initialized and ready for QC
         # Intentionally exclude compensations (they exist in registry but haven't been applied to sample data)
         step_run.evaluable_products["panel"] = {"panel": panel_groups_info}
 
-        for sid in samples:
-            out = step_run.sample_outputs.pop(sid)
-            if sample_flags[sid] != QCFlag.PASS:
-                step_run.sample_outputs[sid] = out["sample_meta"]
+        for sref in samples:
+            out = step_run.sample_outputs.pop(sref.id)
+            if sample_flags[sref.id] != QCFlag.PASS:
+                step_run.sample_outputs[sref.id] = out["sample_meta"]
 
 
         # Store panel_groups_info in batch_outputs for revision handler
@@ -611,4 +601,4 @@ def _extract_panel_from_fcs(fcs: fk.Sample, rename_info: Mapping[str, Mapping[st
             channels["pns"] = channels["pns"].replace(marker_renames)
 
     channels.sort_values("idx", inplace=True)
-    return [ChannelRef.from_record(ch) for ch in channels.to_dict(orient="records")]
+    return [ChannelRef.from_dict(ch) for ch in channels.to_dict(orient="records")] # pyright: ignore[reportArgumentType]

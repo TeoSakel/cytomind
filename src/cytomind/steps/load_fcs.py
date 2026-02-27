@@ -41,14 +41,14 @@ class LoadFCS(BaseStep):
 
         # Check that all panel channels are present in FCS after renaming
         panel = self.project.panel_df
-        panel_columns = set(panel.index.tolist())
+        panel_columns: set[str] = set(panel.index.tolist())
         fcs_columns = set(fcs_df.columns)
-        missing = list(panel_columns - fcs_columns)
+        missing = sorted(panel_columns - fcs_columns)
         if missing:
             step_load.flag = QCFlag.FAIL
             step_load.add_reason(
-                code="ChannelMissing",
-                message=f"Sample {sample.id}: some panel channels not found in FCS file: {missing}.")
+                code="CHANNELS_NOT_FOUND",
+                message=f"Some channels not found in FCS file: {missing}.")
             return {}, qc
 
         # Load data matrix in panel order
@@ -69,7 +69,7 @@ class LoadFCS(BaseStep):
             layer = 'raw'
             uns = {}
             step_run.evaluable_products.setdefault("raw_data", {})[sample.id] = dict()
-        var = self.repo.load_dimensions_df(layer)
+        var = self.repo.load_layer_df(layer)
         adata = ad.AnnData(X=X, var=var, uns=uns)
 
         step_save = self.save_adata(sample, adata, qc, layer=layer)[1]
@@ -82,7 +82,7 @@ class LoadFCS(BaseStep):
             step_load.flag = QCFlag.WARN
             step_load.add_reason(
                 code="MALFORMED_FCS",
-                message=(f"Sample {sample.id}: event count mismatch between FCS file",
+                message=(f"Event count mismatch between FCS file",
                          f"({fcs.event_count}) and loaded data ({sample.n_events})."))
 
         output_info = {
@@ -93,11 +93,11 @@ class LoadFCS(BaseStep):
         return output_info, qc
 
     def update_project(self, step_run: StepRun) -> StepRun:
-        samples = {
-            sid: self.project.samples[sid]
+        samples = [
+            self.project.samples[sid]
             for sid, qc in step_run.qc.sample_qc.items() if qc.overall_flag != QCFlag.FAIL
-        }
-        for sid, ref in samples.items():
-            ref.n_events = step_run.sample_outputs[sid].get("n_events", 0)
+         ]
+        for ref in samples:
+            ref.n_events = step_run.sample_outputs[ref.id].get("n_events", 0)
         self.repo.update_project_metadata(samples=samples)
         return step_run

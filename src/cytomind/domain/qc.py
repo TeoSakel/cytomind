@@ -2,7 +2,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Mapping, Iterable, Sequence, Any, TYPE_CHECKING
+from typing import Mapping, Iterable, Sequence, Any, TYPE_CHECKING, cast
+
 
 if TYPE_CHECKING:
     from numpy import floating
@@ -96,8 +97,8 @@ class QCStepStatus:
     """
 
     flag: QCFlag = QCFlag.PASS
-    # reasons: mapping reason_code -> {"messages": list[str], "tests": list[QCTestRecord]}
-    reasons: dict[str, dict[str, set]] = field(default_factory=dict)
+    # reasons: mapping reason_code -> {"messages": set[str], "tests": set[tuple]}
+    reasons: dict[str, dict[str, set[str | tuple]]] = field(default_factory=dict)
     tests: dict[tuple, QCTestRecord] = field(default_factory=dict)
 
     def add_test(self, test: QCTestRecord) -> None:
@@ -126,7 +127,7 @@ class QCStepStatus:
 
     def to_dict(self) -> dict[str, Any]:
         # serialize tests to dicts
-        serialized_reasons: dict[str, dict[str, list[str]]] = {}
+        serialized_reasons: dict[str, dict[str, list[str | tuple]]] = {}
         for code, detail in self.reasons.items():
             serialized_reasons[code] = {
                 "messages": list(detail.get("messages", set())),
@@ -225,7 +226,9 @@ class QCRunStatus:
         out: set[str] = set()
         for step in self.steps.values():
             for detail in step.reasons.values():
-                out.update(detail.get("messages", []))
+                messages = list(detail.get("messages", []))
+                messages = cast(list[str], messages)  # avoid type confusion with tests which are tuples
+                out.update(messages)
         return list(out)
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,6 +306,7 @@ class EntityQCStatus:
             all_flags.append(self.batch_qc.overall_flag)
         return QCFlag.combine(all_flags) if all_flags else QCFlag.PASS
 
+    @property
     def sample_flags(self) -> dict[str, QCFlag]:
         """Get overall flag per sample."""
         return {
@@ -319,13 +323,43 @@ class EntityQCStatus:
         return list(codes)
 
     @property
-    def all_messages(self) -> list[str]:
-        out: set[str] = set()
+    def all_messages(self) -> list[tuple[str, str]]:
+        out: set[tuple[str, str]] = set()
         for qc_run in [self.batch_qc] + list(self.sample_qc.values()):
             for step in qc_run.steps.values():
-                for detail in step.reasons.values():
-                    out.update(detail.get("messages", []))
+                for code, detail in step.reasons.items():
+                    messages = list(detail.get("messages", []))
+                    messages = cast(list[str], messages)  # avoid type confusion with tests which are tuples
+                    out.update((code, message) for message in messages)
         return list(out)
+
+    def group_samples_by_flag(self) -> dict[str, list[str]]:
+        """Group sample IDs by their overall flag."""
+        groups: dict[str, list[str]] = {}
+        for sample_id, qc_run in self.sample_qc.items():
+            flag = qc_run.overall_flag.value
+            groups.setdefault(flag, []).append(sample_id)
+        return groups
+
+    def group_samples_by_reason_code(self) -> dict[str, list[str]]:
+        """Group sample IDs by reason codes (a sample may appear in multiple groups if it has multiple reason codes)."""
+        groups: dict[str, list[str]] = {}
+        for sample_id, qc_run in self.sample_qc.items():
+            for step in qc_run.steps.values():
+                for reason_code in step.reasons.keys():
+                    groups.setdefault(reason_code, []).append(sample_id)
+        return groups
+
+    def group_samples_by_message(self) -> dict[tuple[str, str], list[str]]:
+        """Group sample IDs by code x message (a sample may appear in multiple groups if it has multiple messages)."""
+        groups: dict[tuple[str, str], list[str]] = {}
+        for sample_id, qc_run in self.sample_qc.items():
+            for step in qc_run.steps.values():
+                for code, detail in step.reasons.items():
+                    for message in detail.get("messages", []):
+                        message = cast(str, message)  # avoid type confusion with tests which are tuples
+                        groups.setdefault((code, message), []).append(sample_id)
+        return groups
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict."""
@@ -371,3 +405,6 @@ class EntityQCStatus:
             generated_at=data.get("generated_at", ""),
             updated_at=data.get("updated_at", ""),
         )
+
+    def __repr__(self) -> str:
+        return f"EntityQCStatus(entity_type={self.entity_type!r}, entity_id={self.entity_id!r}, overall_flag={self.overall_flag.value!r})"

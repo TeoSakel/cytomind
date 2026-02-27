@@ -100,26 +100,30 @@ def spillover_df_to_string(df: pd.DataFrame, fmt: str = ".6g") -> str:
         raise ValueError("Spillover matrix must be at least 2x2")
 
     # index must match columns (if index exists)
-    if df.index is not None and list(df.index) != list(df.columns):
-        raise ValueError("DataFrame index must match columns")
+    if not isinstance(df.index, pd.RangeIndex) and any(df.index != df.columns):
+        raise ValueError("DataFrame index if set must match columns")
 
     # Extract data
     markers = list(df.columns)
     n = str(len(markers))
-    # flatten row-major: S11, S12, ..., S1n, S21, ..., Snn
-    values = df.to_numpy(dtype=float).ravel(order="C")
+    values = df.to_numpy(dtype=float)
 
-    # Validate values
+    # --- Validation --- #
+    # Severe issues: NaN, inf, negative values
     if np.isnan(values).any():
         raise ValueError("Spillover matrix contains NaN values")
-
     if not np.isfinite(values).all():
         raise ValueError("Spillover matrix contains non-finite values")
+    if np.any(values < 0):
+        raise ValueError("Spillover matrix contains negative values")
+    # Mild issues: values greater than 1, diagonal not equal to 1
+    if np.any(values > 1):
+        warnings.warn("Spillover matrix appears to be unnormalized (values greater than 1)")
+    elif np.any(df.to_numpy().diagonal() != 1):  # biggest value is 1
+        warnings.warn("Spillover matrix appears to be unnormalized (diagonal values not equal to 1)")
 
-    if values.max() > 1 or values.min() < -1:
-        warnings.warn("Spillover matrix contains values outside the range [-1, 1]")
-
-    return ",".join((n, *markers, *map(lambda x: format(x, fmt), values)))
+    # flatten row-major: S11, S12, ..., S1n, S21, ..., Snn
+    return ",".join((n, *markers, *map(lambda x: format(x, fmt), values.ravel(order="C"))))
 
 def string_to_filename(s: str) -> str:
     """

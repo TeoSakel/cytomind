@@ -66,15 +66,16 @@ transform_registry: dict[str, Type[TransformLike]] = {
 def get_default_transformations() -> dict[str, TransformationRef]:
     # TODO: get as input a ChannelRef to customize params per channel
     #       using PnB to set param_t
-    return {
-        "identity": TransformationRef(id="identity", type="identity", params={}),
-        "flin": TransformationRef(id="flin", type="linear", params={"param_t": param.t, "param_a": param.a}),
-        "log": TransformationRef(id="log", type="log", params={"param_t": param.t, "param_m": param.m}),
-        "flojo_log": TransformationRef(id="flojo_log", type="log", params={"offset": 1., "decades": param.m}),
-        "flojo_biexp": TransformationRef(id="flojo_biexp", type="biexp", params={"negative": 0., "width": -10., "positive": 4.418540, "max_value": 262144.000029}),
-        "asinh": TransformationRef(id="asinh", type="asinh", params={"param_t": param.t, "param_m": param.m, "param_a": param.a}),
-        "flojo_asinh": TransformationRef(id="flojo_asinh", type="asinh", params={"param_t": 12000., "param_m": 4., "param_a": 0.7}),
-        "logicle": TransformationRef(id="logicle", type="logicle", params={"param_t": param.t, "param_m": param.m, "param_w": param.w, "param_a": param.a}),
-        "hyperlog": TransformationRef(id="hyperlog", type="hyperlog", params={"param_t": param.t, "param_m": param.m, "param_w": param.w, "param_a": param.a}),
-        "fratio": TransformationRef(id="fratio", type="ratio", params={"param_a": 1., "param_b": 0., "param_c": 0.}),
-    }
+    transformations =  (
+        TransformationRef(id="log",         type="log",      params={"param_t": param.t, "param_m": param.m}),
+        TransformationRef(id="flin",        type="linear",   params={"param_t": param.t,                     "param_a": param.a}),
+        TransformationRef(id="asinh",       type="asinh",    params={"param_t": param.t, "param_m": param.m, "param_a": param.a}),
+        TransformationRef(id="logicle",     type="logicle",  params={"param_t": param.t, "param_m": param.m, "param_a": param.a, "param_w": param.w}),
+        TransformationRef(id="hyperlog",    type="hyperlog", params={"param_t": param.t, "param_m": param.m, "param_a": param.a, "param_w": param.w}),
+        TransformationRef(id="flojo_asinh", type="asinh",    params={"param_t": 12000.,  "param_m": 4.,      "param_a": 0.7}),
+        TransformationRef(id="fratio",      type="ratio",    params={"param_a": 1., "param_b": 0., "param_c": 0.}),
+        TransformationRef(id="flojo_log",   type="log",      params={"offset": 1., "decades": param.m}),
+        TransformationRef(id="flojo_biexp", type="biexp",    params={"negative": 0., "width": -10., "positive": 4.418540, "max_value": 262144.000029}),
+        TransformationRef(id="identity",    type="identity", params={}),
+      )
+    return {tref.id: tref for tref in transformations}

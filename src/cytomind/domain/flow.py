@@ -2,29 +2,38 @@
 Flow cytometry domain classes and references.
 """
 from dataclasses import dataclass, field, asdict
-from typing import Any, Mapping, Hashable
+from typing import Any, Mapping, TYPE_CHECKING
 from pathlib import Path
 import hashlib
 
 import numpy as np
-from numpy.typing import NDArray
-from pandas import DataFrame, read_csv
+import pandas as pd
 from flowutils.compensate import get_spill
 
 from cytomind.utils import spillover_df_to_string
 
+if TYPE_CHECKING:
+    from .constants import PathLike
+    from numpy.typing import NDArray
+    FloatArray = NDArray[np.float64]
+else:
+    PathLike = object
+    FloatArray = object
+
 @dataclass
 class CompensationRef:
     id: str       # unique id
+    _spill: dict[str, list[float]]
     name: str | None = None    # human-readable name
     source: str | None = None  # fcs | user | computation step
-    path: str | None = None  # path to csv file with spillover matrix
     batch: list[str] = field(hash=False, default_factory=list)   # list of fcs files specifying this compensation
-    _spill: DataFrame | None = field(repr=False, hash=False, default=None)
 
     @classmethod
-    def generate_id(cls, matrix: str | DataFrame) -> str:
-        """Generate a unique id for the compensation matrix based on its content."""
+    def generate_id(cls, matrix: str | pd.DataFrame) -> str:
+        """
+        Generate a unique id for the compensation matrix based on its content.
+        Also validate that the matrix is a proper spillover matrix.
+        """
         if isinstance(matrix, str):
             try:
                 # Try to parse as spillover matrix string
@@ -34,11 +43,11 @@ class CompensationRef:
                 # Fallback: treat as file path
                 path = Path(matrix)
                 if path.exists():
-                    df = read_csv(path, index_col=False)
+                    df = pd.read_csv(path, index_col=False)
                     codec = spillover_df_to_string(df).encode()
                 else:
                     raise ValueError("Invalid spillover matrix string or file path.") from e
-        elif isinstance(matrix, DataFrame):
+        elif isinstance(matrix, pd.DataFrame):
             codec = spillover_df_to_string(matrix).encode()
         else:
             raise TypeError("matrix must be a string or a pandas DataFrame")
@@ -49,91 +58,47 @@ class CompensationRef:
     @classmethod
     def from_dataframe(
         cls,
-        df: DataFrame,
+        df: pd.DataFrame,
         name: str | None = None,
         source: str | None = None,
-        path: str | None = None,
         batch: list[str] = []
     ) -> "CompensationRef":
-        comp_id = cls.generate_id(df)
-        if path is not None:
-            csv_path = Path(path)
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_csv(csv_path, index=False)
+        comp_id = cls.generate_id(df)  # also performs validation
 
         return CompensationRef(
             id=comp_id,
             name=name,
             source=source,
-            path=path,
             batch=batch,
-            _spill=df,
-        )
-
-    def copy(self) -> "CompensationRef":
-        return CompensationRef(
-            id=self.id,
-            name=self.name,
-            source=self.source,
-            path=self.path,
-            batch=self.batch.copy(),
-            _spill=self._spill.copy() if isinstance(self._spill, DataFrame) else self._spill,
+            _spill=df.to_dict(orient="list"), # pyright: ignore[reportArgumentType]
         )
 
     @classmethod
-    def from_record(cls, record: Mapping[str, Any]) -> "CompensationRef":
-        ref = CompensationRef(
-            id=record["id"],
-            name=record["name"],
-            source=record["source"],
-            path=record.get("path", None),
-            batch=record.get("batch", []),
+    def from_dict(cls, data: Mapping[str, Any]) -> "CompensationRef":
+        return CompensationRef(
+            id=data["id"],
+            _spill=data.get("_spill", None),
+            name=data.get("name", None),
+            source=data.get("source", None),
+            batch=data.get("batch", []),
         )
 
-        return ref
-
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "source": self.source,
-            "batch": self.batch,
-            "path": self.path,
-        }
+        return asdict(self)
 
     @property
-    def spill(self) -> DataFrame:
-        if isinstance(self._spill, DataFrame):
-            if self._spill.index is None:
-                self._spill.index = self._spill.columns
-            return self._spill
-
-        if self.path is not None:
-            csv_path = Path(self.path)
-            if csv_path.exists():
-                df = read_csv(csv_path, index_col=False)
-                df.index = df.columns
-                self._spill = df
-            else:
-                raise FileNotFoundError(f"Compensation spill file not found: {self.path}")
-        else:
-            raise ValueError("Compensation spill matrix is not loaded and no path is provided.")
-
-        return self._spill
-
-    @spill.setter
-    def spill(self, value: DataFrame) -> None:
-        self._spill = value
-        if self.path is not None:
-            value.to_csv(self.path, index=False)
+    def spill(self) -> pd.DataFrame:
+        df = pd.DataFrame(self._spill)
+        df.index = df.columns
+        return df
 
     @property
-    def matrix(self) -> NDArray[np.float64]:
+    def matrix(self) -> FloatArray:
         return self.spill.values
 
     @property
     def detectors(self) -> list[str]:
-        return self.spill.columns.tolist()
+        return list(self._spill.keys())
 
 
 @dataclass(frozen=True)
@@ -176,16 +141,16 @@ class ChannelRef:
         }
 
     @classmethod
-    def from_record(cls, record: Mapping[Hashable, Any]) -> "ChannelRef":
+    def from_dict(cls, data: Mapping[str, Any]) -> "ChannelRef":
         return ChannelRef(
-            idx=record["idx"],
-            pnn=record["pnn"],
-            pns=record.get("pns", None),
-            pne=tuple(record["pne"]) if record.get("pne", None) is not None else None,
-            png=record.get("png", None),
-            pnr=record.get("pnr", None),
-            metric=record.get("metric", None),
-            type=record["type"],
+            idx=data["idx"],
+            pnn=data["pnn"],
+            pns=data.get("pns", None),
+            pne=tuple(data["pne"]) if data.get("pne", None) is not None else None,
+            png=data.get("png", None),
+            pnr=data.get("pnr", None),
+            metric=data.get("metric", None),
+            type=data["type"],
         )
 
 @dataclass
@@ -205,11 +170,11 @@ class TransformationRef:
         return asdict(self)
 
     @classmethod
-    def from_record(cls, record: Mapping[str, Any]) -> "TransformationRef":
+    def from_dict(cls, data: Mapping[str, Any]) -> "TransformationRef":
         return TransformationRef(
-            id=record["id"],
-            type=record["type"],
-            params=record.get("params", {}),
+            id=data["id"],
+            type=data["type"],
+            params=data.get("params", {}),
         )
 
 @dataclass

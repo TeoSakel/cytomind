@@ -31,7 +31,7 @@ class AddLayerStep(BaseStep):
         sample_id: str,
         step_run: StepRun,
     ) -> tuple[dict, QCRunStatus]:
-        qc = self._get_qc_run(sample_id, step_run)
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -42,11 +42,11 @@ class AddLayerStep(BaseStep):
             return {}, qc
 
         # 1) Parse config
-        layer = step_run.config["layer"]
-        dimensions = sorted(self.project.dimensions[layer])
+        layer: str = step_run.config["layer"]
+        dimensions = sorted(self.project.layers[layer])
 
         # 2) Validate dimensions
-        channels = self.project.panel_df.index.to_list()
+        channels: list[str] = self.project.panel_df.index.to_list()
         step_check = validate_dimensions(
             transformations=self.project.transformations,
             channels=channels,
@@ -103,12 +103,12 @@ class AddLayerStep(BaseStep):
 
         # updates sample default layer
         layer: str = step_run.config["layer"]
-        samples_to_update: dict[str, SampleRef] = {}
+        samples_to_update: list[SampleRef] = []
         for sid, qc in step_run.qc.sample_qc.items():
             if qc.overall_flag != QCFlag.FAIL:
                 sample = self.project.samples[sid]
                 sample.default_layer = layer
-                samples_to_update[sid] = sample
+                samples_to_update.append(sample)
 
         self.repo.update_project_metadata(samples=samples_to_update)
         return step_run
@@ -122,7 +122,7 @@ class AddDimensionsStep(BaseStep):
         sample_id: str,
         step_run: StepRun,
     ) -> tuple[dict, QCRunStatus]:
-        qc = self._get_qc_run(sample_id, step_run)
+        qc = step_run.qc.get_sample_steps(sample_id)
         try:
             sample = self.project.samples[sample_id]
         except KeyError:
@@ -133,8 +133,8 @@ class AddDimensionsStep(BaseStep):
             return {}, qc
 
         # 1) Parse config
-        layer = step_run.config["layer"]
-        new_dims = sorted(step_run.config.get("dimensions", []))
+        layer: str = step_run.config["layer"]
+        new_dims: list[DimensionDef] = sorted(step_run.config.get("dimensions", []))
         if not new_dims:
             step = qc.get_step(f"update_dimensions_{layer}")
             step.flag = QCFlag.PASS
@@ -142,7 +142,7 @@ class AddDimensionsStep(BaseStep):
             return {}, qc
 
         # 2) Validate dimensions
-        channels = self.project.panel_df.index.to_list()
+        channels: list[str] = self.project.panel_df.index.to_list()
         step_check = validate_dimensions(
             transformations=self.project.transformations,
             channels=channels,
@@ -165,6 +165,7 @@ class AddDimensionsStep(BaseStep):
         # 4) Apply transforms and build final X
         step_apply = qc.get_step("apply_transformations")
         # Prepare Updated Dimensions (adata.var)
+        final_dim: list[DimensionDef] = self.config.get("final_dimensions", [])
         final_var = pd.DataFrame.from_records([dim.to_record() for dim in final_dim])
         final_var.set_index("id", drop=False, inplace=True)
         # Prepare Updated X matrix
@@ -200,12 +201,12 @@ class AddDimensionsStep(BaseStep):
     def update_project(self, step_run: StepRun) -> StepRun:
         layer: str = step_run.config["layer"]
         final_dim: list[DimensionDef] = step_run.config["final_dimensions"]
-        self.repo.update_project_metadata(dimensions={layer: final_dim})
+        self.repo.update_project_metadata(layers={layer: final_dim})
         return step_run
 
     def merge_config(self, step_run: StepRun) -> dict:
         cfg = super().merge_config(step_run)
-        cur_refs = {dim.id: dim.copy() for dim in self.project.dimensions[cfg["layer"]]}
+        cur_refs = {dim.id: dim.copy() for dim in self.project.layers[cfg["layer"]]}
         new_refs = [DimensionDef.from_dict(dim) for dim in cfg.get("dimensions", [])]
         for dim in new_refs:
             dim.idx = cur_refs[dim.id].idx if dim.id in cur_refs else len(cur_refs)
@@ -234,35 +235,36 @@ def validate_dimensions(
         return step_check
 
     # 2) deterministic ordering & presence of channels on comp.var.index
-    missing_channels = [
-        ch for dim in dimensions for ch in dim.channel_id if ch not in channels
-    ]
+    channel_set = set(channels)
+    missing_channels = set(
+        ch for dim in dimensions for ch in dim.channel_id if ch not in channel_set
+    )
     if missing_channels:
         step_check.flag = QCFlag.FAIL
         step_check.add_reason("CHANNEL_NOT_FOUND",
-                              f"Some dimension channels not found in data var: {missing_channels}.")
+                              f"Some dimension channels not found in data var: {sorted(missing_channels)}.")
         return step_check
 
     # 3) referenced transforms exist in project
-    missing_transforms = [dim.transform_id for dim in dimensions if dim.transform_id not in transformations]
+    missing_transforms = set(dim.transform_id for dim in dimensions if dim.transform_id not in transformations)
     if missing_transforms:
         step_check.flag = QCFlag.FAIL
         step_check.add_reason(
             code="TRANSFORM_NOT_FOUND",
-            message=f"Some transformations not found in project: {missing_transforms}."
+            message=f"Some transformations not found in project: {sorted(missing_transforms)}."
         )
         return step_check
 
     # 4) transform registry contains the referenced transform ids
-    missing_registry = [
+    missing_registry = set(
         dim.transform_id for dim in dimensions
         if transformations[dim.transform_id].id not in transform_registry
-    ]
+    )
     if missing_registry:
         step_check.flag = QCFlag.FAIL
         step_check.add_reason(
             code="TRANSFORM_NOT_FOUND",
-            message=f"Some transformations not found in transformation registry: {missing_registry}."
+            message=f"Some transformations not found in transformation registry: {sorted(missing_registry)}."
         )
         return step_check
 

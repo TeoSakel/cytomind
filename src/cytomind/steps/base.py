@@ -316,17 +316,17 @@ class BaseStep:
         # Clean up project_updates: keep only IDs of updated entries
         for updates in step_run.project_updates:
             if "samples" in updates:
-                updates["samples"] = list(updates["samples"].keys())
+                updates["samples"] = [sref.id for sref in updates["samples"]]
             if "batches" in updates:
-                updates["batches"] = list(updates["batches"].keys())
+                updates["batches"] = [bref.id for bref in updates["batches"]]
             if "compensations" in updates:
-                updates["compensations"] = [c.id for c in updates["compensations"]]
-            if "panel" in updates:
-                updates["panel"] = [ch.pnn for ch in updates["panel"]]
-            if "dimensions" in updates:
-                updates["dimensions"] = {
+                updates["compensations"] = [cref.id for cref in updates["compensations"]]
+            if "panel_catalog" in updates:
+                updates["panel_catalog"] = list(updates["panel_catalog"].keys())
+            if "layers" in updates:
+                updates["layers"] = {
                     layer: [dim.id for dim in dims]
-                    for layer, dims in updates["dimensions"].items()
+                    for layer, dims in updates["layers"].items()
                 }
             if "transformations" in updates:
                 updates["transformations"] = list(updates["transformations"].keys())

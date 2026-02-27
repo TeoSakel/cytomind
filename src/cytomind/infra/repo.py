@@ -1,59 +1,79 @@
 from __future__ import annotations
-from typing import Any, Iterable, Iterator, Sequence, Mapping, Literal
-from numpy.typing import NDArray
-
+from ast import TypeVar
+from typing import Any, Callable, Iterable, Sequence, Mapping, Literal, TypeVar, TYPE_CHECKING
 from pathlib import Path
-from shutil import rmtree
-
-import json
 import warnings
 
-import numpy as np
+from matplotlib.pyplot import flag
 import pandas as pd
-import anndata as ad
 
-from cytomind.domain.constants import PathLike, MaskLike
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef, TransformationRef
-from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef, RevisionSession, NumpyEncoder
+from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef, RevisionSession
 from cytomind.domain.qc import EntityQCStatus
 from cytomind.domain.transforms import get_default_transformations
 from cytomind.domain.gates import GateNode, GatingStrategyRef
-from cytomind.utils import now_iso, rlencode, rldecode
+from cytomind.infra.dataloader import UnifiedDataLoader
+
+if TYPE_CHECKING:
+    from anndata import AnnData
+    from cytomind.domain.constants import PathLike, MaskLike, Serializable, ProjectMetadata
+    import numpy as np
+    from numpy.typing import NDArray
+    BooleanArray = NDArray[np.bool_]
+    R = TypeVar("R")  # Generic return type for parse/serialize functions
+else:
+    AnnData = object
+    PathLike = object
+    MaskLike = object
+    Serializable = object
+    ProjectMetadata = object
+    BooleanArray = object
+    R = object
 
 
 class ProjectRepository:
     """A repository for loading/saving project data."""
 
-    @classmethod
-    def init_new_project(cls, root: PathLike, name: str | None = None) -> "ProjectRepository":
-        """
-        Create a minimal project structure on disk.
+    path_scheme: dict[str, str] = {
 
-        Parameters
-        ----------
-        root : PathLike
-            Filesystem path where the project will be created.
-        name : str | None
-            Optional project name; if None the directory name is used.
+        # ---- Project Metadata ----
+        "project": "project.json",
+        # Batches
+        "batches_dir": "batches",
+        "batch_dir": "batches/{batch_id}",
+        # Compensations
+        "compensations_dir": "compensations",
+        "compensation_spillover": "compensations/{comp_id}/spillover.csv",
+        # Samples
+        "samples_dir": "samples",
+        "sample_dir": "samples/{sample_id}",
+        "sample_adata": "samples/{sample_id}/{layer}.h5ad",
 
-        Returns
-        -------
-        ProjectRepository
-            Initialized repository instance pointing at the new project root.
-        """
-        root = Path(root)
-        repo = cls(root)
+        # ---- Gating Strategy I/O ----
+        "gating_strategies_dir": "gating_strategies",
+        "gating_strategy_catalog": "gating_strategies/catalog.json",
+        "gating_strategy_dir": "gating_strategies/{strategy_id}",
+        "gating_strategy": "gating_strategies/{strategy_id}/strategy.json",
+        "gate_node": "gating_strategies/{strategy_id}/gates/{node_id}.json",
+        "gating_strategy_masks_dir": "gating_strategies/{strategy_id}/masks",
+        "gating_mask": "gating_strategies/{strategy_id}/masks/{mask_id}/{sample_id}.npy",
 
-        # Create an empty project record
-        project = Project(
-            id=name or root.name,
-            samples={},
-            panel=[],
-            compensations={},
-            transformations=get_default_transformations(),
-        )
-        repo.save_project(project, deep_copy=True)
-        return repo
+        # ---- Step/Pipeline I/O ----
+        "steps_dir": "steps",
+        "step_run_dir": "steps/{step_id}",
+        "step_run": "steps/{step_id}/info.json",
+
+        # ---- QC I/O ----
+        "qc_dir": "qc",
+        "qc_entity_dir": "qc/{entity_type}/{entity_id}",
+        "entity_qc": "qc/{entity_type}/{entity_id}/info.json",
+
+        # ---- Revision Workspaces ----
+        "workspaces_dir": "workspaces",
+        "revision_type_dir": "workspaces/{entity_type}",
+        "revision_workspace": "workspaces/{entity_type}/{session_id}",
+        "revision_session": "workspaces/{entity_type}/{session_id}/session.json",
+    }
 
     def __init__(self, root: PathLike, name: str | None = None):
         """
@@ -70,370 +90,263 @@ class ProjectRepository:
             loading an existing project.
         """
         self.root = Path(root)
-        if not self.project_config_path.exists():
-            # First time init: create project with given name
-            self.root.mkdir(parents=True, exist_ok=True)
+        self._dataloader = UnifiedDataLoader(
+            path_scheme=self.path_scheme,
+            root_dir=self.root,
+            data_handlers=self._default_metadata_handlers(),
+            fallback=None,  # Main repo has no fallback
+            viz_cache_dir=None,  # Main repo doesn't use viz caching
+        )
+
+        try:
+            self.load_project_metadata("project")
+            if name is not None:
+                warnings.warn("Project name is ignored when loading existing project from disk.")
+        except FileNotFoundError:
             project = Project(
                 id=name or self.root.name,
                 samples={},
-                panel=[],
+                panel_catalog={},
                 compensations={},
                 transformations=get_default_transformations(),
             )
-            self.save_project(project, deep_copy=True)
-        elif name is not None:
-            warnings.warn("Project name is ignored when loading existing project from disk.")
+            self.save_project(project)
 
 
-        # Initialize step counter
-        self._step_counter = 0
-        if self.steps_dir.exists():
-            for step_dir in self.steps_dir.iterdir():
-                if step_dir.is_dir():
-                    self._step_counter += 1
-
-    # ---------- Directory paths ----------
-
-    @property
-    def transformations_path(self) -> Path:
+    def _default_metadata_handlers(self) -> dict[str, tuple[Callable[[Any], ProjectMetadata], Callable[[Any], dict|list] | None]]:
         """
-        Path to the transformations JSON file.
+        Define default metadata handlers for domain objects.
+
+        Each entry maps a metadata type to a tuple of (parse_func, serialize_func).
+        The parse_func converts raw dict/list data into domain objects, while the
+        serialize_func converts domain objects back into dict/list for storage.
 
         Returns
         -------
-        Path
-            Absolute path to 'transformations.json' inside the project root.
+        dict
+            Mapping of metadata type -> (parse_func, serialize_func).
         """
-        return self.root / "transformations.json"
+        def parse_dict_factory(cls: type[Serializable]) -> Callable[[Mapping[str, dict]], dict[str, Serializable]]:
+            """Factory to create dict parsers for domain objects."""
+            def parse_dict(data: Mapping[str, dict]) -> dict[str, Serializable]:
+                return {k: cls.from_dict(v) for k, v in data.items()}
+            return parse_dict
+
+        # Spacial case for gating strategy catalog to handle graph serialization
+        def serialize_gs_catalog(gs_refs: dict[str, GatingStrategyRef]) -> dict[str, dict[str, Any]]:
+            """Custom serializer for gating strategy catalog to handle graph serialization."""
+            serialized = {}
+            for k, ref in gs_refs.items():
+                ref_dict = ref.to_dict()
+                # Remove graph from catalog to save space
+                if not ref_dict.get("path") or not Path(ref_dict["path"]).exists():
+                    raise ValueError(f"GatingStrategyRef with id '{ref.id}' is missing 'path' attribute required for serialization.")
+                ref_dict.pop("graph", None)
+                serialized[k] = ref_dict
+            return serialized
+
+        return  {
+            "project":          (          Project.from_dict, None),
+            "step_run":         (          StepRun.from_dict, None),
+            "dimension":        (     DimensionDef.from_dict, None),
+            "entity_qc":        (   EntityQCStatus.from_dict, None),
+            "revision_session": (  RevisionSession.from_dict, None),
+            "gating_strategy":  (GatingStrategyRef.from_dict, None),
+            "gating_strategy_catalog": (parse_dict_factory(GatingStrategyRef), serialize_gs_catalog),
+        }
 
     # -------------- Project I/O -------------
 
-    @property
-    def project_config_path(self) -> Path:
-        """
-        Path to the main project configuration file.
+    def load_project_metadata(self, entity: str, **kwargs) -> Any:
+        return self._dataloader.load_data(entity, **kwargs)
 
-        Returns
-        -------
-        Path
-            Absolute path to 'project.json' inside the project root.
-        """
-        return self.root / "project.json"
+    def save_project_metadata(self, entity: str, data: Any, overwrite: bool = True, **kwargs) -> Path:
+        return self._dataloader.save_data(entity, data, overwrite=overwrite, **kwargs)
 
     def load_project(self) -> Project:
-        """
-        Load the project metadata from disk.
+        return self.load_project_metadata("project")
 
-        Reads project.json and reconstructs CompensationRef spill paths.
-
-        Returns
-        -------
-        Project
-            Deserialized Project domain object.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the project configuration file does not exist.
-        """
-        proj_meta = self._read_json(self.project_config_path)
-        return Project.from_dict(proj_meta)
-
-    def save_project(self, project: Project, deep_copy: bool = True) -> None:
-        """
-        Persist project metadata and optionally write related artifacts.
-
-        Parameters
-        ----------
-        project : Project
-            Project domain object to persist.
-        deep_copy : bool
-            If True, also write per-sample metadata, batches, panel, compensations,
-            dimensions and transformations to disk.
-        """
-        self._write_json(self.project_config_path, project.to_dict())
-        if deep_copy:
-            for sample in project.samples.values():
-                self._write_sample_meta(sample)
-            for batch in project.batches.values():
-                self._write_batch_meta(batch)
-            self._save_panel(project.panel)
-            self._update_comp_catalog(project.compensations.values())
-            self._write_dimensions(project.dimensions)
-            self._write_transformations(project.transformations)
-            self._update_gating_strategy_catalog(project.gating_strategies.values())
+    def save_project(self, project: Project) -> None:
+        self.save_project_metadata("project", project)
 
     def update_project_metadata(
         self,
-        samples: Mapping[str, SampleRef] = {},
-        panel: Sequence[ChannelRef] = [],
-        dimensions: Mapping[str, list[DimensionDef]] = {},
+        samples: Iterable[SampleRef] = {},
+        panel_catalog: Mapping[str, Sequence[ChannelRef]] = {},
+        layers: Mapping[str, list[DimensionDef]] = {},
         compensations: Iterable[CompensationRef] = [],
-        transformations: Mapping[str, TransformationRef] = {},
-        batches: Mapping[str, BatchRef] = {},
+        transformations: Iterable[TransformationRef] = [],
+        batches: Iterable[BatchRef] = {},
         gating_strategies: Iterable[GatingStrategyRef] = [],
-        drop_samples: Sequence[str] = [],
-        drop_batches: Sequence[str] = [],
+        drop_samples: Iterable[str] = [],
+        drop_batches: Iterable[str] = [],
     ) -> None:
         """
         Merge and persist updates to the project's registries.
 
         Only non-empty keyword arguments will be merged into the on-disk project metadata.
+        All metadata is stored in project.json; no separate catalog files are written.
 
         Parameters
         ----------
-        samples : Mapping[str, SampleRef], optional
-            Mapping of sample_id -> SampleRef to add/update.
-        panel : Sequence[ChannelRef], optional
-            Channel definitions for the project's panel.
-        dimensions : Mapping[str, list[DimensionDef]], optional
+        samples : Iterable[SampleRef], optional
+            Iterable of SampleRef objects to add/update.
+        panel_catalog : Mapping[str, Sequence[ChannelRef]], optional
+            Mapping of panel_id -> channel definitions for all panels.
+        layers : Mapping[str, list[DimensionDef]], optional
             Data layer dimension definitions to add/update.
         compensations : Iterable[CompensationRef], optional
             Compensation references to add/update.
-        transformations : Mapping[str, TransformationRef], optional
+        transformations : Iterable[TransformationRef], optional
             Transformation references to add/update.
-        batches : Mapping[str, BatchRef], optional
-            Batch references to add/update.
+        batches : Iterable[BatchRef], optional
+            Iterable of BatchRef objects to add/update.
         gating_strategies : Iterable[GatingStrategyRef], optional
-            Gating strategy references to add/update.
-        drop_samples : Sequence[str], optional
+            Iterable of GatingStrategyRef objects to add/update.
+        drop_samples : Iterable[str], optional
             List of sample IDs to remove from the project. This will delete sample
             directories and remove references from batches.
-        drop_batches : Sequence[str], optional
+        drop_batches : Iterable[str], optional
             List of batch IDs to remove from the project. This will delete batch directories.
         """
-        project = self.load_project()
+        project: Project = self.load_project()
         update_needed = False
 
         # Handle sample deletions first
         drop_samples = list(drop_samples)
         if drop_samples:
-            for sample_id in drop_samples:
-                # Remove sample directory and all its contents
-                sample_dir = self.sample_path(sample_id)
-                if sample_dir.exists():
-                    rmtree(sample_dir)
-
-                # Remove from project samples dict
-                project.samples.pop(sample_id, None)
-
-            # Remove samples from batches
-            drop_samples_set = set(drop_samples)
-            for batch in project.batches.values():
-                original_count = len(batch.sample_ids)
-                batch.sample_ids = [sid for sid in batch.sample_ids if sid not in drop_samples_set]
-                if len(batch.sample_ids) < original_count:
-                    self._write_batch_meta(batch)
-
+            project = self._drop_samples(project=project, sample_ids=drop_samples)
             update_needed = True
+
+        # Handle batch deletions
+        drop_batches = list(drop_batches)
+        if drop_batches:
+            project = self._drop_batches(project=project, batch_ids=drop_batches)
+            update_needed = True
+
+        def iter_to_dict(iterable: Iterable[R]) -> dict[str, R]:
+            """Helper to convert iterable of domain objects to dict by id."""
+            return {item.id: item for item in iterable} # pyright: ignore[reportAttributeAccessIssue]
 
         # Handle sample additions/updates
         if samples:
-            for sample in samples.values():
-                self._write_sample_meta(sample)
-            project.samples.update(samples)
+            project.samples.update(iter_to_dict(samples))
             update_needed = True
 
-        panel = list(panel)
-        if panel:
-            project.panel = panel
-            self._save_panel(panel)
-            update_needed = True
-        if compensations:
-            project.compensations = self._update_comp_catalog(compensations)
-            update_needed = True
-        if dimensions:
-            project.dimensions.update(dimensions)
-            update_needed = True
-            self._write_dimensions(project.dimensions)
-        if transformations:
-            project.transformations.update(transformations)
-            update_needed = True
-            self._write_transformations(project.transformations)
-        if gating_strategies:
-            project.gating_strategies = self._update_gating_strategy_catalog(gating_strategies)
-            update_needed = True
-
-        # Handle batch deletions first
-        drop_batches = list(drop_batches)
-        if drop_batches:
-            for batch_id in drop_batches:
-                # Remove batch directory if it exists
-                batch_dir = self.batch_path(batch_id)
-                if batch_dir.exists():
-                    rmtree(batch_dir)
-
-                # Remove from project batches dict
-                project.batches.pop(batch_id, None)
-
-            update_needed = True
-
-        # Handle batch additions/updates
         if batches:
-            for batch in batches.values():
-                self._write_batch_meta(batch)
-            project.batches.update(batches)
+            project.batches.update(iter_to_dict(batches))
+            update_needed = True
+
+        if panel_catalog:
+            project.panel_catalog = {k: list(v) for k, v in panel_catalog.items()}
+            update_needed = True
+
+        if compensations:
+            project.compensations.update(iter_to_dict(compensations))
+            update_needed = True
+
+        if layers:
+            project.layers.update(layers)
+            update_needed = True
+
+        if transformations:
+            project.transformations.update(iter_to_dict(transformations))
+            update_needed = True
+
+        if gating_strategies:
+            cat = self._update_gating_strategy_catalog(gating_strategies)
+            project.gating_strategies.update(cat)
             update_needed = True
 
         if update_needed:
-            self._write_json(self.project_config_path, project.to_dict())
+            self.save_project(project)
 
-    # ------------- Panel I/O -----------------
 
-    @property
-    def panel_path(self) -> Path:
+    def _drop_samples(self, project: Project, sample_ids: Sequence[str]) -> Project:
+        sample_ids_set = set(sample_ids)
+        sample_ids = list(sample_ids_set)  # Ensure uniqueness
+
+        # Validate that all samples exist
+        missing_samples = sample_ids_set - project.samples.keys()
+        if missing_samples:
+            raise ValueError(f"Sample(s) not found in project: {', '.join(sorted(missing_samples))}")
+
+        # Remove sample data directories
+        for sample_id in sample_ids:
+            self._dataloader.remove_data("sample_dir", sample_id=sample_id)
+
+        # Remove samples from project
+        for sample_id in sample_ids:
+            project.samples.pop(sample_id, None)
+
+        # Remove samples from batches
+        for batch in project.batches.values():
+            if set(batch.sample_ids).intersection(sample_ids_set):
+                batch.drop_samples(sample_ids_set)
+
+        return project
+
+    def _drop_batches(self, project: Project, batch_ids: Sequence[str]) -> Project:
+        for batch_id in batch_ids:
+            # Remove batch directory using dataloader
+            self._dataloader.remove_data("batch_dir", batch_id=batch_id)
+
+            # Remove from project batches dict
+            project.batches.pop(batch_id, None)
+
+        return project
+
+    def _update_gating_strategy_catalog(self, strategy_refs: Iterable[GatingStrategyRef]) -> dict[str, GatingStrategyRef]:
         """
-        Path to the panel CSV file.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'panel.csv' inside the project root.
-        """
-        return self.root / "panel.csv"
-
-    def _save_panel(self, panel: Iterable[ChannelRef]) -> None:
-        """
-        Write channel panel to disk as CSV.
+        Merge and persist gating strategy catalog entries.
 
         Parameters
         ----------
-        panel : Iterable[ChannelRef]
-            Iterable of ChannelRef objects describing the panel.
-        """
-        panel_path = self.panel_path
-        panel_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame.from_records([vars(ch) for ch in panel]).to_csv(panel_path, index=False)
-
-    def _load_channelRefs(self) -> list[ChannelRef]:
-        """
-        Load ChannelRef objects from the panel CSV.
+        strategy_refs : Iterable[GatingStrategyRef]
+            New or updated gating strategy references to merge into the catalog.
 
         Returns
         -------
-        list[ChannelRef]
-            Deserialized list of ChannelRef instances.
+        dict[str, GatingStrategyRef]
+            Updated catalog mapping strategy_id -> GatingStrategyRef.
         """
-        panel = pd.read_csv(self.panel_path, index_col=False)
-        return [ChannelRef(**{str(k): v for k, v in ch.items()}) for ch in panel.to_dict(orient="records")]
+        catalog = self.load_project_metadata("gating_strategy_catalog")
+        new_strategy_refs: dict[str, GatingStrategyRef] = {}
+        for ref in strategy_refs:
+            if not isinstance(ref, GatingStrategyRef):
+                raise TypeError("strategy_refs values must be GatingStrategyRef instances.")
+            ref.path = self.save_project_metadata("gating_strategy", ref, strategy_id=ref.id).as_posix()
+            new_strategy_refs[ref.id] = ref
 
-    # ------------- Channel Mapping I/O -----------------
-
-    @property
-    def channel_mapping_path(self) -> Path:
-        """
-        Path to the channel mapping JSON file.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'channel_mapping.json' inside the project root.
-        """
-        return self.root / "channel_mapping.json"
-
-    def load_channel_mapping(self) -> dict[str, dict[str, dict[str, str]]]:
-        """
-        Load channel name mappings from disk.
-
-        Returns structure:
-        {
-            "sample_id": {
-                "channels": {"original_pnn": "new_pnn", ...},
-                "proteins": {"original_pnn": "new_pns", ...}
-            },
-            ...
-        }
-
-        Returns
-        -------
-        dict
-            Channel mapping dictionary, empty dict if file doesn't exist.
-        """
-        if not self.channel_mapping_path.exists():
-            return {}
-        return self._read_json(self.channel_mapping_path)
-
-    def save_channel_mapping(
-        self,
-        mapping: dict[str, dict[str, dict[str, str]]],
-    ) -> None:
-        """
-        Persist channel name mappings to disk.
-
-        Parameters
-        ----------
-        mapping : dict
-            Channel mapping structure with per-sample channel/protein renames.
-            Only includes channels that change names.
-        """
-        self._write_json(self.channel_mapping_path, mapping)
+        catalog.update(new_strategy_refs)
+        self.save_project_metadata("gating_strategy_catalog", catalog)
+        return catalog
 
     # ------------- Dimension I/O -----------------
 
-    @property
-    def dimensions_path(self) -> Path:
-        """
-        Path to the dimensions JSON file.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'dimensions.json' inside the project root.
-        """
-        return self.root / "dimensions.json"
-
-    def load_dimensions(self) -> dict[str, list[DimensionDef]]:
-        """
-        Load data layer dimension definitions.
-
-        Returns
-        -------
-        dict[str, list[DimensionDef]]
-            Mapping of layer name -> list of DimensionDef objects.
-        """
-        if not self.dimensions_path.exists():
-            return {}
-        catalog = self._read_json(self.dimensions_path)
-        return {layer: [DimensionDef.from_dict(dim) for dim in dims] for layer, dims in catalog.items()}
-
-    def load_dimensions_df(self, layer: str) -> pd.DataFrame:
-        """
-        Load data layer dimensions as a DataFrame.
+    def load_layer_df(self, layer: str) -> pd.DataFrame:
+        """Load dimension definitions for a data layer as a DataFrame.
 
         Parameters
         ----------
         layer : str
-            Data layer name.
+            Name of the data layer.
 
         Returns
         -------
         pd.DataFrame
-            DataFrame of dimension definitions for the specified layer.
+            DataFrame with dimension definitions, indexed by dimension ID.
 
         Raises
         ------
         KeyError
-            If the specified layer does not exist.
+            If the layer does not exist in the project.
         """
-        catalog = self.load_dimensions()
-        if layer not in catalog:
-            raise KeyError(f"Data layer '{layer}' not found in dimensions catalog.")
-        df = pd.DataFrame.from_records([dim.to_record() for dim in catalog[layer]])
+        project = self.load_project()
+        if layer not in project.layers:
+            raise KeyError(f"Data layer '{layer}' not found in project.")
+        df = pd.DataFrame.from_records([dim.to_record() for dim in project.layers[layer]])
         return df.set_index("id", drop=False).sort_values("idx")
-
-    def _write_dimensions(self, dimensions: Mapping[str, list[DimensionDef]]) -> None:
-        """
-        Write the dimensions catalog to disk.
-
-        Parameters
-        ----------
-        dimensions : Mapping[str, list[DimensionDef]]
-            Mapping of layer -> list of DimensionDef instances or dict-like records.
-        """
-        self._write_json(
-            self.dimensions_path,
-            {layer: [vars(dim) for dim in dims] for layer, dims in dimensions.items()}
-        )
 
     def add_data_layer(self, layer: str, dimensions: Iterable[Mapping[str, Any]]) -> None:
         """
@@ -451,13 +364,13 @@ class ProjectRepository:
         ValueError
             If the named layer already exists.
         """
-        catalog = self.load_dimensions()
-        if layer in catalog:
+        project = self.load_project()
+        if layer in project.layers:
             raise ValueError(f"Data layer '{layer}' already exists. Call update_layer_dimensions instead.")
         dim_refs = [DimensionDef.from_dict(dim) for dim in dimensions]
         for i, dim in enumerate(dim_refs):
             dim.idx = i
-        self.update_project_metadata(dimensions={layer: dim_refs})
+        self.update_project_metadata(layers={layer: dim_refs})
 
     def update_layer_dimensions(self, layer: str, dimensions: Iterable[Mapping[str, Any]]) -> None:
         """
@@ -472,221 +385,41 @@ class ProjectRepository:
         dimensions : Iterable[Mapping[str, Any]]
             Sequence of dimension records (dict-like) to be added or updated.
         """
-        catalog = self.load_dimensions()
-        if layer not in catalog:
+        project = self.load_project()
+        if layer not in project.layers:
             warnings.warn(f"Data layer '{layer}' does not exist. Calling add_data_layer instead.")
             self.add_data_layer(layer, dimensions)
             return
 
-        cur_refs = {dim.id: dim for dim in catalog[layer]}
+        cur_refs = {dim.id: dim for dim in project.layers[layer]}
         new_refs = [DimensionDef.from_dict(dim) for dim in dimensions]
         for dim in new_refs:
             dim.idx = cur_refs[dim.id].idx if dim.id in cur_refs else len(cur_refs)
             cur_refs[dim.id] = dim
 
-        catalog[layer] = sorted(list(cur_refs.values()))
-        self.update_project_metadata(dimensions=catalog)
-
-    def load_transformations(self) -> dict[str, TransformationRef]:
-        """
-        Load transformation references from disk.
-
-        Returns
-        -------
-        dict[str, TransformationRef]
-            Mapping of transformation id -> TransformationRef.
-        """
-        if not self.transformations_path.exists():
-            return {}
-        catalog = self._read_json(self.transformations_path)
-        return {k: TransformationRef(**v) for k, v in catalog.items()}
-
-    def _write_transformations(self, transformations: Mapping[str, TransformationRef]) -> None:
-        """
-        Persist transformation references to disk.
-
-        Parameters
-        ----------
-        transformations : Mapping[str, TransformationRef]
-            Mapping of id -> TransformationRef to persist.
-        """
-        self._write_json(
-            self.transformations_path,
-            {k: v.to_dict() for k, v in transformations.items()}
-        )
+        updated_layers = {layer: sorted(list(cur_refs.values()))}
+        self.update_project_metadata(layers=updated_layers)
 
     # ------------- Sample I/O -----------------
 
-    @property
-    def samples_dir(self) -> Path:
-        """Absolute path to samples directory."""
-        return self.root / "samples"
-
-    def sample_path(self, sample: SampleRef | str) -> Path:
-        """
-        Get absolute path to a sample directory.
-
-        Parameters
-        ----------
-        sample_id : str
-            Identifier of the sample.
-
-        Returns
-        -------
-        Path
-            Absolute path to the sample directory within the project.
-        """
-        sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        return self.samples_dir / sample_id
-
-    def sample_config_path(self, sample: SampleRef | str) -> Path:
-        """
-        Path to a sample's metadata JSON file.
-
-        Parameters
-        ----------
-        sample_id : str
-            Identifier of the sample.
-
-        Returns
-        -------
-        Path
-            Absolute path to '<sample_id>/sample.json'.
-        """
-        sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        return self.sample_path(sample_id) / "sample.json"
-
     def sample_adata_path(self, sample: SampleRef | str, layer: str) -> Path:
-        """
-        Path to a sample's AnnData file for a given layer.
-
-        Parameters
-        ----------
-        sample_id : str
-            Identifier of the sample.
-        layer : str
-            Data layer name.
-
-        Returns
-        -------
-        Path
-            Absolute path to '<sample_id>/<layer>.h5ad'.
-        """
+        """Path to a sample's AnnData file for a given layer."""
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        return self.sample_path(sample_id) / f"{layer}.h5ad"
-
-    def sample_relpath(self, sample: SampleRef | str) -> Path:
-        """
-        Relative path of the sample directory with respect to project root.
-
-        Parameters
-        ----------
-        sample_id : str
-            Identifier of the sample.
-
-        Returns
-        -------
-        Path
-            Relative path object.
-        """
-        sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        abs_path = self.sample_path(sample_id)
-        return abs_path.relative_to(self.root)
-
-    def iter_sample_dirs(self) -> Iterator[Path]:
-        """
-        Yield sample directories present in the project.
-
-        Returns
-        -------
-        Iterator[Path]
-            Iterator over Path objects for each sample directory.
-        """
-        if self.samples_dir.exists():
-            yield from (p for p in self.samples_dir.iterdir() if p.is_dir())
-        else:
-            yield from []
-
-    def load_samples(self) -> dict[str, SampleRef]:
-        """
-        Load all sample metadata as SampleRef objects.
-
-        Returns
-        -------
-        dict[str, SampleRef]
-            Mapping of sample_id -> SampleRef.
-        """
-        samples: dict[str, SampleRef] = {}
-        for sample_dir in self.iter_sample_dirs():
-            s = self.load_sample_meta(sample_dir.name)
-            samples[s.id] = s
-        return samples
+        pattern = self.path_scheme["sample_adata"]
+        return self._dataloader._resolve_read_path(pattern=pattern,  sample_id=sample_id, layer=layer)
 
     def load_sample_meta(self, sample_id: str) -> SampleRef:
-        """
-        Load a single sample's metadata record.
+        project = self.load_project()
+        if sample_id not in project.samples:
+            raise KeyError(f"Sample '{sample_id}' not found in project.")
+        return project.samples[sample_id]
 
-        Parameters
-        ----------
-        sample_id : str
-            Identifier of the sample to load.
-
-        Returns
-        -------
-        SampleRef
-            Deserialized SampleRef instance.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the sample metadata file does not exist.
-        """
-        path = self.sample_config_path(sample_id)
-        config = self._read_json(path)
-        config["root"] = self.sample_path(sample_id)
-        return SampleRef.from_record(config)
-
-    def _write_sample_meta(self, sample: SampleRef) -> None:
-        """
-        Persist sample metadata to disk.
-
-        Parameters
-        ----------
-        sample : SampleRef
-            Sample reference to write.
-        """
-        path = self.sample_config_path(sample.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(path, sample.to_dict())
-
-    def _load_sample_layer(self, sample_id: str, layer: str, backed: bool | Literal["r", "r+"] = "r") -> ad.AnnData:
-        """
-        Load an AnnData object for a sample layer (possibly backed).
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier.
-        layer : str
-            Data layer name.
-        backed : bool or {'r','r+'}, optional
-            Whether to open the AnnData in backed mode. Defaults to "r".
-
-        Returns
-        -------
-        anndata.AnnData
-            AnnData view (may be backed). Caller is responsible for converting to memory if needed.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the requested layer file does not exist.
-        """
-        path = self.sample_path(sample_id) / f"{layer}.h5ad"
-        if not path.exists():
-            raise FileNotFoundError(f"Sample {sample_id} layer '{layer}' data file not found at {path.as_posix()}")
-        ondisk = ad.read_h5ad(path, backed=backed)
-        return ondisk
+    def _load_sample_layer(self, sample_id: str, layer: str, backed: bool | Literal["r", "r+"] = "r") -> AnnData:
+        return self._dataloader.load_adata(
+            sample_id=sample_id,
+            layer=layer,
+            backed=backed,
+        )
 
     def load_sample_adata(
         self,
@@ -694,280 +427,23 @@ class ProjectRepository:
         layer: str,
         mask: MaskLike = slice(None),
         select: Sequence[str] | slice = slice(None),
-    ) -> ad.AnnData:
-        """
-        Load a sample AnnData into memory applying optional row/column selection.
+    ) -> AnnData:
+        return self._dataloader.load_adata(
+            sample_id=sample_id,
+            layer=layer,
+            mask=mask,
+            select=select,
+        )
 
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier.
-        layer : str
-            Data layer name to load.
-        mask : MaskLike, optional
-            Boolean or integer index or slice to select rows (observations). Defaults to slice(None).
-        select : Sequence[str] or slice, optional
-            Sequence of var_names or slice to select columns. Defaults to slice(None).
-
-        Returns
-        -------
-        anndata.AnnData
-            Materialized in-memory AnnData object.
-        """
-        ondisk = self._load_sample_layer(sample_id, layer)
-        adata = ondisk[mask, select].to_memory(copy=True)
-        try:
-            ondisk.file.close()
-            del ondisk
-        except Exception:
-            pass
-        return adata
-
-    def save_sample_adata(self, sample_id: str, layer: str, adata: ad.AnnData, **kwargs) -> None:
-        """
-        Save an AnnData for a sample's layer.
-
-        Handles both backed and in-memory AnnData objects.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier.
-        layer : str
-            Data layer name.
-        adata : anndata.AnnData
-            AnnData object to persist.
-        **kwargs
-            Additional keyword arguments passed to AnnData.write_h5ad.
-        """
-        path = self.sample_path(sample_id) / f"{layer}.h5ad"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if adata.isbacked and adata.filename == path.as_posix():
-            flush = adata.to_memory(copy=False)
-            try:
-                adata.file.close()
-            except Exception:
-                pass
-            del adata
-            flush.write_h5ad(path, **kwargs)
-        else:
-            adata.write_h5ad(path, **kwargs)
-
-    def drop_samples(self, sample_ids: Sequence[str]) -> None:
-        """
-        Remove samples from the project.
-
-        This method removes sample data files, sample metadata, and removes
-        sample references from the project and any batches that contain them.
-
-        Parameters
-        ----------
-        sample_ids : Sequence[str]
-            List of sample identifiers to remove from the project.
-
-        Raises
-        ------
-        ValueError
-            If any sample_id does not exist in the project.
-        """
-
-        project = self.load_project()
-        sample_ids_set = set(sample_ids)
-
-        # Validate that all samples exist
-        missing_samples = sample_ids_set - set(project.samples.keys())
-        if missing_samples:
-            raise ValueError(f"Sample(s) not found in project: {', '.join(sorted(missing_samples))}")
-
-        # Remove samples from project
-        for sample_id in sample_ids_set:
-            # Remove sample directory and all its contents
-            sample_dir = self.sample_path(sample_id)
-            if sample_dir.exists():
-                rmtree(sample_dir)
-
-            # Remove from project samples dict
-            project.samples.pop(sample_id, None)
-
-        # Remove samples from batches
-        for batch in project.batches.values():
-            original_count = len(batch.sample_ids)
-            batch.sample_ids = [sid for sid in batch.sample_ids if sid not in sample_ids_set]
-            if len(batch.sample_ids) < original_count:
-                self._write_batch_meta(batch)
-
-        # Compensations and panel are not sample-specific, so no changes needed there.
-
-        # Save updated project metadata
-        self.save_project(project, deep_copy=False)
-
-
-    # ------------- Batch I/O -----------------
-
-    @property
-    def batch_dir(self) -> Path:
-        """
-        Path to batches directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to the project's 'batches' directory.
-        """
-        return self.root / "batches"
-
-    def batch_path(self, batch_id: str) -> Path:
-        """
-        Get path to a batch directory.
-
-        Parameters
-        ----------
-        batch_id : str
-            Batch identifier.
-
-        Returns
-        -------
-        Path
-            Absolute path to the batch directory.
-        """
-        return self.batch_dir / batch_id
-
-    def batch_config_path(self, batch_id: str) -> Path:
-        """
-        Path to a batch's metadata JSON file.
-
-        Parameters
-        ----------
-        batch_id : str
-            Batch identifier.
-
-        Returns
-        -------
-        Path
-            Absolute path to '<batch_id>/batch.json'.
-        """
-        return self.batch_path(batch_id) / "batch.json"
-
-    def _load_batches(self) -> dict[str, BatchRef]:
-        """
-        Load all batch metadata present on disk.
-
-        Returns
-        -------
-        dict[str, BatchRef]
-            Mapping of batch_id -> BatchRef.
-        """
-        batches: dict[str, BatchRef] = {}
-        if not self.batch_dir.exists():
-            return batches
-        for batch_dir in self.batch_dir.iterdir():
-            if not batch_dir.is_dir():
-                continue
-            b = self.load_batch_meta(batch_dir.name)
-            batches[b.id] = b
-        return batches
-
-    def load_batch_meta(self, batch_id: str) -> BatchRef:
-        """
-        Load a batch's metadata record.
-
-        Parameters
-        ----------
-        batch_id : str
-            Batch identifier.
-
-        Returns
-        -------
-        BatchRef
-            Deserialized BatchRef instance.
-        """
-        path = self.batch_config_path(batch_id)
-        config = self._read_json(path)
-        config["root"] = self.batch_path(batch_id)
-        return BatchRef.from_record(config)
-
-    def _write_batch_meta(self, batch: BatchRef) -> None:
-        """
-        Persist batch metadata to disk.
-
-        Parameters
-        ----------
-        batch : BatchRef
-            Batch reference to persist.
-        """
-        path = self.batch_config_path(batch.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(path, batch.to_dict())
+    def save_sample_adata(self, sample_id: str, layer: str, adata: AnnData, **kwargs) -> None:
+        return self._dataloader.save_adata(
+            sample_id=sample_id,
+            layer=layer,
+            adata=adata,
+            **kwargs,
+        )
 
     # --------- Compensation I/O ----------
-
-    @property
-    def compensation_dir(self) -> Path:
-        """
-        Path to compensations directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to the project's 'compensations' directory.
-        """
-        return self.root / "compensations"
-
-    @property
-    def comp_catalog_path(self) -> Path:
-        """
-        Path to the compensation catalog JSON file.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'compensations/catalog.json'.
-        """
-        return self.compensation_dir / "catalog.json"
-
-    def get_comp_catalog(self) -> dict[str, CompensationRef]:
-        """
-        Load the compensation catalog and attach spillover file paths.
-
-        Returns
-        -------
-        dict[str, CompensationRef]
-            Mapping comp_id -> CompensationRef.
-        """
-        if not self.comp_catalog_path.exists():
-            return {}
-        catalog = self._read_json(self.comp_catalog_path)
-        return {comp_id: CompensationRef.from_record(config) for comp_id, config in catalog.items()}
-
-    @property
-    def spillover_dir(self) -> Path:
-        """
-        Path to compensation spillover matrices directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'compensations/matrices'.
-        """
-        return self.compensation_dir / "matrices"
-
-    def spillover_path(self, comp: CompensationRef | str) -> Path:
-        """
-        Path to a compensation spillover CSV for a given compensation id.
-
-        Parameters
-        ----------
-        comp_id : str
-            Compensation identifier.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'compensations/matrices/<comp_id>.csv'.
-        """
-
-        comp_id = comp.id if isinstance(comp, CompensationRef) else comp
-        return self.spillover_dir / f"{comp_id}.csv"
 
     def get_spill_df(self, comp: CompensationRef | str) -> pd.DataFrame:
         """
@@ -988,44 +464,17 @@ class ProjectRepository:
         FileNotFoundError
             If the referenced spillover CSV does not exist when comp is a string id.
         """
+        if isinstance(comp, CompensationRef):
+            return comp.spill
+
         if isinstance(comp, str):
-            path = self.spillover_path(comp)
-            if not path.exists():
-                raise FileNotFoundError(f"Compensation spillover file not found: {path.as_posix()}")
-            df = pd.read_csv(path, index_col=False)
-        elif isinstance(comp, CompensationRef):
-            df = comp.spill.copy()
-        else:
-            raise ValueError(f"Unsupported comp type: {type(comp)}")
-        df.index = df.columns
-        return df
+            project = self.load_project()
+            try:
+                return project.compensations[comp].spill
+            except KeyError as e:
+                 raise KeyError(f"Compensation with id '{comp}' not found in project.") from e
 
-    def _update_comp_catalog(self, comp_refs: Iterable[CompensationRef]) -> dict[str, CompensationRef]:
-        """
-        Merge and persist compensation catalog entries.
-
-        Parameters
-        ----------
-        comp_refs : Iterable[CompensationRef]
-            New or updated compensation references to merge into the catalog.
-        """
-        self.compensation_dir.mkdir(parents=True, exist_ok=True)
-        catalog = self.get_comp_catalog()
-        comps: dict[str, CompensationRef] = {}
-        for ref in comp_refs:
-            if not isinstance(ref, CompensationRef):
-                raise TypeError("comps values must be CompensationRef instances.")
-            path = self.spillover_path(ref.id)
-            if not path.exists():
-                ref = self._save_compensation_ref(ref)
-            ref.path = path.as_posix()  # Ensure path is set correctly
-            comps[ref.id] = ref
-        catalog.update(comps)
-        self._write_json(
-            self.comp_catalog_path,
-            {comp_id: comp.to_dict() for comp_id, comp in catalog.items()}
-        )
-        return catalog
+        raise ValueError(f"Unsupported comp type: {type(comp)}")
 
     def add_compensation(
         self,
@@ -1062,88 +511,10 @@ class ProjectRepository:
             raise TypeError("Spillover must be a pandas DataFrame.")
 
         ref = CompensationRef.from_dataframe(df = spillover.copy(), name=name, source=source, batch=batch)
-        self._add_compensation_refs([ref])
+        self.update_project_metadata(compensations=[ref])
         return ref.id
 
-    def _save_compensation_ref(self, comp_ref: CompensationRef) -> CompensationRef:
-        """
-        Write a single compensation spillover CSV and update the catalog.
-
-        Parameters
-        ----------
-        comp_ref : CompensationRef
-            CompensationRef instance with attached spillover matrix.
-
-        Raises
-        ------
-        ValueError
-            If the CompensationRef is missing an attached spillover matrix.
-        """
-        if not isinstance(comp_ref, CompensationRef):
-            raise TypeError("comp_ref must be a CompensationRef instance.")
-        path = self.spillover_path(comp_ref.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        comp_ref.spill.to_csv(path, index=False)
-        comp_ref.path = path.as_posix()
-        return comp_ref
-
-    def _add_compensation_refs(self, comp_refs: Iterable[CompensationRef]) -> None:
-        """
-        Write multiple compensation spillover CSVs and update the catalog.
-
-        Parameters
-        ----------
-        comp_refs : Iterable[CompensationRef]
-            Iterable of CompensationRef instances with attached spillover matrices.
-
-        Raises
-        ------
-        ValueError
-            If any CompensationRef is missing an attached spillover matrix.
-        """
-        comps: list[CompensationRef] = []
-        for comp_ref in comp_refs:
-            saved_ref = self._save_compensation_ref(comp_ref)
-            comps.append(saved_ref)
-        self._update_comp_catalog(comps)
-
-
-    def update_compensations(self, comp_refs: Iterable[CompensationRef]) -> None:
-        """
-        Write compensation spillover CSVs and update the catalog.
-
-        Parameters
-        ----------
-        comp_refs : Iterable[CompensationRef]
-            Iterable of CompensationRef instances with attached spillover matrices.
-
-        Raises
-        ------
-        ValueError
-            If any CompensationRef is missing an attached spillover matrix.
-        """
-        comps: list[CompensationRef] = []
-        self.spillover_dir.mkdir(parents=True, exist_ok=True)
-        for ref in comp_refs:
-            path = self.spillover_path(ref.id)
-            ref.spill.to_csv(path, index=False)
-            ref.path = path.as_posix()
-            comps.append(ref)
-        self._update_comp_catalog(comps)
-
     # ---------- Pipeline I/O ----------
-
-    @property
-    def step_counter(self) -> int:
-        """
-        Number of saved step runs.
-
-        Returns
-        -------
-        int
-            Integer step counter used to generate new step IDs.
-        """
-        return self._step_counter
 
     @property
     def steps_dir(self) -> Path:
@@ -1155,34 +526,28 @@ class ProjectRepository:
         Path
             Absolute path to the project's 'steps' directory.
         """
-        return self.root / "steps"
+        return self.root / self.path_scheme["steps_dir"]
 
-    def step_dir(self, step_id: str) -> Path:
+    @property
+    def step_counter(self) -> int:
         """
-        Path to a specific step run directory.
-
-        Parameters
-        ----------
-        step_id : str
-            Step run identifier.
+        Number of saved step runs.
 
         Returns
         -------
-        Path
-            Absolute path to the step directory.
+        int
+            Integer step counter used to generate new step IDs.
         """
-        return self.steps_dir / step_id
+        if not self.steps_dir.exists():
+            return 0
+        return sum(1 for step in self.steps_dir.iterdir() if step.is_dir())
 
     # ---------- QC I/O ----------
 
-    @property
-    def qc_root(self) -> Path:
-        """Path to project-level QC directory."""
-        return self.root / "qc"
-
     def qc_entity_dir(self, entity_type: str, entity_id: str) -> Path:
         """Path to a specific entity QC directory."""
-        return self.qc_root / entity_type / entity_id
+        pattern = self.path_scheme["qc_entity_dir"]
+        return self.root / pattern.format(entity_type=entity_type, entity_id=entity_id)
 
     def qc_entity_tables_dir(self, entity_type: str, entity_id: str) -> Path:
         """Path to entity QC tables directory."""
@@ -1192,43 +557,12 @@ class ProjectRepository:
         """Path to entity QC figures directory."""
         return self.qc_entity_dir(entity_type, entity_id) / "figures"
 
-    def qc_entity_status_path(self, entity_type: str, entity_id: str) -> Path:
-        """Path to entity QC run metadata."""
-        return self.qc_entity_dir(entity_type, entity_id) / "status.json"
-
     def load_qc_entity_status(self, entity_type: str, entity_id: str) -> EntityQCStatus:
-        """Load entity QC run metadata."""
-        path = self.qc_entity_status_path(entity_type, entity_id)
-        if not path.exists():
-            raise FileNotFoundError(f"QC status file not found for {entity_type} {entity_id}: {path.as_posix()}")
-        entity_data = self._read_json(path)
-        return EntityQCStatus.from_dict(entity_data)
+        """Load and return QC status for a specific entity."""
+        return self.load_project_metadata("entity_qc", entity_type=entity_type, entity_id=entity_id)
 
     def save_qc_entity_status(self, qc_status: EntityQCStatus) -> None:
-        """Persist entity QC status to disk."""
-        path = self.qc_entity_status_path(qc_status.entity_type, qc_status.entity_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(path, qc_status.to_dict())
-
-    def qc_entity_aggregates_path(self, entity_type: str, entity_id: str) -> Path:
-        """Path to entity QC aggregates file."""
-        return self.qc_entity_dir(entity_type, entity_id) / "aggregates.json"
-
-    def revisions_dir(self, step_id: str) -> Path:
-        """
-        Path to the revisions directory for a specific step run.
-
-        Parameters
-        ----------
-        step_id : str
-            Step run identifier.
-
-        Returns
-        -------
-        Path
-            Absolute path to the step revisions directory.
-        """
-        return self.step_dir(step_id) / "revisions"
+        self.save_project_metadata("entity_qc", qc_status, entity_type=qc_status.entity_type, entity_id=qc_status.entity_id)
 
     def save_step_run(self, step: StepRun) -> None:
         """
@@ -1241,11 +575,7 @@ class ProjectRepository:
         step : StepRun
             StepRun domain object to persist.
         """
-        step_dir = self.step_dir(step.id)
-        step_dir.mkdir(parents=True, exist_ok=True)
-        path = step_dir / f"{step.id}_{step.step_type}.json"
-        self._write_json(path, step.to_dict())
-        self._step_counter += 1
+        self.save_project_metadata("step_run", step, step_id=step.id)
 
     def load_step_run(self, step_run_id: str) -> StepRun:
         """
@@ -1268,168 +598,21 @@ class ProjectRepository:
         ValueError
             If multiple or no JSON files found in step directory.
         """
-        step_dir = self.step_dir(step_run_id)
-        if not step_dir.exists():
-            raise FileNotFoundError(f"Step run directory not found: {step_dir}")
-
-        # Find JSON file in step directory
-        json_files = list(step_dir.glob(f"{step_run_id}_*.json"))
-        if len(json_files) == 0:
-            raise FileNotFoundError(f"No JSON file found for step run: {step_run_id}")
-        if len(json_files) > 1:
-            raise ValueError(f"Multiple JSON files found for step run: {step_run_id}")
-
-        data = self._read_json(json_files[0])
-        return StepRun.from_dict(data)
-
-    def list_step_run_ids(self) -> list[str]:
-        """
-        List all step run IDs in the project.
-
-        Returns
-        -------
-        list[str]
-            List of step run identifiers sorted by name.
-        """
-        if not self.steps_dir.exists():
-            return []
-
-        step_ids = []
-        for step_dir in self.steps_dir.iterdir():
-            if step_dir.is_dir():
-                step_ids.append(step_dir.name)
-
-        return sorted(step_ids)
-
-    def list_step_runs(self, step_type: str | None = None) -> list[StepRun]:
-        """
-        List all step runs in the project, optionally filtered by step type.
-
-        Parameters
-        ----------
-        step_type : str | None
-            Optional step type filter (e.g., "compensate", "load_fcs").
-            If None, returns all step runs.
-
-        Returns
-        -------
-        list[StepRun]
-            List of StepRun objects sorted by step_run_id.
-        """
-        step_runs = []
-        for step_id in self.list_step_run_ids():
-            try:
-                step_run = self.load_step_run(step_id)
-                if step_type is None or step_run.step_type == step_type:
-                    step_runs.append(step_run)
-            except (FileNotFoundError, ValueError, KeyError) as e:
-                warnings.warn(f"Failed to load step run {step_id}: {e}")
-                continue
-
-        return step_runs
-
-    # ---------- tiny JSON helpers ----------
-
-    @staticmethod
-    def _read_json(path: Path) -> dict:
-        """
-        Read and return JSON content from a file.
-
-        Parameters
-        ----------
-        path : Path
-            Path to the JSON file.
-
-        Returns
-        -------
-        dict
-            Parsed JSON object.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the file does not exist.
-        json.JSONDecodeError
-            If the file contents are not valid JSON.
-        """
-        with path.open() as f:
-            return json.load(f)
-
-    @staticmethod
-    def _write_json(path: PathLike, data: dict) -> None:
-        """
-        Write a JSON-serializable dictionary to a file.
-
-        Uses NumpyEncoder to handle numpy scalar types (int64, float64, etc.)
-        and numpy arrays, converting them to Python native types.
-
-        Parameters
-        ----------
-        path : PathLike
-            Destination file path.
-        data : dict
-            Data to serialize to JSON.
-        """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w") as f:
-            json.dump(data, f, indent=2, cls=NumpyEncoder)
+        return self.load_project_metadata("step_run", step_id=step_run_id)
 
     # ------------- Gating Strategy Catalog I/O -----------------
 
-    @property
-    def gating_strategies_dir(self) -> Path:
-        """
-        Path to gating strategies directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'gating_strategies'.
-        """
-        return self.root / "gating_strategies"
-
-    def strategy_dir(self, strategy: str | GatingStrategyRef) -> Path:
-        """
-        Get the path to a gating strategy directory.
-
-        Parameters
-        ----------
-        strategy: str | GatingStrategyRef
-            Strategy identifier or reference.
-
-        Returns
-        -------
-        Path
-            Absolute path to the gating strategy directory.
-        """
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
-        return self.gating_strategies_dir / strategy_id
-
-    def mask_dir(self, strategy: str | GatingStrategyRef, mask: str) -> Path:
-        return self.strategy_dir(strategy) / "masks" / mask
-
     def gate_node_path(self, strategy: str | GatingStrategyRef, node_id: str) -> Path:
-        """
-        Get the path to a gating node definition file.
+        """Get the path to a gating node definition file."""
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+        pattern = self.path_scheme["gate_node"]
+        return self.root / pattern.format(strategy_id=strategy_id, node_id=node_id)
 
-        Parameters
-        ----------
-        strategy: str | GatingStrategyRef
-            Strategy identifier or reference.
-        node_id: str
-            Gating node identifier.
-
-        Returns
-        -------
-        Path
-            Absolute path to the gating node definition JSON file.
-        """
-        return self.mask_dir(strategy, node_id) / "node.json"
-
-    def get_gate_node(self, strategy: str | GatingStrategyRef, node_id: str) -> GateNode:
+    def load_gate_node(self, strategy: str | GatingStrategyRef, node_id: str) -> GateNode:
         """
         Load a gating node definition by ID from a gating strategy.
+
+        REFACTORED (Phase 3): Now delegates to internal RepoDataLoader.
 
         Parameters
         ----------
@@ -1448,13 +631,19 @@ class ProjectRepository:
         KeyError
             If the node is not found in the strategy.
         """
-        path = self.gate_node_path(strategy, node_id)
-        data = self._read_json(path)
-        return GateNode.from_dict(data)
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+
+        return self._dataloader.load_gate_node(
+            strategy_id=strategy_id,
+            node_id=node_id,
+            parse_func=GateNode.from_dict,
+        )
 
     def save_gate_node(self, strategy: str | GatingStrategyRef, node: GateNode, force: bool = False) -> None:
         """
         Save a gating node definition to disk.
+
+        REFACTORED (Phase 3): Now delegates to internal RepoDataLoader.
 
         Parameters
         ----------
@@ -1462,56 +651,19 @@ class ProjectRepository:
             Strategy identifier or reference.
         node: GateNode
             Gating node definition to save.
-        """
-        path = self.gate_node_path(strategy, node.id)
-        if path.exists() and not force:
-            raise FileExistsError(f"Gating node already exists at {path.as_posix()}. Use force=True to overwrite.")
-        self._write_json(path, node.to_dict())
-
-    @property
-    def gating_strategy_catalog_path(self) -> Path:
-        """
-        Path to the gating strategy catalog JSON file.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'gating_strategies/catalog.json'.
-        """
-        return self.gating_strategies_dir / "catalog.json"
-
-    def _get_strategy_path(self, strategy: str | GatingStrategyRef) -> Path:
-        """
-        Get the path to a gating strategy definition file.
-
-        Parameters
-        ----------
-        strategy: str | GatingStrategyRef
-            Strategy identifier or reference.
-
-        Returns
-        -------
-        Path
-            Absolute path to the gating strategy definition JSON file.
+        force : bool
+            If True, overwrite existing node.
         """
         strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
-        return self.gating_strategies_dir / strategy_id / "strategy.json"
 
-    def get_gating_strategy_catalog(self) -> dict[str, GatingStrategyRef]:
-        """
-        Load the gating strategy catalog.
+        return self._dataloader.save_gate_node(
+            strategy_id=strategy_id,
+            node=node,
+            serialize_func=lambda n: n.to_dict(),
+            overwrite=force,  # Map 'force' param to 'overwrite' context
+        )
 
-        Returns
-        -------
-        dict[str, GatingStrategyRef]
-            Mapping strategy_id -> GatingStrategyRef.
-        """
-        if not self.gating_strategy_catalog_path.exists():
-            return {}
-        catalog = self._read_json(self.gating_strategy_catalog_path)
-        return {strat_id: GatingStrategyRef.from_dict(config) for strat_id, config in catalog.items()}
-
-    def get_gating_strategy(self, strategy_id: str) -> GatingStrategyRef:
+    def load_gating_strategy(self, strategy_id: str) -> GatingStrategyRef:
         """
         Load a gating strategy by ID (with lazy-loaded definition).
 
@@ -1530,12 +682,7 @@ class ProjectRepository:
         KeyError
             If the strategy is not found in the catalog.
         """
-        if not self.gating_strategy_catalog_path.exists():
-            raise KeyError(f"Gating strategy '{strategy_id}' not found in catalog.")
-        catalog = self._read_json(self.gating_strategy_catalog_path)
-        if strategy_id not in catalog:
-            raise KeyError(f"Gating strategy '{strategy_id}' not found in catalog.")
-        return GatingStrategyRef.from_dict(catalog[strategy_id])
+        return self.load_project_metadata("gating_strategy", strategy_id=strategy_id)
 
     def save_gating_masks(
         self,
@@ -1557,23 +704,25 @@ class ProjectRepository:
             Gating mask data to save.
         """
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        for mask_id, mask in masks.items():
-            mask_dir = self.mask_dir(strategy, mask_id)
-            mask_dir.mkdir(parents=True, exist_ok=True)
-            mask_path = mask_dir / f"{sample_id}.npy"
-            if mask_path.exists() and not force:
-                raise FileExistsError(f"Gating mask already exists at {mask_path.as_posix()}. Use force=True to overwrite.")
-            mask_enc = rlencode(mask)
-            np.save(mask_path, mask_enc)
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+
+        return self._dataloader.save_masks(
+            sample_id=sample_id,
+            strategy_id=strategy_id,
+            masks=masks,
+            overwrite=force,  # Map 'force' param to 'overwrite' context
+        )
 
     def load_gating_masks(
         self,
         strategy: str | GatingStrategyRef,
         sample: str | SampleRef,
         mask_ids: Iterable[str]
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, BooleanArray]:
         """
         Load gating mask for a given strategy, sample, and mask ID.
+
+        REFACTORED (Phase 3): Now delegates to internal RepoDataLoader.
 
         Parameters
         ----------
@@ -1585,122 +734,49 @@ class ProjectRepository:
             Mask identifiers.
         Returns
         -------
-        dict[str, np.ndarray]
+        dict[str, BooleanArray]
             Decoded gating mask array.
         """
-
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        masks: dict[str, np.ndarray] = {}
-        for mask_id in mask_ids:
-            mask_path = self.mask_dir(strategy, mask_id) / f"{sample_id}.npy"
-            if not mask_path.exists():
-                raise FileNotFoundError(f"Gating mask not found at {mask_path.as_posix()}.")
-            mask_enc: NDArray[np.int_] = np.load(mask_path, allow_pickle=True)
-            masks[mask_id] = rldecode(mask_enc)
-        return masks
+        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
 
-    def _update_gating_strategy_catalog(self, strategy_refs: Iterable[GatingStrategyRef]) -> dict[str, GatingStrategyRef]:
-        """
-        Merge and persist gating strategy catalog entries.
-
-        Parameters
-        ----------
-        strategy_refs : Iterable[GatingStrategyRef]
-            New or updated gating strategy references to merge into the catalog.
-
-        Returns
-        -------
-        dict[str, GatingStrategyRef]
-            Updated catalog mapping strategy_id -> GatingStrategyRef.
-        """
-        catalog = self.get_gating_strategy_catalog()
-        catalog.update({ref.id: self._save_strategy_ref(ref) for ref in strategy_refs})
-
-        self._write_json(
-            self.gating_strategy_catalog_path,
-            {ref_id: ref.to_dict() for ref_id, ref in catalog.items()}
+        return self._dataloader.load_masks(
+            sample_id=sample_id,
+            strategy_id=strategy_id,
+            gate_ids=mask_ids,  # Map 'mask_ids' to 'gate_ids' in dataloader
         )
-        return catalog
 
-    def _save_strategy_ref(self, ref: GatingStrategyRef) -> GatingStrategyRef:
-        if not isinstance(ref, GatingStrategyRef):
-            raise TypeError("ref must be a GatingStrategyRef instance.")
-        if not ref.created_at:
-            ref.created_at = now_iso()
-        ref.path = self._get_strategy_path(ref).as_posix()
+    # ------------- Revision Session I/O -----------------
 
-        # Create a copy of the ref data to write
-        ref_data = ref.to_dict()
-        self._write_json(ref.path, ref_data)
-        ref_data["graph"] = None  # Invalidate cached graph
-        return GatingStrategyRef.from_dict(ref_data)
-
-    def generate_revision_workspace(self, entity_type: str, entity_id: str | None = None) -> Path:
+    def generate_revision_workspace(self, entity_type: str, session_id: str | None) -> Path:
         """
-        Generate a new workspace directory for a QC revision of a given entity.
+        Generate a new revision workspace directory for a given session.
 
         Parameters
         ----------
         entity_type : str
-            Type of the entity (e.g., "sample", "batch").
-        entity_id : str | None
-            Optional identifier of the entity. If None, generates a workspace for the entire entity type.
+            Type of the entity for the revision session.
+        session_id : str | None
+            Identifier for the revision session.
 
         Returns
         -------
         Path
-            Absolute path to the newly created revision workspace directory.
+            Absolute path to the created revision workspace.
         """
-        workspace_dir = self.workspaces_dir / entity_type
-        if entity_id is None:
-            entity_id = "{:03d}".format(sum(1 for _ in workspace_dir.iterdir() if _.is_dir()))
-        else:
-            candidate = workspace_dir / entity_id
-            k = 0
-            while candidate.exists():
-                k += 1
-                entity_id = "{}_rev{:03d}".format(entity_id, k)
-                candidate = workspace_dir / entity_id
-        return workspace_dir / entity_id
 
-    @property
-    def workspaces_dir(self) -> Path:
-        """
-        Path to the QC revision workspaces directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to 'workspaces'.
-        """
-        return self.root / "workspaces"
-
-    def load_revision_session(self, entity_type: str, session_id: str) -> RevisionSession:
-        """
-        Load a QC revision session from disk.
-
-        Parameters
-        ----------
-        entity_type : str
-            Type of the entity (e.g., "sample", "batch").
-        session_id : str
-            Identifier of the revision session.
-
-        Returns
-        -------
-        RevisionSession
-            Loaded RevisionSession object.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the session file does not exist.
-        json.JSONDecodeError
-            If the session file is not valid JSON.
-        """
-        path = self.workspaces_dir / entity_type / session_id / "session.json"
+        session_id = session_id or "session_001"
+        pattern = self.path_scheme["revision_session"].format(
+            entity_type=entity_type,
+            session_id=session_id
+        )
+        path = (self.root / pattern).parent
         if not path.exists():
-            raise FileNotFoundError(f"Revision session file not found: {path.as_posix()}")
-        data = self._read_json(path)
-        return RevisionSession.from_dict(data)
+            return path
 
+        type_dir = self.root / self.path_scheme["revision_type_dir"].format(entity_type=entity_type)
+        session_id = "session" if session_id.startswith("session") else session_id
+        k = sum(1 for d in type_dir.iterdir() if d.is_dir() and d.name.startswith(session_id))
+        session_id = f"{session_id}_{k:03d}"
+        path = self.root / self.path_scheme["revision_session"].format(entity_type=entity_type, session_id=session_id)
+        return path.parent

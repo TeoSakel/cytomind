@@ -4,11 +4,10 @@ Structures to hold metadata required for the CytoMind pipeline management.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Any
+from typing import Iterable, Mapping, Any
 import json
 
 import numpy as np
-from anndata import AnnData
 from pandas import DataFrame
 
 from .flow import *
@@ -39,48 +38,60 @@ class NumpyEncoder(json.JSONEncoder):
 @dataclass
 class Project:
     id: str
-    panel: list[ChannelRef] = field(default_factory=list)  # list of all channels in the panel
+    panel_catalog: dict[str, list[ChannelRef]] = field(default_factory=dict)  # panel_id -> channels
     samples: dict[str, SampleRef] = field(default_factory=dict)
     batches: dict[str, BatchRef] = field(default_factory=dict)
-    dimensions: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
+    layers: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
     compensations: dict[str, CompensationRef] = field(default_factory=dict)
     transformations: dict[str, TransformationRef] = field(default_factory=dict)
     gating_strategies: dict[str, GatingStrategyRef] = field(default_factory=dict)
 
     @property
+    def panel(self) -> list[ChannelRef]:
+        """Convenience property to get the default panel channels."""
+        return self.panel_catalog.get("panel", [])
+
+    @property
     def panel_df(self) -> DataFrame:
-        if "raw" in self.dimensions:
-            df = DataFrame.from_records([dim.to_record() for dim in self.dimensions["raw"]])
+        if "raw" in self.layers:
+            df = DataFrame.from_records([dim.to_record() for dim in self.layers["raw"]])
             df.set_index("id", inplace=True)
             return df
-        df = DataFrame.from_records([ch.to_record() for ch in self.panel])
+        panel = self.panel_catalog.get("panel", [])
+        if not panel:
+            return DataFrame()
+
+        df = DataFrame.from_records([ch.to_record() for ch in panel])
         df.sort_values("idx", inplace=True)
         df.set_index("pnn", inplace=True, drop=False)
         return df.loc[:, df.notnull().any()]  # drop empty cols
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Project":
+        panel_catalog = {k: [ChannelRef.from_dict(ch) for ch in v] for k, v in data.get("panel_catalog", {}).items()}
+        if not panel_catalog and data.get("panel"):
+            panel_catalog = {"panel": [ChannelRef.from_dict(ch) for ch in data.get("panel", [])]}
 
         return cls(
             id=data["id"],
-            samples={k: SampleRef.from_record(v) for k, v in data.get("samples", {}).items()},
-            panel=[ChannelRef.from_record(ch) for ch in data.get("panel", [])],
-            dimensions={k: [DimensionDef.from_dict(dim) for dim in v] for k, v in data.get("dimensions", {}).items()},
-            compensations={k: CompensationRef.from_record(v) for k, v in data.get("compensations", {}).items()},
-            transformations={k: TransformationRef.from_record(v) for k, v in data.get("transformations", {}).items()},
-            batches={k: BatchRef.from_record(v) for k, v in data.get("batches", {}).items()},
+            samples={k: SampleRef.from_dict(v) for k, v in data.get("samples", {}).items()},
+            panel_catalog=panel_catalog,
+            layers={k: [DimensionDef.from_dict(dim) for dim in v] for k, v in data.get("layers", {}).items()},
+            compensations={k: CompensationRef.from_dict(v) for k, v in data.get("compensations", {}).items()},
+            transformations={k: TransformationRef.from_dict(v) for k, v in data.get("transformations", {}).items()},
+            batches={k: BatchRef.from_dict(v) for k, v in data.get("batches", {}).items()},
             gating_strategies={k: GatingStrategyRef.from_dict(v) for k, v in data.get("gating_strategies", {}).items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
+        def _serialize_list_catalog(catalog: Mapping[str, Iterable[Any]]) -> dict[str, list[dict[str, Any]]]:
+            return {k: [item.to_dict() for item in v] for k, v in catalog.items()}
+
         return {
             "id": self.id,
             "samples": {k: v.to_dict() for k, v in self.samples.items()},
-            "panel": [ch.to_dict() for ch in self.panel],
-            "dimensions": {
-                k: [dim.to_dict() for dim in v]
-                for k, v in self.dimensions.items()
-            },
+            "panel_catalog": _serialize_list_catalog(self.panel_catalog),
+            "layers": _serialize_list_catalog(self.layers),
             "compensations": {k: v.to_dict() for k, v in self.compensations.items()},
             "transformations": {k: v.to_dict() for k, v in self.transformations.items()},
             "batches": {k: v.to_dict() for k, v in self.batches.items()},
@@ -94,10 +105,9 @@ class BatchRef:
     """
 
     id: str
-    sample_ids: list[str]
-    tags: list[str] = field(default_factory=list)  # optional tags to label where this batch belongs
+    sample_ids: set[str]
+    tags: set[str] = field(default_factory=set)  # optional tags to label where this batch belongs
     meta: dict[str, Any] = field(default_factory=dict)
-    _adata_backed: dict[str, AnnData] = field(init=False, repr=False, hash=False, default_factory=dict)
 
     def __iter__(self):
         """Iterate over sample_ids in the batch."""
@@ -111,6 +121,11 @@ class BatchRef:
         """Get number of samples in the batch."""
         return len(self.sample_ids)
 
+    def __contains__(self, item: str | SampleRef):
+        """Check if a sample_id is in the batch."""
+        sample_id = item.id if isinstance(item, SampleRef) else item
+        return sample_id in self.sample_ids
+
     def copy(self) -> "BatchRef":
         return BatchRef(
             id=self.id,
@@ -120,22 +135,50 @@ class BatchRef:
         )
 
     @classmethod
-    def from_record(cls, data: Mapping[str, Any]) -> "BatchRef":
+    def from_dict(cls, data: Mapping[str, Any]) -> "BatchRef":
         return cls(
             id=data["id"],
-            sample_ids=list(data.get("sample_ids", [])),
-            tags=list(data.get("tags", [])),
+            sample_ids=set(data.get("sample_ids", [])),
+            tags=set(data.get("tags", [])),
             meta={k: v for k, v in data.items() if k not in {"id", "sample_ids", "tags", "root"}},
         )
 
     def to_dict(self) -> dict[str, Any]:
         base = {
             "id": self.id,
-            "sample_ids": self.sample_ids,
-            "tags": self.tags,
+            "sample_ids": list(self.sample_ids),
+            "tags": list(self.tags),
         }
         base.update(self.meta)
         return base
+
+    def subset(self, id:str, sample_ids: Iterable[str]) -> "BatchRef":
+        """Create a new BatchRef that is a subset of the current one."""
+
+        sample_ids = set(sample_ids)
+        if not sample_ids.issubset(self.sample_ids):
+            raise ValueError("Subset sample_ids must be a subset of the original batch's sample_ids.")
+
+        tags = self.tags | {f"subset_of_{self.id}"} if self.tags else {f"subset_of_{self.id}"}
+        return BatchRef(
+            id=id,
+            sample_ids=sample_ids,
+            tags=tags,
+            meta={sid: self.meta.get(sid, {}) for sid in sample_ids},
+        )
+
+    def drop_samples(self, sample_ids: Iterable[str]) -> "BatchRef":
+        """Create a new BatchRef with specified sample_ids removed."""
+
+        sample_ids = set(sample_ids)
+        remaining = {sid for sid in self.sample_ids if sid not in sample_ids}
+
+        return BatchRef(
+            id=self.id,
+            sample_ids=remaining,
+            tags=self.tags.copy(),
+            meta={sid: self.meta.get(sid, {}) for sid in remaining},
+        )
 
 
 @dataclass
@@ -173,8 +216,8 @@ class SampleRef:
         )
 
     @classmethod
-    def from_record(cls, data: Mapping[str, Any]) -> "SampleRef":
-        non_meta_fields = {"id", "fcs", "root", "default_layer", "n_events", "compensation", "rename", "status", "latest_steps"}
+    def from_dict(cls, data: Mapping[str, Any]) -> "SampleRef":
+        non_meta_fields = {"id", "fcs", "default_layer", "n_events", "compensation", "rename", "status", "latest_steps"}
         return cls(
             id=data["id"],
             fcs=data["fcs"].as_posix() if isinstance(data["fcs"], Path) else str(data["fcs"]),
@@ -316,7 +359,7 @@ class RevisionSession:
     """
     id: str                              # revision session id (e.g., "rev_001")
     entity_type: str                     # Entity type (e.g., "compensation", "gating_strategy", "step")
-    state: str                           # "active" | "ready_to_commit" | "committed" | "cancelled"
+    status: str                           # "active" | "ready_to_commit" | "committed" | "cancelled"
     entity_id: str | None = None         # The entity being revised (e.g., "comp_001", "step_0003")
     created_at: str = ""                 # ISO timestamp of when the revision session was created
     updated_at: str = ""                 # ISO timestamp of the last update to the revision session
@@ -332,7 +375,7 @@ class RevisionSession:
         return {
             "id": self.id,
             "entity_type": self.entity_type,
-            "state": self.state,
+            "status": self.status,
             "entity_id": self.entity_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -342,11 +385,11 @@ class RevisionSession:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RevisionSession":
+    def from_dict(cls, data: Mapping[str, Any]) -> "RevisionSession":
         return cls(
             id=data["id"],
             entity_type=data["entity_type"],
-            state=data["state"],
+            status=data["status"],
             entity_id=data.get("entity_id"),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
