@@ -4,6 +4,11 @@ from typing import Any, Sequence, Mapping, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from cytomind.qc.base import QCTester
+else:
+    QCTester = object
+
+if TYPE_CHECKING:
     from cytomind.domain.constants import MaskLike
     from numpy.typing import NDArray
     BooleanMask = NDArray[np.bool_]
@@ -124,6 +129,27 @@ class Gate(ABC):
         new_gate.params = self.params.copy()
         new_gate.diagnostics = self.diagnostics.copy()
         return new_gate
+
+    def get_tests(self) -> dict[str, type]:
+        """
+        Return dictionary of tester classes for this gate.
+
+        Subclasses compose tests via:
+            tests = super().get_tests(entity=entity)  # Get parent tests
+            tests.update({"new_test": NewTestClass})  # Add own tests
+            return tests
+
+        Parameters
+        ----------
+        entity : Any, optional
+            Entity for which to get tests (used by subclasses for entity-specific tests).
+
+        Returns
+        -------
+        dict[str, type]
+            Mapping of test_name → QCTester subclass specific to this gate type
+        """
+        return {}
 
     def fit(self, events: AnnData, mask: dict[str, MaskLike] = {}) -> "Gate":
         """

@@ -53,4 +53,4 @@ class EntityQCEvaluatorRegistry:
 
 
 # Import evaluators to trigger registration
-from . import compensation, step
+from . import compensation, gating_strategy, step

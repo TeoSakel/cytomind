@@ -8,6 +8,7 @@ import networkx as nx
 from networkx.readwrite import json_graph
 
 from .constants import GML_VERSION
+from cytomind.utils import now_iso
 
 __all__ = ["GatingStrategyRef", "GateNode"]
 
@@ -166,7 +167,7 @@ class GatingStrategyRef:
             "name": self.name,
             "batch_id": self.batch_id,
             "path": self.path,
-            "created_at": self.created_at,
+            "created_at": self.created_at or now_iso(),
             "description": self.description,
             "glm_version": self.glm_version,
             "graph": json_graph.tree_data(self._graph, root="root") if self._graph else None,
