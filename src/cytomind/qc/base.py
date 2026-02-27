@@ -41,10 +41,15 @@ class QCTester(ABC):
     - Evaluators classify records post-execution with configurable thresholds
     - Plots are generated on-demand for flagged tests
 
+    Plotting Metadata:
+    - plot_type: str - Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty string if plot() not implemented.
+    - plot_description: str - Human-readable description for frontend UI
+
     Concrete implementations should:
     - Set test_type and test_name class attributes
     - Define default_config and default_thresholds
     - Implement fit/classify/plot/make_key for their specific entity type
+    - If plot() is implemented, populate plot_type and plot_description
     - Use **kwargs for entity-specific dimensions (donors, parents, receivers, etc.)
     """
 
@@ -53,6 +58,8 @@ class QCTester(ABC):
     key_fields: tuple[str, ...]              # Fields from metadata that uniquely identify this test instance (used for make_key)
     default_config: dict[str, Any] = {}      # Default config parameters for the tester
     default_thresholds: dict[str, Any] = {}  # Default thresholds for classifying test results
+    plot_type: str = ""                       # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
+    plot_description: str = ""                # Human-readable description for frontend UI
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         cfg = dict(self.default_config)
@@ -199,14 +206,38 @@ class EntityQCEvaluator(ABC):
     - Evaluators classify pending records, apply thresholds, assign final status
     - Thresholds are configurable and can be adjusted post-execution
 
+    Artifact Declaration:
+    - _supported_tables: dict[str, dict] - Mapping of table_type → artifact spec
+    - _supported_figures: dict[str, dict] - Mapping of figure_type → artifact spec
+    - Each spec dict should include:
+        - "description": str - Human-readable description
+        - "input_params": dict - Required/optional parameters for generation
+        - Optionally other metadata
+
+    Example:
+        _supported_tables = {
+            "my_table": {
+                "description": "Summary table of test results",
+                "input_params": {
+                    "sample_data": "optional"
+                }
+            }
+        }
+
     Test Registration:
     - Subclasses implement get_tests() → dict[str, type[QCTester]]
     - Composition via super().get_tests() and dict.update() for inheritance
     - Tests route to per-sample or batch evaluation based on test_type
+
+    Artifact Listing:
+    - Call list_artifacts(entity_ref=None) to get available artifacts
+    - This combines class-level declarations with test-derived plots
     """
 
     entity_type: str
     default_config: dict[str, Any] = {}
+    _supported_tables: dict[str, dict[str, Any]] = {}    # Table type → artifact spec
+    _supported_figures: dict[str, dict[str, Any]] = {}   # Figure type → artifact spec
 
     def __init__(self, config: Mapping[str, Any] | None = None):
         cfg = dict(self.default_config)
@@ -256,6 +287,77 @@ class EntityQCEvaluator(ABC):
             Mapping of test_name → QCTester subclass
         """
         return {}
+
+    def list_artifacts(self, entity_ref: Any = None) -> dict[str, list[dict[str, Any]]]:
+        """
+        List available artifacts (tables and figures) for this evaluator.
+
+        Combines:
+        - Class-level artifact declarations (_supported_tables, _supported_figures)
+        - Test-derived plots from registered tests (tests with supports_plot=True)
+
+        The entity_ref parameter allows evaluators to determine entity-dependent artifacts.
+        For example, GatingStrategyQCEvaluator can use StrategyRef to decide which
+        gate-specific visualizations to include.
+
+        Parameters
+        ----------
+        entity_ref : Any, optional
+            Entity reference (e.g., CompensationRef, StrategyRef) used by subclasses
+            to determine entity-dependent artifacts. Default None.
+
+        Returns
+        -------
+        dict[str, list[dict[str, Any]]]
+            Dictionary with "tables" and "figures" keys, each mapping to a list of artifact specs.
+            Each artifact spec is a dict with at minimum:
+            - "type": str - identifier for the artifact (e.g., "compensation_channel")
+            - "description": str - human-readable description
+            - For test plots, also includes: "test_name", "test_type", "plot_type"
+
+        Examples
+        --------
+        >>> evaluator = CompensationQCEvaluator()
+        >>> artifacts = evaluator.list_artifacts()
+        >>> artifacts["tables"]
+        [{"type": "compensation_channel", "description": "..."},
+         {"type": "compensation_pair", "description": "..."}]
+        >>> artifacts["figures"]  # Includes test plots
+        [{"type": "qc_test_plot", "test_name": "NegativeFluorescence", ...},
+         ...]
+        """
+        # Start with class-level artifact declarations
+        tables = []
+        for table_type, spec in self._supported_tables.items():
+            table_spec = dict(spec)  # Copy to avoid mutating class attribute
+            table_spec["type"] = table_type
+            tables.append(table_spec)
+
+        figures = []
+        for figure_type, spec in self._supported_figures.items():
+            figure_spec = dict(spec)  # Copy to avoid mutating class attribute
+            figure_spec["type"] = figure_type
+            figures.append(figure_spec)
+
+        # Add test-derived plots from registered tests
+        tests = self.get_tests(entity=entity_ref)
+        for test_name, tester_class in tests.items():
+            plot_type = getattr(tester_class, "plot_type", "")
+            if plot_type:  # Non-empty plot_type means plot is supported
+                test_plot_spec = {
+                    "type": "qc_test_plot",
+                    "test_name": tester_class.test_name,
+                    "test_type": tester_class.test_type,
+                    "plot_type": plot_type,
+                    "description": getattr(tester_class, "plot_description", ""),
+                }
+                figures.append(test_plot_spec)
+
+        return {
+            "tables": tables,
+            "figures": figures,
+        }
+
 
     @abstractmethod
     def update_batch_qc(
@@ -479,7 +581,7 @@ class EntityQCEvaluator(ABC):
         if entity_qc.entity_type != self.entity_type:
             raise TypeError(f"EntityQCEvaluator for '{self.entity_type}' cannot summarize QC for entity type '{entity_qc.entity_type}'")
 
-        per_sample_flags = {sid: flag.value for sid, flag in entity_qc.sample_flags().items()}
+        per_sample_flags = {sid: flag.value for sid, flag in entity_qc.sample_flags.items()}
         sample_counts = Counter(qc.overall_flag.value for qc in entity_qc.sample_qc.values())
 
         # Build test summary by counting status for each test_name

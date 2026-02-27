@@ -67,6 +67,8 @@ class NegativeFluorescenceTest(QCTester):
     key_fields = ("compensation_id", "channel")
     default_config = {}
     default_thresholds = {"ratio_neg": (0.15, 0.30)} # warn, severe thresholds for ratio of negative events
+    plot_type = "histogram"
+    plot_description = "Distribution of compensated fluorescence values in channel"
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         super().__init__(config=config, thresholds=thresholds)
@@ -148,12 +150,21 @@ class NegativeFluorescenceTest(QCTester):
         self._check_test_record(test)
         channel = test.metadata["channel"]
         values = adata[:, channel].X.ravel() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        cap_percentile = kwargs.pop("cap_percentile", 95)
+        if cap_percentile is None:
+            capped_values = values
+        else:
+            cap_percentile = float(cap_percentile)
+            if not 0 < cap_percentile <= 100:
+                raise ValueError("cap_percentile must be in (0, 100].")
+            cap_value = float(np.nanpercentile(values, cap_percentile))
+            capped_values = np.minimum(values, cap_value)
         fig = build_histogram1d(
-            values=values,
+            values=capped_values,
             nbins=nbins,
             title=f'Histogram of {channel} Fluorescence Values',
             xaxis_title='Fluorescence Intensity',
-            yaxis_title='Event Count',
+            yaxis_title='Frequency',
             **kwargs
         )
 
@@ -163,7 +174,7 @@ class NegativeFluorescenceTest(QCTester):
             fig.add_vline(
                 x=0.0,
                 line=dict(color="red" if bar_color != "red" else "blue", dash="dash"),
-                annotation_text="0",
+                annotation_text="",
                 annotation_position="top right",
             )
 
@@ -187,6 +198,8 @@ class VeryNegativeFluorescenceTest(QCTester):
         "k_sigma_threshold": 4.0,
     }
     default_thresholds = {"ratio_very_neg": (0.01, 0.05)} # warn, severe thresholds for ratio of very negative events
+    plot_type = "histogram"
+    plot_description = "Distribution showing very negative events and sigma cutoff thresholds"
 
     def __init__(
         self,
@@ -312,12 +325,21 @@ class VeryNegativeFluorescenceTest(QCTester):
         self._check_test_record(test)
         channel = test.metadata["channel"]
         values = adata[:, channel].X.flatten() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        cap_percentile = kwargs.pop("cap_percentile", 95)
+        if cap_percentile is None:
+            capped_values = values
+        else:
+            cap_percentile = float(cap_percentile)
+            if not 0 < cap_percentile <= 100:
+                raise ValueError("cap_percentile must be in (0, 100].")
+            cap_value = float(np.nanpercentile(values, cap_percentile))
+            capped_values = np.minimum(values, cap_value)
         fig = build_histogram1d(
-            values=values,
+            values=capped_values,
             nbins=nbins,
             title=f'Histogram of {channel} Fluorescence Values',
             xaxis_title='Fluorescence Intensity',
-            yaxis_title='Event Count',
+            yaxis_title='Frequency',
             **kwargs
         )
 
@@ -365,6 +387,8 @@ class NegativeEnrichmentTest(QCTester):
         "min_high_events": 1000,
     }
     default_thresholds = {"p_neg_given_high_donor": (0.05, 0.15)} # warn, severe thresholds for proportion of negative receiver events given high donor values
+    plot_type = "scatter"
+    plot_description = "Donor-receiver fluorescence correlation in high-donor population"
 
     def __init__(
         self,
@@ -566,6 +590,8 @@ class HighDonorCorrelationTest(QCTester):
     key_fields = ("compensation_id", "donor_channel", "receiver_channel")
     default_config = {"high_quantile": 0.99, "min_high_events": 1000}
     default_thresholds = {"spearman_given_high_donor": (0.3, 0.5)} # warn, severe thresholds for Spearman correlation
+    plot_type = "scatter"
+    plot_description = "Donor-receiver correlation scatter in high-donor population"
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         super().__init__(config, thresholds)
@@ -953,6 +979,18 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     """QC evaluator for compensation entities."""
 
     entity_type = "compensation"
+    _supported_tables = {
+        "compensation_channel": {
+            "description": "Per-channel negative fluorescence metrics across samples",
+            "input_params": {}
+        },
+        "compensation_pair": {
+            "description": "Pairwise spillover metrics (correlation, enrichment) across samples",
+            "input_params": {}
+        },
+    }
+    _supported_figures = {}  # Test plots are auto-discovered from registered tests
+
     default_config = {
         "compute_pairwise": True,
         "subsample": 1.0,
@@ -995,7 +1033,10 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         return "comp"
 
     def load_entity(self, repo: ProjectRepository, entity_id: Hashable) -> CompensationRef:
-        return repo.get_comp_catalog()[str(entity_id)]
+        project = repo.load_project()
+        if entity_id not in project.compensations:
+            raise KeyError(f"Compensation '{entity_id}' not found in project.")
+        return project.compensations[str(entity_id)]
 
     def update_sample_qc(
         self,

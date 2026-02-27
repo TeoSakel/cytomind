@@ -29,6 +29,38 @@ class StepQCEvaluator(EntityQCEvaluator):
     """Default step QC evaluator (entity_type='step')."""
 
     entity_type = "step"
+    _supported_tables = {
+        "per_sample_step": {
+            "description": "One row per sample-step combination",
+            "input_params": {}
+        },
+        "heatmap": {
+            "description": "Heatmap format with samples as rows and steps as columns",
+            "input_params": {}
+        },
+        "per_sample": {
+            "description": "Summary per sample with overall flag and test counts",
+            "input_params": {}
+        },
+        "per_step": {
+            "description": "Summary per step with sample-level flag counts and rates",
+            "input_params": {}
+        },
+        "per_test": {
+            "description": "Summary per test (test_type/test_name) with flag counts and rates",
+            "input_params": {}
+        },
+        "all": {
+            "description": "All tests with flag for every combination of sample_id, step_name, test_type, and test_name",
+            "input_params": {}
+        },
+    }
+    _supported_figures = {
+        "heatmap": {
+            "description": "Sample × Step QC heatmap with flags and hover messages",
+            "input_params": {}
+        },
+    }
 
     def get_tests(self, entity: StepRun | None = None) -> dict[str, type]:
         """Return dictionary of test classes for step QC.
@@ -170,7 +202,7 @@ class StepQCEvaluator(EntityQCEvaluator):
     def generate_table(
         self,
         entity_qc: EntityQCStatus,
-        table_type: str = "long_format",
+        table_type: str = "per_sample_step",
         sample_data: Iterable[tuple[str, Any]] | None = None,
         table_dir: PathLike | None = None,
     ) -> pd.DataFrame:
@@ -180,12 +212,13 @@ class StepQCEvaluator(EntityQCEvaluator):
         ----------
         entity_qc : EntityQCStatus
             The QC status object containing step and sample data.
-        table_type : str, default "long_format"
+        table_type : str, default "per_sample_step"
             Type of table to generate:
-            - "long_format": Long format with sample_id, step_name, flag columns
+            - "per_sample_step": One row per sample-step combination
             - "heatmap": Heatmap format with samples as rows and steps as columns
             - "per_sample": Summary per sample with overall flag and counts
-            - "per_step": Summary per step with flag counts across samples
+            - "per_step": Summary per step with sample-level flag counts and rates
+            - "per_test": Summary per test (test_type/test_name) with flag counts and rates
         sample_data : Iterable[tuple[str, Any]] | None
             Optional iterable of (sample_id, data) tuples for filtering results.
             If provided, only samples in this iterable are included.
@@ -202,25 +235,31 @@ class StepQCEvaluator(EntityQCEvaluator):
         else:
             sample_filter = set(sid for sid, _ in sample_data)
 
-        # Generate long format first (base representation)
-        df_long = self._generate_long_format(entity_qc, sample_filter)
+        df_all = self._generate_all_tests(entity_qc, sample_filter)
+        df_sample_step = self._aggregate_per_sample_step(df_all)
+        if "_is_placeholder" in df_all.columns:
+            df_all_public = df_all.drop(columns=["_is_placeholder"])
+        else:
+            df_all_public = df_all
 
-        if df_long.empty:
-            return df_long
-
-        # Derive other formats from long format
-        if table_type == "long_format":
-            return df_long
+        # Derive other formats from all-tests table
+        # NOTE: Should this be done in the front-end?
+        if table_type == "per_sample_step":
+            return df_sample_step
         elif table_type == "heatmap":
-            return self._pivot_to_heatmap(df_long, entity_qc)
+            return self._pivot_to_heatmap(df_sample_step, entity_qc)
         elif table_type == "per_sample":
-            return self._aggregate_per_sample(df_long)
+            return self._aggregate_per_sample(df_sample_step)
         elif table_type == "per_step":
-            return self._aggregate_per_step(df_long)
+            return self._aggregate_per_step(df_sample_step)
+        elif table_type == "per_test":
+            return self._aggregate_per_test(df_all)
+        elif table_type == "all":
+            return df_all_public
         else:
             raise ValueError(
                 f"Unknown table_type '{table_type}'. Must be one of: "
-                "'long_format', 'heatmap', 'per_sample', 'per_step'"
+                "'per_sample_step', 'heatmap', 'per_sample', 'per_step', 'per_test', 'all'"
             )
 
     def _generate_long_format(
@@ -279,6 +318,83 @@ class StepQCEvaluator(EntityQCEvaluator):
             ])
 
         return pd.DataFrame(records)
+
+    def _aggregate_per_sample_step(self, df_all: pd.DataFrame) -> pd.DataFrame:
+        """Aggregate all-tests table into one row per sample-step.
+
+        Parameters
+        ----------
+        df_all : pd.DataFrame
+            All-tests table from _generate_all_tests.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: sample_id, step_name, flag, n_tests, n_pass, n_warn, n_severe, n_fail, n_skip, message
+        """
+        if df_all.empty:
+            return pd.DataFrame(columns=[
+                "sample_id", "step_name", "flag", "n_tests", "n_pass",
+                "n_warn", "n_severe", "n_fail", "n_skip", "message"
+            ])
+
+        flag_order = ["PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
+        if "_is_placeholder" in df_all.columns:
+            df_non_placeholder = df_all[~df_all["_is_placeholder"]]
+            placeholder_flags = (
+                df_all[df_all["_is_placeholder"]]
+                .set_index(["sample_id", "step_name"])["flag"]
+                .to_dict()
+            )
+        else:
+            df_non_placeholder = df_all
+            placeholder_flags = {}
+
+        base_index = df_all.groupby(["sample_id", "step_name"]).size().index
+        flag_counts = (
+            df_non_placeholder.groupby(["sample_id", "step_name"])
+            .flag.value_counts()
+            .unstack(fill_value=0)
+            .reindex(index=base_index, columns=flag_order, fill_value=0)
+        )
+
+        df_sample_step = flag_counts.rename(columns={
+            "PASS": "n_pass",
+            "WARN": "n_warn",
+            "SEVERE": "n_severe",
+            "FAIL": "n_fail",
+            "SKIP": "n_skip",
+        }).reset_index()
+
+        df_sample_step["n_tests"] = df_sample_step[[
+            "n_pass", "n_warn", "n_severe", "n_fail", "n_skip"
+        ]].sum(axis=1)
+
+        def _combine_flags(row: pd.Series) -> str:
+            key = row.name
+            if row["n_tests"] == 0 and key in placeholder_flags:
+                return placeholder_flags[key]
+            flags = []
+            if row["n_pass"]:
+                flags.append(QCFlag.PASS)
+            if row["n_warn"]:
+                flags.append(QCFlag.WARN)
+            if row["n_severe"]:
+                flags.append(QCFlag.SEVERE)
+            if row["n_fail"]:
+                flags.append(QCFlag.FAIL)
+            return QCFlag.combine(flags).value
+
+        df_sample_step["flag"] = df_sample_step.apply(_combine_flags, axis=1)
+
+        df_sample_step["message"] = ""
+
+        df_sample_step = df_sample_step[[
+            "sample_id", "step_name", "flag", "n_tests", "n_pass",
+            "n_warn", "n_severe", "n_fail", "n_skip", "message"
+        ]]
+
+        return df_sample_step
 
     def _pivot_to_heatmap(self, df_long: pd.DataFrame, entity_qc: EntityQCStatus) -> pd.DataFrame:
         """Convert long format to heatmap (pivot on samples × steps).
@@ -358,32 +474,144 @@ class StepQCEvaluator(EntityQCEvaluator):
         Returns
         -------
         pd.DataFrame
-            Columns: step_name, n_samples, n_pass, n_warn, n_severe, n_fail, n_skip, pass_rate, fail_rate
+            Columns: step_name, n_samples, n_pass, n_warn, n_severe, n_fail, n_skip, pass_rate, warn_rate, fail_rate
         """
-        agg_dict = {
-            "flag": lambda flags: QCFlag.combine([QCFlag(f) for f in flags]).value,
-            "sample_id": "count",  # Count of samples per step
-            "n_pass": "sum",
-            "n_warn": "sum",
-            "n_severe": "sum",
-            "n_fail": "sum",
-            "n_skip": "sum",
-        }
+        flag_order = ["PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
+        flag_counts = (
+            df_long.groupby("step_name")
+            .flag.value_counts()
+            .unstack(fill_value=0)
+            .reindex(columns=flag_order, fill_value=0)
+        )
 
-        df_per_step = df_long.groupby("step_name", as_index=False).agg(agg_dict)
-        df_per_step = df_per_step.rename(columns={"sample_id": "n_samples"})
+        df_per_step = flag_counts.rename(columns={
+            "PASS": "n_pass",
+            "WARN": "n_warn",
+            "SEVERE": "n_severe",
+            "FAIL": "n_fail",
+            "SKIP": "n_skip",
+        }).reset_index()
 
-        # Calculate rates
+        df_per_step["n_samples"] = df_per_step[[
+            "n_pass", "n_warn", "n_severe", "n_fail", "n_skip"
+        ]].sum(axis=1)
+
+        # Calculate rates based on sample-level flags
         df_per_step["pass_rate"] = df_per_step["n_pass"] / df_per_step["n_samples"]
+        df_per_step["warn_rate"] = df_per_step["n_warn"] / df_per_step["n_samples"]
         df_per_step["fail_rate"] = df_per_step["n_fail"] / df_per_step["n_samples"]
 
         # Reorder columns
         df_per_step = df_per_step[[
             "step_name", "n_samples", "n_pass", "n_warn", "n_severe",
-            "n_fail", "n_skip", "pass_rate", "fail_rate"
+            "n_fail", "n_skip", "pass_rate", "warn_rate", "fail_rate"
         ]]
 
         return df_per_step
+
+    def _aggregate_per_test(self, df_all: pd.DataFrame) -> pd.DataFrame:
+        """Aggregate test-level table by test_type and test_name.
+
+        Parameters
+        ----------
+        df_all : pd.DataFrame
+            All-tests table from _generate_all_tests.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: test_type, test_name, n_tests, n_pass, n_warn, n_severe, n_fail, n_skip,
+            pass_rate, warn_rate, fail_rate
+        """
+        if df_all.empty:
+            return pd.DataFrame(columns=[
+                "test_type", "test_name", "n_tests", "n_pass", "n_warn",
+                "n_severe", "n_fail", "n_skip", "pass_rate", "warn_rate", "fail_rate"
+            ])
+
+        if "_is_placeholder" in df_all.columns:
+            df_all = df_all[~df_all["_is_placeholder"]]
+
+        flag_order = ["PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
+        flag_counts = (
+            df_all.groupby(["test_type", "test_name"])
+            .flag.value_counts()
+            .unstack(fill_value=0)
+            .reindex(columns=flag_order, fill_value=0)
+        )
+
+        df_per_test = flag_counts.rename(columns={
+            "PASS": "n_pass",
+            "WARN": "n_warn",
+            "SEVERE": "n_severe",
+            "FAIL": "n_fail",
+            "SKIP": "n_skip",
+        }).reset_index()
+
+        df_per_test["n_tests"] = df_per_test[[
+            "n_pass", "n_warn", "n_severe", "n_fail", "n_skip"
+        ]].sum(axis=1)
+
+        df_per_test["pass_rate"] = df_per_test["n_pass"] / df_per_test["n_tests"]
+        df_per_test["warn_rate"] = df_per_test["n_warn"] / df_per_test["n_tests"]
+        df_per_test["fail_rate"] = df_per_test["n_fail"] / df_per_test["n_tests"]
+
+        df_per_test = df_per_test[[
+            "test_type", "test_name", "n_tests", "n_pass", "n_warn", "n_severe",
+            "n_fail", "n_skip", "pass_rate", "warn_rate", "fail_rate"
+        ]]
+
+        return df_per_test
+
+    def _generate_all_tests(self, entity_qc: EntityQCStatus, sample_filter: set[str]) -> pd.DataFrame:
+        """Generate table with all test combinations for every sample-step pair.
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            The QC status object.
+        sample_filter : set[str]
+            Sample IDs to include.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: sample_id, step_name, test_type, test_name, flag
+            Includes placeholder rows with empty test_type/test_name for steps without tests.
+        """
+        records = []
+
+        for sample_id, qc_run in entity_qc.sample_qc.items():
+            if sample_id not in sample_filter:
+                continue
+
+            for step_name, step in qc_run.steps.items():
+                # Iterate through all tests in this step
+                for test_id, test in step.tests.items():
+                    records.append({
+                        "sample_id": sample_id,
+                        "step_name": step_name,
+                        "test_type": test.test_type,
+                        "test_name": test.test_name,
+                        "flag": test.flag.value,
+                        "_is_placeholder": False,
+                    })
+                if not step.tests:
+                    records.append({
+                        "sample_id": sample_id,
+                        "step_name": step_name,
+                        "test_type": "",
+                        "test_name": "",
+                        "flag": step.flag.value,
+                        "_is_placeholder": True,
+                    })
+
+        if not records:
+            return pd.DataFrame(columns=[
+                "sample_id", "step_name", "test_type", "test_name", "flag", "_is_placeholder"
+            ])
+
+        return pd.DataFrame(records)
 
     def generate_figure(
         self,
