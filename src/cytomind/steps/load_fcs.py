@@ -58,7 +58,7 @@ class LoadFCS(BaseStep):
         # Create AnnData with panel (columns already in correct order)
         if sample.compensation:
             layer = 'comp'
-            uns = {'compensation_id': sample.compensation}
+            uns = {'sample_id': sample.id, 'compensation_id': sample.compensation}
             comp_evals = step_run.evaluable_products.setdefault("compensation", {})
             if sample.compensation in comp_evals:
                 comp_evals[sample.compensation]["sample_ids"].append(sample.id)
@@ -67,7 +67,7 @@ class LoadFCS(BaseStep):
 
         else:
             layer = 'raw'
-            uns = {}
+            uns = {'sample_id': sample.id}
             step_run.evaluable_products.setdefault("raw_data", {})[sample.id] = dict()
         var = self.repo.load_layer_df(layer)
         adata = ad.AnnData(X=X, var=var, uns=uns)
