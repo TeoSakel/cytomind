@@ -47,7 +47,6 @@ class AddGateStep(BaseStep):
 
     def merge_config(self, step_run: StepRun) -> dict:
         """Validate config before execution."""
-        # TODO: should I move checks to run so that I can capture them in QC?
         batch_ids = step_run.inputs.get("batch_ids", [])
         if not batch_ids:
             raise ValueError("AddGateStep requires one batch_id in inputs.")
@@ -59,7 +58,9 @@ class AddGateStep(BaseStep):
         if "gate_node" not in step_run.config:
             raise ValueError("AddGateStep requires 'gate_node' in config.")
 
-        step_run.config["custom_fit"] = set(step_run.config.get("custom_fit", []))
+        # Keep custom_fit as list; convert to set locally when needed for membership tests
+        if "custom_fit" not in step_run.config:
+            step_run.config["custom_fit"] = []
         return super().merge_config(step_run)
 
     def prepare_batch(self, batch_id: str, step_run: StepRun) -> tuple[dict, QCRunStatus]:
@@ -74,7 +75,9 @@ class AddGateStep(BaseStep):
             return {}, qc
 
         strategy_id = step_run.config["strategy_id"]
-        if not strategy_id in self.project.gating_strategies:
+        try:
+            strategy = self.project.gating_strategies[strategy_id]
+        except KeyError:
             step = qc.get_step("LoadGatingStrategy")
             step.flag = QCFlag.FAIL
             step.add_reason("STRATEGY_NOT_FOUND", f"Gating strategy {strategy_id} not found in project.")
@@ -92,7 +95,7 @@ class AddGateStep(BaseStep):
             return {}, qc
 
         # Check if gate already exists
-        if self.repo.gate_node_path(strategy_id, gate_node.id).exists():
+        if gate_node.id in strategy.graph:
             step = qc.get_step("CheckGateExists")
             step.flag = QCFlag.FAIL
             step.add_reason(
@@ -112,6 +115,9 @@ class AddGateStep(BaseStep):
         if gate is None:
             return {}, qc
 
+        gate_node.dimensions = gate.dimensions  # Ensure dimensions are populated in node for downstream use
+        gate_node.use_as_complement = gate.use_as_complement  # Ensure complement flag is in node for downstream use
+        gate_node.glm_type = gate.glm_type  # Ensure glm_type is in node for downstream use
         output["gate_node"] = gate_node
         output["gate"] = gate
 
@@ -181,13 +187,13 @@ class AddGateStep(BaseStep):
         strategy_id = step_run.config["strategy_id"]
         batch_id = step_run.inputs["batch_ids"][0]
         gate_node: GateNode = step_run.batch_outputs[batch_id]["gate_node"]
-        gate: Gate = step_run.batch_outputs[batch_id]["gate"]
-        should_fit = gate.tunable and (not step_run.config["fit_on_batch"] or sample_id in step_run.config["custom_fit"])
+        gate_batch: Gate = step_run.batch_outputs[batch_id]["gate"]
 
-        # Load sample data (backed on disk for now)
-        adata, _ = self.load_layer(sample, qc, layer=gate_node.layer)
-        if adata is None:
-            return {}, qc
+        # Check if this sample should be refitted
+        custom_fit_set = set(step_run.config["custom_fit"])
+        # Refit if: gate is tunable AND (batch fitting disabled OR sample explicitly in custom_fit list)
+        should_fit = not step_run.config.get("fit_on_batch", False) or sample_id in custom_fit_set
+        should_fit = gate_batch.tunable and should_fit
 
         # Load Parent Masks
         parent_dict, _ = self.run_step(
@@ -202,20 +208,51 @@ class AddGateStep(BaseStep):
         if parent_dict is None:
             return {}, qc
 
+        if gate_node.gate_type == "Boolean":
+            adata = ad.AnnData(np.empty((0, 0), dtype=np.float32))
+        else:
+            if not parent_dict:
+                parent_dict = {"root": np.ones(sample.n_events, dtype=bool)}
+            if len(parent_dict) != 1:
+                step = qc.get_step("ValidateParentMasks")
+                step.flag = QCFlag.FAIL
+                step.add_reason(
+                    "MULTIPLE_PARENTS_NOT_SUPPORTED",
+                    f"Gate of type '{gate_node.gate_type}' expects exactly one parent/root mask, got {len(parent_dict)}."
+                )
+                return {}, qc
+
+            # Load only parent-selected events; Gate.apply expands back to full length.
+            adata, _ = self.load_adata(
+                sample,
+                qc,
+                layer=gate_node.layer,
+                mask=parent_dict,
+                select=gate_node.dimensions
+            )
+            if adata is None:
+                return {}, qc
+
         # Fit gate (skip if already fitted on batch)
         if should_fit:
             gate, step = self.run_step(
                 qc,
                 "FitGate",
-                gate.copy().fit,
+                gate_batch.copy().fit,
                 events=adata,
                 mask=parent_dict,
                 reason_code_fail="GATE_FIT_ERROR"
             ) # pyright: ignore[reportAssignmentType]
             if gate is None:
                 return {}, qc
+        else:
+            if sample_id in gate_node.custom_gates:
+                params_to_use = gate_node.custom_gates[sample_id]
+            else:
+                params_to_use = gate_batch.to_node_params()
+            gate = gate_batch.update_params(params_to_use)
 
-        # Apply gate
+        # Apply gate with required mask parameter
         mask, _ = self.run_step(
             qc,
             "ApplyGate",
@@ -242,13 +279,13 @@ class AddGateStep(BaseStep):
 
         # Store counts in nested dict structure for easier access
         summary = {
-            "root": len(adata),
+            "root": sample.n_events,
             "parents": {pid: int(parent_mask.sum()) for pid, parent_mask in parent_dict.items()},
             "gates": {mask_id: int(gate_mask.sum()) for mask_id, gate_mask in mask.items()}
         }
         output_info = {
             "summary": summary,
-            "params": gate.param_dict() if should_fit else None,
+            "params": gate.to_node_params() if should_fit else None,
         }
 
         return output_info, qc
@@ -279,19 +316,33 @@ class AddGateStep(BaseStep):
 
         # Create GateNode from config
         gate_node: GateNode = output_info["gate_node"]
-        gate_node.params = output_info["gate"].param_dict() if output_info.get("fit_on_batch", False) else {}
+        # Extract full param structure from gate: {"hyperparams": {...}, "params": {...}, "diagnostics": {...}}
+        full_gate_params = output_info["gate"].to_node_params() if output_info.get("fit_on_batch", False) else {}
+        gate_node.params = full_gate_params
+
+        # Store sample-specific parameter overrides (only if sample was actually fitted)
         for sample_id, sample_info in step_run.sample_outputs.items():
-            params = sample_info.pop("params", None)
+            params = sample_info.get("params")  # None if sample wasn't fitted
             if params:
                 gate_node.custom_gates[sample_id] = params
 
         # Add the gate node with its attributes
-        strategy.add_node(gate_node)
+        try:
+            strategy.add_node(gate_node)
+        except ValueError as e:
+            # Has been checked in prepare_batch but re-checking here for safety since graph is being modified
+            step = qc.get_step("AddGateNode")
+            step.flag = QCFlag.FAIL
+            step.add_reason("CYCLE_DETECTED", str(e))
+            return {}, qc
+
         gate_ids = [gate_node.id]
 
         # For QuadrantGate, create individual GateNodes for each quadrant
         if gate_node.glm_type == "QuadrantGate":
             gate: QuadrantGate = output_info["gate"]
+            # Extract nested "params" dict which contains computed quadrants
+            nested_params = full_gate_params.get("params", {}) if full_gate_params else {}
             for qid, loc in gate.locations.items():  # type: ignore[attr-defined]
                 # Create a GateNode for this quadrant
                 quadrant_node = GateNode(
@@ -303,14 +354,25 @@ class AddGateStep(BaseStep):
                     name=qid,
                     parent_ids=[gate_node.id],
                     use_as_complement=False,
-                    params=gate_node.params.get(qid, {}),
-                    custom_gates={sid: params.get(qid, {}) for sid, params in gate_node.custom_gates.items()}
+                    params=nested_params.get(qid, {}) if nested_params else {},
+                    custom_gates={
+                        sid: sample_info.get("params", {}).get(qid, {})
+                        for sid, sample_info in step_run.sample_outputs.items()
+                        if sample_info.get("params")
+                    }
                 )
                 # Add node with attributes to graph
-                strategy.add_node(quadrant_node)
+                try:
+                    strategy.add_node(quadrant_node)
+                except ValueError as e:
+                    step = qc.get_step("AddQuadrantNode")
+                    step.flag = QCFlag.FAIL
+                    step.add_reason("CYCLE_DETECTED", str(e))
+                    return {}, qc
+
                 gate_ids.append(quadrant_node.id)
 
-        step_run.project_updates.append({"gating_strategy": [strategy]})
+        step_run.project_updates.append({"gating_strategies": [strategy]})
 
         # Populate evaluable_products: gating strategy is now updated with new gate(s)
         # Include metadata about parent dependencies for QC validation
@@ -323,23 +385,64 @@ class AddGateStep(BaseStep):
         return output_info, qc
 
     def cleanup_step_run(self, step_run: StepRun) -> StepRun:
-        step_run.config["custom_fit"] = list(step_run.config.get("custom_fit", []))
+        step_run = super().cleanup_step_run(step_run)
+        # Remove params from sample outputs as they are persisted to the database
+        # Keep only debugging/QC context information in outputs
+        for sample_id, sample_info in step_run.sample_outputs.items():
+            sample_info.pop("params", None)
         return step_run
 
     def _initialize_gate(self, gate_node: GateNode) -> Gate:
+        """Initialize a Gate instance from a GateNode.
+
+        This handles reconstruction of gates that may have batch-level fitted parameters.
+        If the gate_node has params, use Gate.from_node() to properly restore them.
+        Otherwise, initialize fresh (will be fitted during prepare_batch or run_sample).
+
+        Validates that multi-parent gates are only BooleanGates (other gates must have
+        single parent or no parent).
+
+        Parameters
+        ----------
+        gate_node : GateNode
+            Gate node from the gating strategy (may have empty params if new gate)
+
+        Returns
+        -------
+        Gate
+            Initialized gate instance, ready for fit() or apply()
+
+        Raises
+        ------
+        ValueError
+            If gate type is not found in registry, or if multiple parents on non-BooleanGate
+        """
+        # Validate multi-parent gates: only BooleanGates are allowed to have multiple parents
+        if len(gate_node.parent_ids) > 1 and gate_node.gate_type != "Boolean":
+            raise ValueError(
+                f"MULTI_PARENT_NOT_ALLOWED: Gate '{gate_node.id}' has {len(gate_node.parent_ids)} parents. "
+                f"Only BooleanGates support multiple parents. Other gates must have single parent or no parent."
+            )
+
         try:
             gate_class = GateRegistry.get(gate_node.gate_type)
         except KeyError:
             raise ValueError(
-                f"UNKNOWN_GATE_TYPE:"
-                f"Gate type '{gate_node.gate_type}' not recognized. "
+                f"UNKNOWN_GATE_TYPE: Gate type '{gate_node.gate_type}' not recognized. "
                 f"Available: {list(GateRegistry.list_gates().keys())}"
             )
+
+        # If gate_node has saved params (batch-fitted), reconstruct with them
+        if gate_node.params:
+            return gate_class.from_node(gate_node)
+
+        # Otherwise, initialize fresh with just hyperparams
+        hyperparams = gate_node.params.get("hyperparams", {})
         return gate_class(
             gate_name=gate_node.name or gate_node.id,
             dimensions=gate_node.dimensions,
             use_as_complement=gate_node.use_as_complement,
-            **gate_node.params.get("hyperparams", {})
+            **hyperparams,
         )
 
     def _build_batch_adata(
@@ -424,12 +527,36 @@ class AddGateStep(BaseStep):
         return batch_adata
 
     def _get_parent_mask(self, strategy_id: str, parent_ids: Sequence[str], sample: SampleRef) -> NDArray[np.bool_]:
-        """Load parent mask for a sample. Returns None if no parent."""
+        """Load parent mask for a sample.
+
+        Parameters
+        ----------
+        strategy_id : str
+            Gating strategy identifier
+        parent_ids : Sequence[str]
+            List of parent gate IDs (should be 0 or 1; multi-parent only for BooleanGates)
+        sample : SampleRef
+            Sample to load parent masks for
+
+        Returns
+        -------
+        NDArray[np.bool_]
+            Combined parent mask (all True if no parents)
+
+        Raises
+        ------
+        ValueError
+            If multiple parents provided (batch fitting only supports single parent or no parent)
+        """
         if not parent_ids:
             return np.ones(sample.n_events, dtype=bool)
 
         if len(parent_ids) > 1:
-            raise ValueError(f"Gate has {len(parent_ids)} parents. Only single-parent gates can use batch fitting.")
+            raise ValueError(
+                f"BATCH_FIT_MULTI_PARENT_ERROR: Batch fitting does not support gates with {len(parent_ids)} parents. "
+                f"Only single-parent gates can use batch-level fitting. "
+                f"For multi-parent gates (e.g., BooleanGates), use per-sample fitting (fit_on_batch=False)."
+            )
 
         parent_dict = self.repo.load_gating_masks(
             strategy=strategy_id,

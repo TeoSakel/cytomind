@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from typing import Any, Sequence, Mapping
-from numpy.typing import NDArray
+from typing import Any, Sequence, Mapping, TYPE_CHECKING
 
 import anndata as ad
 import numpy as np
@@ -10,6 +9,12 @@ import pandas as pd
 
 from .base import Gate
 from . import GateRegistry
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+    BooleanMask = NDArray[np.bool_]
+else:
+    BooleanMask = object
 
 
 @GateRegistry.register("Rectangle")
@@ -650,22 +655,26 @@ class BooleanGate(Gate):
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
 
-    def apply(self, events: ad.AnnData, mask: dict[str, NDArray[np.bool_]] = {}) -> dict[str, NDArray[np.bool_]]:
+    def apply(self, events: ad.AnnData, mask: dict[str, BooleanMask]) -> dict[str, BooleanMask]:
         """
         Apply boolean expression to masks from parent gates.
+
+        BooleanGate completely overrides the standard gate apply behavior.
+        It works only with masks from parent gates; event data is not used.
 
         Parameters
         ----------
         events : ad.AnnData
-            Not used for BooleanGate, but accepted for interface consistency
-        mask : dict[str, NDArray[np.bool_]]
+            Not used for BooleanGate, but required for interface compatibility
+        mask : dict[str, BooleanMask]
             Dictionary of masks from parent gates, mapping variable names to boolean arrays.
             Must contain all variables referenced in the expression.
 
         Returns
         -------
         dict[str, NDArray[np.bool_]]
-            Dictionary with single key self.mask_key containing the result of the expression
+            Dictionary with single key self.gate_name containing the result of the expression.
+            Mask size equals the size of the input mask arrays.
         """
         # Ensure we have all needed variables
         provided_vars = set(mask.keys())
@@ -676,13 +685,9 @@ class BooleanGate(Gate):
                 f"Provided masks: {provided_vars}"
             )
 
-        # Evaluate the expression with the provided masks using pandas
+        # Evaluate the expression with the provided masks using pandas.
+        # BooleanGate does not depend on event matrix content.
         mask_df = pd.DataFrame(mask)
-        if len(mask_df) != events.n_obs:
-            raise ValueError(
-                f"BooleanGate '{self.gate_name}' received masks of length {len(mask_df)}, "
-                f"but events AnnData has length {events.n_obs}"
-            )
         try:
             result = mask_df.eval(self.expression, local_dict={}, global_dict={})
         except Exception as e:

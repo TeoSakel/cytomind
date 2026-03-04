@@ -23,9 +23,23 @@ class GateNode:
     The node is a record - it doesn't perform fitting or application.
     Use the gate class specified in `gate_type` to create Gate instances
     for actual computation.
+
+    Parameter Storage
+    -----------------
+    Supports both batch-level and sample-specific parameter storage:
+
+    - **params**: Batch-level parameters (dict structure with 'hyperparams', 'params', 'diagnostics').
+      Applied to all samples unless overridden by custom_gates.
+
+    - **custom_gates[sample_id]**: Sample-specific parameter overrides (same dict structure).
+      Takes precedence over params for that specific sample.
+
+    Use Gate.from_node(node, sample_id) to reconstruct a Gate with the correct parameters:
+    - from_node(node) → uses batch-level params
+    - from_node(node, "sample_123") → uses custom_gates["sample_123"] or falls back to params
     """
 
-    id: str                          # Unique node identifier
+    id: str                               # Unique node identifier
     gate_type: str                        # Gate class name (e.g., "RectangleGate")
     dimensions: list[str]                 # Dimension IDs this gate operates on
     layer: str = "xf"                     # Data layer: "raw", "comp", or "xf"
@@ -33,8 +47,8 @@ class GateNode:
     glm_type: str | None = None           # GatingML type (optional)
     parent_ids: list[str] = field(default_factory=list)  # Parent node IDs in hierarchy
     use_as_complement: bool = False       # Whether to use gate as complement
-    params: dict[str, Any] = field(default_factory=dict)  # Gate default parameters
-    custom_gates: dict[str, dict[str, Any]] = field(default_factory=dict)  # Sample-specific custom gate parameters
+    params: dict[str, Any] = field(default_factory=dict)  # Batch-level parameters (structure: {hyperparams, params, diagnostics})
+    custom_gates: dict[str, dict[str, Any]] = field(default_factory=dict)  # Sample-specific parameter overrides
 
     def __post_init__(self) -> None:
         pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
@@ -78,6 +92,17 @@ class GateNode:
             Deserialized gate node instance
         """
 
+        # Backward/forward compatibility for incoming gate payloads:
+        # - New shape: params={"hyperparams": ..., "params": ..., "diagnostics": ...}
+        # - Legacy add_gate payload: hyperparams={...}
+        params = data.get("params", {})
+        if not params and "hyperparams" in data:
+            params = {
+                "hyperparams": dict(data.get("hyperparams", {})),
+                "params": {},
+                "diagnostics": {},
+            }
+
         return GateNode(
             id=data["id"],
             gate_type=data["gate_type"],
@@ -87,9 +112,37 @@ class GateNode:
             glm_type=data.get("glm_type"),
             parent_ids=data.get("parent_ids", []),
             use_as_complement=data.get("use_as_complement", False),
-            params=data.get("params", {}),
+            params=params,
             custom_gates=data.get("custom_gates", {}),
         )
+
+    def get_params_for_sample(self, sample_id: str) -> dict[str, Any]:
+        """Get merged parameters for a specific sample.
+
+        Implements parameter precedence: sample-specific overrides fall back to batch-level params.
+
+        Parameters
+        ----------
+        sample_id : str
+            Sample identifier to look up parameters for
+
+        Returns
+        -------
+        dict[str, Any]
+            Merged parameter structure ({"hyperparams": {...}, "params": {...}, "diagnostics": {...}}).
+            If sample_id is in custom_gates, returns that (with fallback).
+            Otherwise returns batch-level params.
+
+        Examples
+        --------
+        Get parameters (with precedence):
+        >>> params = node.get_params_for_sample("sample_123")
+        >>> # Returns custom_gates["sample_123"] if present, else params
+        """
+        if sample_id in self.custom_gates:
+            return self.custom_gates[sample_id]
+        else:
+            return self.params
 
 @dataclass
 class GatingStrategyRef:
@@ -138,7 +191,7 @@ class GatingStrategyRef:
                 raise KeyError(f"Missing required field '{f}' in GatingStrategyRef data")
 
         graph_data = data.get("graph")
-        graph = json_graph.tree_graph(graph_data) if graph_data else None
+        graph = json_graph.node_link_graph(graph_data) if graph_data else None
 
         ref = GatingStrategyRef(
             id=data["id"],
@@ -170,7 +223,7 @@ class GatingStrategyRef:
             "created_at": self.created_at or now_iso(),
             "description": self.description,
             "glm_version": self.glm_version,
-            "graph": json_graph.tree_data(self._graph, root="root") if self._graph else None,
+            "graph": json_graph.node_link_data(self._graph) if self._graph else None,
         }
 
     @property
@@ -202,14 +255,14 @@ class GatingStrategyRef:
             raise FileNotFoundError(f"Gating strategy file not found: {self.path} and instance is not set.")
 
         try:
-            tree_data = json.loads(path.read_text())["graph"]
+            graph_data = json.loads(path.read_text())["graph"]
         except KeyError:
             raise ValueError(f"Gating strategy file {self.path} does not contain graph data.")
         except json.JSONDecodeError as e:
             raise ValueError(f"Error decoding gating strategy file {self.path}: {e}") from e
 
         try:
-            self._graph = json_graph.tree_graph(data=tree_data)
+            self._graph = json_graph.node_link_graph(data=graph_data)
         except Exception as e:
             raise ValueError(f"Error loading gating strategy graph from file {self.path}: {e}") from e
 
@@ -289,6 +342,41 @@ class GatingStrategyRef:
                 raise KeyError(f"Parent gate node with id '{parent_id}' not found in gating strategy.")
 
         node_id = gate_node.pop("id")
+
+        # Check if node already exists
+        if self.graph.has_node(node_id):
+            raise ValueError(f"Gate node with id '{node_id}' already exists in the gating strategy.")
+
         self.graph.add_node(node_id, **gate_node)
+
+        # Add edges and check for cycles
         for parent_id in parents:
             self.graph.add_edge(parent_id, node_id)
+
+        # Check if the new node creates a cycle by looking for a path back to any parent
+        for parent_id in parents:
+            if nx.has_path(self.graph, node_id, parent_id):
+                self.graph.remove_node(node_id)
+                raise ValueError(
+                    f"Adding gate '{node_id}' with parents {parents} would create a cycle in the gating strategy. "
+                    "The gating strategy must remain a directed acyclic graph (DAG)."
+                )
+
+    def has_path(self, from_node_id: str, to_node_id: str) -> bool:
+        """
+        Check if there is a path from one node to another in the gating strategy graph.
+
+        Parameters
+        ----------
+        from_node_id : str
+            The ID of the starting node.
+        to_node_id : str
+            The ID of the target node.
+
+        Returns
+        -------
+        bool
+            True if there is a path from from_node_id to to_node_id, False otherwise.
+        """
+
+        return nx.has_path(self.graph, from_node_id, to_node_id)

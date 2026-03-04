@@ -274,7 +274,12 @@ class BaseStep:
 
         # Evaluate step's own QC
         step_qc = step_evaluator.parse_step(step_run)
-        step_qc = step_evaluator.update_entity_qc(entity=step_run, entity_qc=step_qc)
+        step_qc = step_evaluator.update_entity_qc(
+            entity=step_run,
+            entity_qc=step_qc,
+            dataloader=self.repo._dataloader,  # Not needed for step QC
+            dataloader_context=None,
+        )
         self.repo.save_qc_entity_status(step_qc)
 
 
@@ -395,7 +400,7 @@ class BaseStep:
         sample: SampleRef,
         qc: QCRunStatus,
         layer: str | None = None,
-        mask: NDArray[np.bool_] | slice | None = None,
+        mask: NDArray[np.bool_] | dict[str, NDArray[np.bool_]] | slice | None = None,
         select: Sequence[str] | slice |None = None,
     ) -> tuple[AnnData | None, QCStepStatus]:
         """
@@ -403,8 +408,10 @@ class BaseStep:
         Returns (AnnData, updated qc).
         """
         layer = layer or sample.default_layer
-        mask = mask or slice(None)
         select = select or slice(None)
+        mask = mask or slice(None)
+        if isinstance(mask, dict):
+            mask = next(iter(mask.values()))
 
         return self.run_step(
             qc,

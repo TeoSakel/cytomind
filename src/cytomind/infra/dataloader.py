@@ -5,7 +5,6 @@ UnifiedDataLoader owns all I/O business logic and is configured with base direct
 This eliminates coupling to ProjectRepository and centralizes file operations.
 
 Architecture:
-- DataLoader Protocol: Defines the complete I/O interface
 - UnifiedDataLoader: Consolidated implementation handling both repo and workspace I/O
   - Configurable with root_dir, optional fallback_root for workspace-first pattern
   - Handles all I/O: AnnData, masks, gates, metadata with optional parsing
@@ -15,7 +14,7 @@ Handlers only configure loaders with paths—they don't micromanage I/O.
 Visualization subset caching is managed by dataloader for test/debug workflows.
 """
 from __future__ import annotations
-from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Protocol, Sequence, TypeVar, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeVar, TYPE_CHECKING
 import warnings
 from pathlib import Path
 from shutil import rmtree
@@ -25,7 +24,7 @@ import numpy as np
 import anndata as ad
 
 from cytomind.domain.pipeline import NumpyEncoder
-from cytomind.domain.gates import GateNode
+from cytomind.domain.gates import GateNode, GatingStrategyRef
 from cytomind.utils import rlencode, rldecode, now_iso
 
 if TYPE_CHECKING:
@@ -44,248 +43,6 @@ else:
     JSONSerializable = object
     HandlerDictType = object
     R = object
-
-@runtime_checkable
-class DataLoader(Protocol):
-    """Protocol for loading and saving data by sample and context.
-
-    Implementations handle both reading and writing AnnData objects,
-    gating masks, gate node definitions, and other entities. Context
-    parameters allow evaluators to customize behavior (e.g., apply
-    compensation, select specific gates).
-    """
-
-    # -------- AnnData I/O --------
-
-    def load_adata(
-        self,
-        sample_id: str,
-        layer: str | None = None,
-        mask: MaskLike = slice(None),
-        select: Sequence[str] | slice = slice(None),
-        backed: bool | Literal["r", "r+"] = False,
-        **context: Any,
-    ) -> ad.AnnData:
-        """
-        Load AnnData for a sample.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier
-        layer : str | None
-            Layer name to load (e.g., "raw", "comp", "xf").
-            Meaning depends on dataloader implementation.
-        mask : MaskLike
-            Boolean or integer index/slice to select observations (rows).
-            Defaults to loading all observations.
-        select : Sequence[str] | slice
-            Variable names or slice for column (feature) selection.
-            Defaults to loading all variables.
-        backed : bool | Literal["r", "r+"]
-            Whether to open in backed mode. False for in-memory (default),
-            True or "r" for read-only backed, "r+" for read-write backed.
-        **context : dict
-            Optional context (e.g., comp_ref for compensation, strategy_id for gates).
-            Implementation decides how to use it.
-
-        Returns
-        -------
-        AnnData
-            Loaded annotated data object (in-memory or backed depending on parameter)
-        """
-        ...
-
-    def save_adata(
-        self,
-        sample_id: str,
-        layer: str,
-        adata: ad.AnnData,
-        **context: Any,
-    ) -> None:
-        """
-        Save AnnData for a sample's layer.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier
-        layer : str
-            Data layer name (e.g., "raw", "comp", "xf")
-        adata : AnnData
-            AnnData object to persist
-        **context : dict
-            Optional context (e.g., overwrite flags, compression options)
-        """
-        ...
-
-    # -------- Gating Mask I/O --------
-
-    def load_masks(
-        self,
-        sample_id: str,
-        strategy_id: str,
-        gate_ids: Iterable[str] | None = None,
-        **context: Any,
-    ) -> Mapping[str, BooleanArray]:
-        """
-        Load gating masks for a sample.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier
-        strategy_id : str
-            Gating strategy identifier
-        gate_ids : Iterable[str] | None
-            Optional list of gate IDs to load. If None, load all gates in strategy.
-        **context : dict
-            Optional additional context
-
-        Returns
-        -------
-        Mapping[str, BooleanArray]
-            Mapping of gate_id → boolean mask array
-        """
-        ...
-
-    def save_masks(
-        self,
-        sample_id: str,
-        strategy_id: str,
-        masks: Mapping[str, BooleanMask],
-        **context: Any,
-    ) -> None:
-        """
-        Save gating masks for a sample.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier
-        strategy_id : str
-            Gating strategy identifier
-        masks : Mapping[str, BooleanMask]
-            Mapping of gate_id → boolean mask array
-        **context : dict
-            Optional context (e.g., overwrite flags, compression options)
-        """
-        ...
-
-    # -------- Gate Node I/O --------
-
-    def load_gate_node(
-        self,
-        strategy_id: str,
-        node_id: str,
-        parse_func: Callable[[dict], Any] | None = None,
-        **context: Any,
-    ) -> Any:
-        """
-        Load a gate node definition.
-
-        Parameters
-        ----------
-        strategy_id : str
-            Gating strategy identifier
-        node_id : str
-            Gate node identifier
-        parse_func : Callable[[dict], Any] | None, optional
-            Function to parse the loaded dict. If None, returns raw dict (default).
-        **context : dict
-            Optional additional context
-
-        Returns
-        -------
-        GateNode | dict
-            Gate node definition (parsed via parse_func if provided, else raw dict)
-        """
-        ...
-
-    def save_gate_node(
-        self,
-        strategy_id: str,
-        node: Any,
-        serialize_func: Callable[[Any], dict] | None = None,
-        **context: Any,
-    ) -> None:
-        """
-        Save a gate node definition.
-
-        Parameters
-        ----------
-        strategy_id : str
-            Gating strategy identifier
-        node : GateNode | dict
-            Gate node definition to save (will be serialized if serialize_func provided)
-        serialize_func : Callable[[Any], dict] | None, optional
-            Function to serialize node to dict. If None, treats node as dict (default).
-        **context : dict
-            Optional context (e.g., overwrite flags)
-        """
-        ...
-
-    # -------- Visualization Subset I/O --------
-
-    def get_or_create_viz_subset(
-        self,
-        sample_id: str,
-        layer: str,
-        n_subset: int | None = None,
-        seed: int | None = None,
-        n_total: int | None = None,
-        **context: Any,
-    ) -> ad.AnnData:
-        """
-        Get or create a visualization subset.
-
-        Lazy loads: creates on first access, caches thereafter.
-        Useful for interactive visualization and debugging workflows.
-
-        Parameters
-        ----------
-        sample_id : str
-            Sample identifier
-        layer : str
-            Layer name (e.g., "raw", "comp")
-        n_subset : int | None
-            Number of events in subset. If None, implementation default is used.
-        seed : int | None
-            Random seed for reproducibility. If None, implementation default is used.
-        n_total : int | None
-            Total number of events in the full dataset.
-            Some implementations may require this; others can compute it.
-        **context : dict
-            Optional context (e.g., repo instance for computing n_total)
-
-        Returns
-        -------
-        AnnData
-            Visualization subset loaded into memory
-        """
-        ...
-
-    def invalidate_viz_cache(
-        self,
-        sample_ids: Iterable[str],
-        layer: str,
-        **context: Any,
-    ) -> None:
-        """
-        Invalidate cached visualization subsets.
-
-        Call after modifying data in a layer to clear stale cached subsets.
-
-        Parameters
-        ----------
-        sample_ids : Iterable[str]
-            Sample IDs whose data was modified
-        layer : str
-            Layer that was modified
-        **context : dict
-            Optional additional context
-        """
-        ...
 
 
 class UnifiedDataLoader:
@@ -493,13 +250,13 @@ class UnifiedDataLoader:
         GateNode
             Gate node definition (parsed via parse_func)
         """
-        path = self._resolve_read_path(
-            self._pattern("gate_node"),
+        return self.load_data(
+            entity="gate_node",
+            parse_func=parse_func,
             strategy_id=strategy_id,
             node_id=node_id,
+            **context
         )
-        data = self._load_json(path)
-        return parse_func(data) # pyright: ignore[reportArgumentType]
 
     def save_gate_node(
         self,
@@ -522,19 +279,72 @@ class UnifiedDataLoader:
         **context : dict
             Optional context (e.g., overwrite flags)
         """
-        overwrite = context.get("overwrite", False)
-        node_dict = serialize_func(node)
-        path = self._resolve_write_path(
-            self._pattern("gate_node"),
+        self.save_data(
+            pattern="gate_node",
+            data=node,
+            serialize_func=serialize_func,
+            overwrite=context.get("overwrite", True),
             strategy_id=strategy_id,
-            node_id=node_dict["id"],
+            node_id=node.id,
+            **context
         )
-        if not overwrite and path.exists():
-            raise FileExistsError(
-                f"Gate node already exists at {path.as_posix()}. "
-                "Use overwrite=True to replace."
-            )
-        self._save_json(path, node_dict)
+
+    def load_gating_strategy(
+        self,
+        strategy_id: str,
+        parse_func: Callable[[dict], GatingStrategyRef] = GatingStrategyRef.from_dict,
+        **context: Any
+    ) -> GatingStrategyRef:
+        """
+        Load gating strategy definition from JSON.
+
+        Parameters
+        ----------
+        strategy_id : str
+            Gating strategy identifier
+        parse_func : Callable[[dict], GatingStrategyRef]
+            Function to parse the loaded dict to a GatingStrategyRef
+        **context : dict
+            Optional context
+
+        Returns
+        -------
+        GatingStrategyRef
+            Gating strategy definition (parsed via parse_func)
+        """
+        return self.load_data(
+            entity="gating_strategy",
+            parse_func=parse_func,
+            strategy_id=strategy_id,
+            **context
+        )
+
+    def save_gating_strategy(
+        self,
+        strategy: GatingStrategyRef,
+        serialize_func: Callable[[GatingStrategyRef], dict] = GatingStrategyRef.to_dict,
+        **context: Any
+    ) -> None:
+        """
+        Save gating strategy definition to JSON.
+
+        Parameters
+        ----------
+        strategy : GatingStrategyRef
+            Gating strategy to save (will be serialized if serialize_func provided)
+        serialize_func : Callable[[GatingStrategyRef], dict], optional
+            Function to serialize strategy to dict. Defaults to GatingStrategyRef.to_dict.
+        **context : dict
+            Optional context (e.g., overwrite flags)
+        """
+        self.save_data(
+            pattern="gating_strategy",
+            data=strategy,
+            serialize_func=serialize_func,
+            strategy_id=strategy.id,
+            overwrite=context.get("overwrite", True),
+            **context
+        )
 
     # ========== Generic Data I/O ==========
 
@@ -563,16 +373,6 @@ class UnifiedDataLoader:
 
         return parse_func(data) # pyright: ignore[reportArgumentType]
 
-    @staticmethod
-    def _serialize_to_container(data: Any) -> dict | list:
-        """Default serialization function for generic data."""
-        if hasattr(data, "to_dict") and callable(getattr(data, "to_dict")):
-            return data.to_dict()  # type: ignore
-        elif isinstance(data, (dict, list)):
-            return data
-        else:
-            raise TypeError(f"Data of type {type(data)} is not serializable by default. Provide a custom serialize_func.")
-
     def save_data(self, pattern: str, data: Any, serialize_func: Callable[[Any], dict[str, Any] | list] | None = None, overwrite: bool = True, **kwargs) -> Path:
         """Save data to a pattern, optionally serializing first.
 
@@ -598,7 +398,7 @@ class UnifiedDataLoader:
         actual_pattern = self._pattern(pattern)
         path = self._resolve_write_path(actual_pattern, **kwargs)
         if path.exists() and not overwrite:
-            raise FileExistsError(f"Metadata file already exists at {path.as_posix()}")
+            raise FileExistsError(f"{pattern} file already exists at {path.as_posix()}. Use overwrite=True to replace.")
 
         if serialize_func is None:
             _, default_serialize_func = self.data_handlers.get(pattern, (None, None))
@@ -671,11 +471,10 @@ class UnifiedDataLoader:
         self,
         sample_id: str,
         layer: str,
-        n_subset: int,
-        seed: int,
-        mask_id: str = "root",
-        mask: MaskLike = slice(None),
-        select: list[str] | slice = slice(None)
+        n_subset: int | None = None,
+        seed: int | None = None,
+        n_total: int | None = None,
+        **context: Any
     ) -> ad.AnnData:
         """
         Generic implementation for visualization subset creation.
@@ -686,29 +485,41 @@ class UnifiedDataLoader:
             Sample identifier
         layer : str
             Layer name
-        n_subset : int
+        n_subset : int | None, optional
             Number of events to subset
-        seed : int
+        seed : int | None, optional
             Random seed
-        mask_id : str
-            Optional mask identifier to apply before subsetting (e.g., gate_id)
-        mask : MaskLike, optional
-            Mask to apply to the data before subsetting (default: slice(None))
-        select : Sequence[str] | slice, optional
-            Columns to select from the data before subsetting (default: slice(None))
+        n_total : int | None, optional
+            Total number of events (not used in this implementation)
+        **context : dict
+            Optional context:
+            - mask_id : str, optional (default: "root")
+            - mask : MaskLike, optional (default: slice(None))
+            - select : Sequence[str] | slice, optional (default: slice(None))
         """
 
         if not self.viz_cache_dir:
             raise RuntimeError("Visualization caching is disabled")
 
+        # Extract context parameters with defaults
+        mask_id = context.get("mask_id", "root")
+        mask = context.get("mask", slice(None))
+        select = context.get("select", slice(None))
+
         if mask_id == "root" and mask != slice(None):
             raise ValueError("Cannot specify a mask when mask_id is 'root'")
-        subset_key = self.make_viz_data_key(sample_id, layer, mask_id, n_subset)
+        subset_key = self.make_viz_data_key(sample_id, layer, mask_id, n_subset or 0)
 
         # Check if already materialized
         if subset_key in self._viz_metadata:
             subset_path = self._viz_metadata[subset_key]["path"]
             return self._load_h5ad(Path(subset_path), mask=mask, select=select)
+
+        # Ensure n_subset and seed are provided for creating new cache
+        if n_subset is None:
+            raise ValueError("n_subset is required when creating a new viz cache entry")
+        if seed is None:
+            raise ValueError("seed is required when creating a new viz cache entry")
 
         # Load full data keep all columns to faciliate select in future calls
         full_data = self.load_adata(sample_id, layer, mask=mask)
@@ -789,6 +600,48 @@ class UnifiedDataLoader:
 
         return subset_path
 
+    def invalidate_viz_cache(
+        self,
+        sample_ids: Iterable[str],
+        layer: str,
+        **context: Any,
+    ) -> None:
+        """
+        Invalidate cached visualization subsets.
+
+        Call after modifying data in a layer to clear stale cached subsets.
+
+        Parameters
+        ----------
+        sample_ids : Iterable[str]
+            Sample IDs whose data was modified
+        layer : str
+            Layer that was modified
+        **context : dict
+            Optional additional context
+        """
+        if self.viz_cache_dir is None:
+            return  # Nothing to invalidate if caching is disabled
+
+        # Collect keys to remove
+        sample_id_set = set(sample_ids)
+        keys_to_remove = [
+            key for key, metadata in self._viz_metadata.items()
+            if metadata["sample_id"] in sample_id_set and metadata["layer"] == layer
+        ]
+
+        # Remove from metadata and delete files
+        for key in keys_to_remove:
+            metadata = self._viz_metadata.pop(key, None)
+            if metadata is not None:
+                path = Path(metadata["path"])
+                if path.exists():
+                    path.unlink()
+
+        # Save updated metadata if changes were made
+        if keys_to_remove:
+            self._save_viz_metadata()
+
     # ========== Workspace Generation ==========
 
     def generate_workspace(self, session_id: str) -> Path:
@@ -849,13 +702,17 @@ class UnifiedDataLoader:
         # If not backed, use existing logic (load with temporary backing, then to memory)
         if not backed_mode:
             adata = ad.read_h5ad(path, backed="r")
-            result = adata[mask, select].to_memory(copy=True)
-
             try:
-                adata.file.close()
+                result = adata[mask, select].to_memory(copy=True)
+            finally:
+                # Ensure file is always closed, even if to_memory() fails
+                if hasattr(adata, 'file') and adata.file is not None:
+                    try:
+                        adata.file.close()
+                    except Exception as e:
+                        # Log but don't fail - data was already loaded
+                        warnings.warn(f"Failed to close h5ad file {path}: {e}")
                 del adata
-            except Exception:
-                pass
 
             return result
 
@@ -925,7 +782,7 @@ class UnifiedDataLoader:
             if fallback_masks_dir.exists():
                 yield from (d.name for d in fallback_masks_dir.iterdir() if d.is_dir())
 
-    # ========== Low-level JSON I/O Helpers ==========
+    # ========== Helper Methods ==========
 
     @staticmethod
     def _load_json(path: PathLike) -> JSONSerializable:
@@ -942,4 +799,12 @@ class UnifiedDataLoader:
         with path.open("w") as f:
             json.dump(data, f, indent=2, cls=NumpyEncoder)
 
-    # ========== File/Directory Removal Helpers ==========
+    @staticmethod
+    def _serialize_to_container(data: Any) -> dict | list:
+        """Default serialization function for generic data."""
+        if hasattr(data, "to_dict") and callable(getattr(data, "to_dict")):
+            return data.to_dict()  # type: ignore
+        elif isinstance(data, (dict, list)):
+            return data
+        else:
+            raise TypeError(f"Data of type {type(data)} is not serializable by default. Provide a custom serialize_func.")

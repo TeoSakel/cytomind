@@ -295,7 +295,7 @@ class AddSamplesStep(BaseStep):
         batches = []
         batches.append(
             BatchRef(
-                id="__panel__",
+                id="panel",
                 sample_ids=set(sample_ids),
                 tags={"panel_group"},
                 meta={"panel_hash": panel_hash}
@@ -491,7 +491,7 @@ def _compute_panel_hash(panel: list[ChannelRef]) -> str:
         f"{ch.idx}:{ch.pnn}:{ch.pns}:{ch.type}:{ch.metric}"
         for ch in sorted(panel, key=lambda c: c.idx)
     )
-    return hashlib.md5(panel_str.encode("utf-8")).hexdigest()[:16]
+    return hashlib.md5(panel_str.encode("utf-8")).hexdigest()[:8]
 
 
 def _iter_comp_records_from_metadata(text: Mapping[str, str]):

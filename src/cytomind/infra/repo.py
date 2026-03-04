@@ -105,9 +105,6 @@ class ProjectRepository:
         except FileNotFoundError:
             project = Project(
                 id=name or self.root.name,
-                samples={},
-                panel_catalog={},
-                compensations={},
                 transformations=get_default_transformations(),
             )
             self.save_project(project)
@@ -310,7 +307,10 @@ class ProjectRepository:
         dict[str, GatingStrategyRef]
             Updated catalog mapping strategy_id -> GatingStrategyRef.
         """
-        catalog = self.load_project_metadata("gating_strategy_catalog")
+        try:
+            catalog = self.load_project_metadata("gating_strategy_catalog")
+        except FileNotFoundError:
+            catalog = {}
         new_strategy_refs: dict[str, GatingStrategyRef] = {}
         for ref in strategy_refs:
             if not isinstance(ref, GatingStrategyRef):
