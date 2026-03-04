@@ -2,7 +2,7 @@
 Step-level QC summarization.
 """
 from __future__ import annotations
-from typing import Any, Hashable, Iterable, TYPE_CHECKING
+from typing import Any, Hashable, TYPE_CHECKING
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,11 +17,13 @@ if TYPE_CHECKING:
     from cytomind.domain.qc import EntityQCStatus
     from cytomind.domain.pipeline import StepRun
     from cytomind.infra.repo import ProjectRepository
+    from cytomind.infra.dataloader import UnifiedDataLoader
 else:
     PathLike = object
     EntityQCStatus = object
     StepRun = object
     ProjectRepository = object
+    UnifiedDataLoader = object
 
 
 @EntityQCEvaluatorRegistry.register("step")
@@ -82,8 +84,8 @@ class StepQCEvaluator(EntityQCEvaluator):
     def required_layer(self, entity: StepRun | None = None) -> str | None:
         return None
 
-    def load_entity(self, repo: ProjectRepository, entity_id: Hashable) -> StepRun:
-        return repo.load_step_run(str(entity_id))
+    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> StepRun:
+        return dataloader.load_data("step_run", step_id=str(entity_id))
 
     def parse_step(self, step_run: StepRun, entity_id: str | None = None) -> EntityQCStatus:
         """Return the step_run's execution QC, preserving all data from run phases."""
@@ -93,7 +95,8 @@ class StepQCEvaluator(EntityQCEvaluator):
         self,
         entity: StepRun,
         entity_qc: EntityQCStatus | None = None,
-        sample_data: Iterable[tuple[str, Any]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] | None = None,
     ) -> EntityQCStatus:
@@ -105,8 +108,10 @@ class StepQCEvaluator(EntityQCEvaluator):
             The step run to evaluate.
         entity_qc : EntityQCStatus | None
             Optional existing QC status to update. If None, uses step_run.qc.
-        sample_data : Iterable[tuple[str, Any]] | None
-            Not used for step QC.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader (not used for step QC).
+        dataloader_context : dict[str, Any] | None
+            Optional context (not used for step QC).
         context : dict[str, Any] | None
             Optional metadata to attach to the QC status.
 
@@ -123,7 +128,8 @@ class StepQCEvaluator(EntityQCEvaluator):
         self,
         entity: StepRun,
         entity_qc: EntityQCStatus | None = None,
-        all_samples: Iterable[tuple[str, Any]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] | None = None,
     ) -> EntityQCStatus:
@@ -203,8 +209,9 @@ class StepQCEvaluator(EntityQCEvaluator):
         self,
         entity_qc: EntityQCStatus,
         table_type: str = "per_sample_step",
-        sample_data: Iterable[tuple[str, Any]] | None = None,
-        table_dir: PathLike | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        table_path: PathLike | None = None,
     ) -> pd.DataFrame:
         """Generate tables from step-level QC status.
 
@@ -219,21 +226,23 @@ class StepQCEvaluator(EntityQCEvaluator):
             - "per_sample": Summary per sample with overall flag and counts
             - "per_step": Summary per step with sample-level flag counts and rates
             - "per_test": Summary per test (test_type/test_name) with flag counts and rates
-        sample_data : Iterable[tuple[str, Any]] | None
-            Optional iterable of (sample_id, data) tuples for filtering results.
-            If provided, only samples in this iterable are included.
-            If None, includes all samples in entity_qc.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading additional data if needed.
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader.
+        table_path : PathLike | None
+            Optional output path to save the table.
 
         Returns
         -------
         pd.DataFrame
             Table in the requested format.
         """
-        # Determine which samples to include
-        if sample_data is None:
-            sample_filter = set(entity_qc.sample_qc.keys())
-        else:
-            sample_filter = set(sid for sid, _ in sample_data)
+        # Default context to empty dict to avoid None checks
+        dataloader_context = dataloader_context or {}
+
+        # Use sample_ids from context if provided, otherwise use all samples
+        sample_filter = set(dataloader_context.get("sample_ids") or entity_qc.sample_qc.keys())
 
         df_all = self._generate_all_tests(entity_qc, sample_filter)
         df_sample_step = self._aggregate_per_sample_step(df_all)
@@ -617,7 +626,8 @@ class StepQCEvaluator(EntityQCEvaluator):
         self,
         entity_qc: EntityQCStatus,
         test_key: Any,
-        sample_data: Iterable[tuple[str, Any]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
         figure_dir: PathLike | None = None,
         **kwargs: Any,
@@ -634,11 +644,14 @@ class StepQCEvaluator(EntityQCEvaluator):
         test_key : Any
             Visualization type identifier:
             - "heatmap": Samples as rows, steps as columns, colored by flag
-        sample_data : Mapping[str, Any] | None
-            Optional sample data mapping for filtering samples.
-            If provided, only samples in this mapping are included.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading additional data if needed.
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader.
         step_id : str | None
             Unused for step-level QC (placeholder for interface compatibility).
+        figure_dir : PathLike | None
+            Optional directory to save the figure.
         **kwargs : Any
             Additional plotting options (passed to visualization functions).
 
@@ -654,7 +667,7 @@ class StepQCEvaluator(EntityQCEvaluator):
         """
         # Dispatch to appropriate visualization function
         if test_key == "heatmap":
-            return self._generate_heatmap_figure(entity_qc, sample_data, **kwargs)
+            return self._generate_heatmap_figure(entity_qc, **kwargs)
         else:
             available = ["heatmap"]
             raise ValueError(
@@ -665,7 +678,6 @@ class StepQCEvaluator(EntityQCEvaluator):
     def _generate_heatmap_figure(
         self,
         entity_qc: EntityQCStatus,
-        sample_data: Iterable[tuple[str, Any]] | None = None,
         **kwargs: Any,
     ) -> go.Figure:
         """Generate a scatter plot of samples vs steps with flags.
@@ -674,9 +686,6 @@ class StepQCEvaluator(EntityQCEvaluator):
         ----------
         entity_qc : EntityQCStatus
             The QC status object.
-        sample_data : Iterable[tuple[str, Any]] | None
-            Optional iterable of (sample_id, data) tuples for filtering samples.
-            If provided, only samples in this iterable are included.
         **kwargs : Any
             Additional plotting options (e.g., height, width adjustments).
 
@@ -686,10 +695,7 @@ class StepQCEvaluator(EntityQCEvaluator):
             Plotly scatter plot figure with square markers colored by flag.
         """
         # Determine which samples to include
-        if sample_data is None:
-            sample_filter = set(entity_qc.sample_qc.keys())
-        else:
-            sample_filter = set(sid for sid, _ in sample_data)
+        sample_filter = set(entity_qc.sample_qc.keys())
 
         # Generate long format
         df_long = self._generate_long_format(entity_qc, sample_filter)

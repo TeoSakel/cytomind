@@ -4,14 +4,11 @@ Compensation QC Evaluator.
 Performs detailed QC analysis on compensated data using statistical tests.
 """
 from __future__ import annotations
-from logging import warn
-from math import e
 from typing import Any, Hashable, Iterable, Mapping, TYPE_CHECKING
 from pathlib import Path
 import warnings
 
 import numpy as np
-import pandas as pd
 from scipy.stats import median_abs_deviation as mad, spearmanr
 
 import plotly.graph_objects as go
@@ -26,12 +23,12 @@ from .base import EntityQCEvaluator, QCTester
 
 if TYPE_CHECKING:
     from anndata import AnnData
-    from cytomind.infra.repo import ProjectRepository
+    from cytomind.infra.dataloader import UnifiedDataLoader
     from cytomind.domain.flow import CompensationRef
     from cytomind.domain.constants import PathLike
 else:
     AnnData = object
-    ProjectRepository = object
+    UnifiedDataLoader = object
     CompensationRef = object
     PathLike = object
 
@@ -46,7 +43,13 @@ def _validate_percentage(name: str, value: float) -> None:
 	if not (0.0 <= value <= 1.0):
 		raise ValueError(f"{name} must be in [0, 1] range.")
 
-def _validate_warn_severe(warn_name: str, warn: float, severe_name: str, severe: float, are_percentage: bool=True) -> None:
+def _validate_warn_severe(
+    warn_name: str,
+    warn: float,
+    severe_name: str,
+    severe: float,
+    are_percentage: bool=True
+) -> None:
 	"""Validate two percentage thresholds: each in [0,1] and severe >= warn."""
 	if are_percentage:
 		_validate_percentage(warn_name, warn)
@@ -59,12 +62,15 @@ def _validate_warn_severe(warn_name: str, warn: float, severe_name: str, severe:
 # QC Test Classes
 # ============================================================================
 
+# TODO: Refactor tests based on common test_type to reduce code duplication
+
 class NegativeFluorescenceTest(QCTester):
     """Test for negative fluorescence in a single channel."""
 
     test_type = "compensation_channel"
     test_name = "negative_fluorescence"
-    key_fields = ("compensation_id", "channel")
+    target_keys = ("compensation_id", "sample_id", "mask")
+    meta_keys = ("channel",)
     default_config = {}
     default_thresholds = {"ratio_neg": (0.15, 0.30)} # warn, severe thresholds for ratio of negative events
     plot_type = "histogram"
@@ -83,39 +89,112 @@ class NegativeFluorescenceTest(QCTester):
     def neg_severe(self) -> float:
         return self.thresholds["ratio_neg"][1]
 
+    def _yield_skip_channel_records(
+        self,
+        entity: CompensationRef,
+        targets: dict[str, Any],
+        message: str = "No events to test.",
+    ) -> Iterable[QCTestRecord]:
+        """Yield skip records for all channels."""
+        for channel in entity.detectors:
+            metadata = {"channel": channel}
+            yield QCTestRecord(
+                id=self.make_key(targets, metadata),
+                test_type=self.test_type,
+                test_name=self.test_name,
+                targets=targets,
+                metadata=metadata,
+                thresholds=self.thresholds,
+                metrics={"ratio_neg": 0.0},
+                status="SKIP",
+                message=message,
+            )
+
     def fit(
         self,
         entity: CompensationRef,
+        targets: dict[str, Any],
         adata: AnnData,
-        channel: str | None = None,
+        *,
+        mask: dict[str, np.ndarray] | None = None,
+        **kwargs
+    ) -> Iterable[QCTestRecord]:
+        """Compute test metrics for all channels in entity.detectors.
+
+        Yields one QCTestRecord per channel.
+        """
+        mask_key = targets.get("mask", "root")
+        if adata.X is None or adata.n_obs == 0:
+            yield from self._yield_skip_channel_records(
+                entity,
+                targets,
+                message="No events to test."
+            )
+            return
+
+        # Handle mask parameter for subsetting (should be single parent mask only)
+        if mask is not None:
+            mask_array = mask[mask_key]
+            adata = adata[mask_array]
+        elif mask_key != "root":
+            raise ValueError(
+                f"Mask key '{mask_key}' specified in targets but no mask provided."
+                "Mask parameter should contain only parent mask, not multiple gates."
+            )
+
+        if adata.n_obs == 0:
+            yield from self._yield_skip_channel_records(
+                entity,
+                targets,
+                message="No events to test (empty after mask)."
+            )
+            return
+
+        # Iterate through all channels
+        for channel in entity.detectors:
+            if channel not in adata.var_names:
+                # Skip channels not in adata
+                metadata = {"channel": channel}
+                test = QCTestRecord(
+                    id=self.make_key(targets, metadata),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=metadata,
+                    thresholds=self.thresholds,
+                    metrics={"ratio_neg": 0.0},
+                    status="SKIP",
+                    message=f"Channel '{channel}' not found in adata.",
+                )
+                yield test
+                continue
+
+            # Extract values for this channel
+            values = adata[:, channel].X.ravel() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+
+            # Compute ratio of negative events
+            ratio_neg = float(np.mean(values < 0))
+
+            metadata = {"channel": channel}
+            test = QCTestRecord(
+                id=self.make_key(targets, metadata),
+                test_type=self.test_type,
+                test_name=self.test_name,
+                targets=targets,
+                metadata=metadata,
+                thresholds=self.thresholds,
+                metrics={"ratio_neg": ratio_neg},
+                status="PENDING",
+            )
+            yield test
+
+    def classify(
+        self,
+        test: QCTestRecord,
+        neg_warn: float | None = None,
+        neg_severe: float | None = None,
         **kwargs
     ) -> QCTestRecord:
-        """Compute test metrics."""
-        if channel is None:
-            raise ValueError("Channel name must be provided for NegativeFluorescenceTest.")
-
-        metadata = {"compensation_id": entity.id, "channel": channel}
-        test = QCTestRecord(
-            id = self.make_key(metadata),
-            test_type=self.test_type,
-            test_name=self.test_name,
-            metadata=metadata,
-            thresholds=self.thresholds,
-            metrics={"ratio_neg": 0.0},
-            status="PENDING",
-        )
-
-        if adata.X is None or adata.n_obs == 0:
-            test.status = "SKIP"
-            test.message = "No events to test."
-            return test
-
-        values = adata[:, channel].X.ravel() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
-        test.metrics["ratio_neg"] = np.mean(values < 0)
-
-        return test
-
-    def classify(self, test: QCTestRecord, neg_warn: float | None = None, neg_severe: float | None = None, **kwargs) -> QCTestRecord:
         """Classify test results based on thresholds."""
         _neg_warn = neg_warn if neg_warn is not None else self.neg_warn
         _neg_severe = neg_severe if neg_severe is not None else self.neg_severe
@@ -191,7 +270,8 @@ class VeryNegativeFluorescenceTest(QCTester):
 
     test_type = "compensation_channel"
     test_name = "very_negative_fluorescence"
-    key_fields = ("compensation_id", "channel")
+    target_keys = ("compensation_id", "sample_id", "mask")
+    meta_keys = ("channel",)
 
     default_config = {
         "min_neg_events_for_sigma": 50,
@@ -216,7 +296,13 @@ class VeryNegativeFluorescenceTest(QCTester):
             raise ValueError("k_sigma_threshold must be positive.")
 
         # Validate thresholds
-        _validate_warn_severe("ratio_very_neg", self.very_warn, "ratio_very_neg", self.very_severe, are_percentage=True)
+        _validate_warn_severe(
+            "ratio_very_neg",
+            self.very_warn,
+            "ratio_very_neg",
+            self.very_severe,
+            are_percentage=True
+        )
 
     @property
     def very_warn(self) -> float:
@@ -226,69 +312,129 @@ class VeryNegativeFluorescenceTest(QCTester):
     def very_severe(self) -> float:
         return self.thresholds["ratio_very_neg"][1]
 
+    def _yield_skip_channel_records(
+        self,
+        entity: CompensationRef,
+        targets: dict[str, Any],
+        min_neg_events: int,
+        k_sigma_threshold: float,
+        message: str = "No events to test.",
+    ) -> Iterable[QCTestRecord]:
+        """Yield skip records for all channels."""
+        for channel in entity.detectors:
+            metadata = {
+                "channel": channel,
+                "min_events_for_sigma": min_neg_events,
+                "k_sigma_threshold": k_sigma_threshold,
+            }
+            yield QCTestRecord(
+                id=self.make_key(targets, metadata),
+                test_type=self.test_type,
+                test_name=self.test_name,
+                targets=targets,
+                metadata=metadata,
+                metrics={"ratio_very_neg": 0.0},
+                status="SKIP",
+                message=message,
+            )
+
     def fit(
         self,
         entity: CompensationRef,
+        targets: dict[str, Any],
         adata: AnnData,
-        channel: str | None = None,
+        *,
+        mask: dict[str, np.ndarray] | None = None,
         **kwargs
-    ) -> QCTestRecord:
-        """Compute test metrics."""
-        if channel is None:
-            raise ValueError("Channel name must be provided for VeryNegativeFluorescenceTest.")
+    ) -> Iterable[QCTestRecord]:
+        """Compute test metrics for all channels in entity.detectors.
 
-        # Extract channel values
+        Yields one QCTestRecord per channel.
+        """
+        # Extract config once
         min_neg_events = int(self.metadata["min_neg_events_for_sigma"])
         k_sigma_threshold = float(self.metadata["k_sigma_threshold"])
-
-        metadata = {
-            "compensation_id": entity.id,
-            "channel": channel,
-            "min_events_for_sigma": min_neg_events,
-            "k_sigma_threshold": k_sigma_threshold,
-        }
-        test = QCTestRecord(
-            id = self.make_key(metadata),
-            test_type=self.test_type,
-            test_name=self.test_name,
-            metadata=metadata,
-            metrics={"ratio_very_neg": 0.0},
-            status="PENDING",
-        )
+        mask_key = targets.get("mask", "root")
 
         if adata.X is None or adata.n_obs == 0:
-            test.status = "SKIP"
-            test.message = "No events to test."
-            return test
+            yield from self._yield_skip_channel_records(
+                entity,
+                targets,
+                min_neg_events,
+                k_sigma_threshold,
+                message="No events to test.",
+            )
+            return
 
-        values = adata[:, channel].X.ravel() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
-        neg_mask = values < 0  # Basic negative statistics
-        # Robust sigma estimation
-        try:
-            sigma_global: float = mad(values, scale=1.4826)
-        except Exception:
-            sigma_global = 1.
+        # Handle mask parameter for subsetting (should be single parent mask only)
+        if mask is not None:
+            mask_array = mask[mask_key]
+            adata = adata[mask_array]
+        elif mask_key != "root":
+            raise ValueError(
+                f"Mask key '{mask_key}' specified in targets but no mask provided."
+                "Mask parameter should contain only parent mask, not multiple gates."
+            )
 
-        if not np.isfinite(sigma_global) or sigma_global <= 0:
-            sigma_global = 1.
+        if adata.n_obs == 0:
+            yield from self._yield_skip_channel_records(
+                entity,
+                targets,
+                min_neg_events,
+                k_sigma_threshold,
+                message="No events to test (empty after mask).",
+            )
+            return
 
-        # Per-channel robust sigma from negative values if sufficient data
-        sigma_neg = sigma_global  # standard deviation of negative values
-        if neg_mask.sum() >= min_neg_events:
+        # Iterate through all channels
+        missing = [channel for channel in entity.detectors if channel not in adata.var_names]
+        if missing:
+            raise ValueError(f"Channels not found in adata: {', '.join(missing)}")
+
+        for channel in entity.detectors:
+            values = adata[:, channel].X.ravel() # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            neg_mask = values < 0  # Basic negative statistics
+
+            # Robust sigma estimation
             try:
-                sigma_neg: float = mad(values[neg_mask], scale=1.4826)
+                sigma_global: float = mad(values, scale=1.4826)
             except Exception:
-                pass
-            if not np.isfinite(sigma_neg) or sigma_neg <= 0:
-                sigma_neg = sigma_global
+                sigma_global = 1.
 
-        # very negatives
-        very_cutoff = -k_sigma_threshold * sigma_neg
-        test.metadata["very_neg_cutoff"] = very_cutoff
-        test.metadata["sigma_negative"] = sigma_neg
-        test.metrics["ratio_very_neg"] = np.mean(values < very_cutoff)
+            if not np.isfinite(sigma_global) or sigma_global <= 0:
+                sigma_global = 1.
 
-        return test
+            # Per-channel robust sigma from negative values if sufficient data
+            sigma_neg = sigma_global  # standard deviation of negative values
+            if neg_mask.sum() >= min_neg_events:
+                try:
+                    sigma_neg: float = mad(values[neg_mask], scale=1.4826)
+                except Exception:
+                    pass
+                if not np.isfinite(sigma_neg) or sigma_neg <= 0:
+                    sigma_neg = sigma_global
+
+            # very negatives
+            very_cutoff = -k_sigma_threshold * sigma_neg
+            ratio_very_neg = float(np.mean(values < very_cutoff))
+
+            metadata = {
+                "channel": channel,
+                "min_events_for_sigma": min_neg_events,
+                "k_sigma_threshold": k_sigma_threshold,
+                "very_neg_cutoff": very_cutoff,
+                "sigma_negative": sigma_neg,
+            }
+            test = QCTestRecord(
+                id=self.make_key(targets, metadata),
+                test_type=self.test_type,
+                test_name=self.test_name,
+                targets=targets,
+                metadata=metadata,
+                metrics={"ratio_very_neg": ratio_very_neg},
+                status="PENDING",
+            )
+            yield test
 
     def classify(self, test: QCTestRecord, **kwargs) -> QCTestRecord:
         """Classify test results based on thresholds."""
@@ -380,13 +526,14 @@ class NegativeEnrichmentTest(QCTester):
 
     test_type = "compensation_pair"
     test_name = "negative_enrichment"
-    key_fields = ("compensation_id", "donor_channel", "receiver_channel")
+    target_keys = ("compensation_id", "sample_id", "mask")
+    meta_keys = ("donor_channel", "receiver_channel")
 
     default_config = {
         "high_quantile": 0.99,
         "min_high_events": 1000,
     }
-    default_thresholds = {"p_neg_given_high_donor": (0.05, 0.15)} # warn, severe thresholds for proportion of negative receiver events given high donor values
+    default_thresholds = {"p_neg_given_high_donor": (0.05, 0.15)}
     plot_type = "scatter"
     plot_description = "Donor-receiver fluorescence correlation in high-donor population"
 
@@ -413,68 +560,125 @@ class NegativeEnrichmentTest(QCTester):
         severe_val = self.thresholds.get("p_neg_given_high_donor", (0.05, 0.15))[1]
         _validate_warn_severe("p_neg_given_high_donor", warn_val, "p_neg_given_high_donor", severe_val)
 
+    def _yield_skip_pair_records(
+        self,
+        entity: CompensationRef,
+        targets: dict[str, Any],
+        message: str = "No events to test.",
+    ) -> Iterable[QCTestRecord]:
+        """Yield skip records for all donor-receiver pairs."""
+        high_quantile = self.metadata["high_quantile"]
+        for donor in entity.detectors:
+            for receiver in entity.detectors:
+                if donor == receiver:
+                    continue
+                metadata = {
+                    "donor_channel": donor,
+                    "receiver_channel": receiver,
+                    "compensation_coefficient": entity.spill.at[receiver, donor],
+                    "high_quantile": high_quantile,
+                }
+                yield QCTestRecord(
+                    id=self.make_key(targets, metadata),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=metadata,
+                    metrics={
+                        "p_neg_given_high_donor": 0.0,
+                        "p_neg_given_low_donor": 0.0,
+                    },
+                    status="SKIP",
+                    message=message,
+                )
+
     def fit(
         self,
         entity: CompensationRef,
+        targets: dict[str, Any],
         adata: AnnData,
-        donor: str | None = None,
-        receiver: str | None = None,
+        *,
+        mask: dict[str, np.ndarray] | None = None,
         **kwargs
-    ) -> QCTestRecord:
-        if donor is None or receiver is None:
-            raise ValueError("Donor and receiver channel names must be provided for NegativeEnrichmentTest.")
+    ) -> Iterable[QCTestRecord]:
+        """Compute test metrics for all donor-receiver pairs.
 
+        Yields one QCTestRecord per pair.
+        """
         high_quantile = self.metadata["high_quantile"]
         min_high_events = self.metadata["min_high_events"]
-        coef = entity.spill.at[receiver, donor]
-
-        # Initialize test
-        metadata = {
-            "compensation_id": entity.id,
-            "donor_channel": donor,
-            "receiver_channel": receiver,
-            "compensation_coefficient": coef,
-            "high_quantile": high_quantile,
-        }
-        test = QCTestRecord(
-            id=self.make_key(metadata),
-            test_type=self.test_type,
-            test_name=self.test_name,
-            metadata=metadata,
-            metrics={
-                "p_neg_given_high_donor": 0.0,
-                "p_neg_given_low_donor": 0.0,
-            },
-            status="PENDING"
-        )
+        mask_key = targets.get("mask", "root")
 
         if adata.X is None or adata.n_obs == 0:
-            test.status = "SKIP"
-            test.message = "No events to test."
-            return test
+            yield from self._yield_skip_pair_records(entity, targets, message="No events to test.")
+            return
 
-        # Extract channel values
-        donor_values = np.asarray(adata[:, donor].X).ravel()
-        receiver_values = np.asarray(adata[:, receiver].X).ravel()
+        # Handle mask parameter for subsetting (should be single parent mask only)
+        if mask is not None:
+            mask_array = mask[mask_key]
+            adata = adata[mask_array]
+        elif mask_key != "root":
+            raise ValueError(
+                f"Mask key '{mask_key}' specified in targets but no mask provided."
+                "Mask parameter should contain only parent mask, not multiple gates."
+            )
 
-        # Identify events with high donor values based on quantile threshold,
-        # ensuring at least min_high_events are included
-        donor_thr = np.quantile(donor_values, high_quantile)
-        donor_high = donor_values >= donor_thr
-        n_high = donor_high.sum(dtype=int)
-        if n_high < min_high_events:
-            high_quantile = 1.0 - (min_high_events / len(donor_values))
+        if adata.n_obs == 0:
+            yield from self._yield_skip_pair_records(
+                entity,
+                targets,
+                message="No events to test (empty after mask)."
+            )
+            return
+
+        # Iterate through all donor-receiver pairs
+        for donor in entity.detectors:
+            donor_values = np.asarray(adata[:, donor].X).ravel()
+
+            # Compute donor threshold once (donor-specific, not receiver-specific)
             donor_thr = np.quantile(donor_values, high_quantile)
             donor_high = donor_values >= donor_thr
             n_high = donor_high.sum(dtype=int)
+            if n_high < min_high_events:
+                high_quantile_adj = 1.0 - (min_high_events / len(donor_values))
+                donor_thr = np.quantile(donor_values, high_quantile_adj)
+                donor_high = donor_values >= donor_thr
+                n_high = donor_high.sum(dtype=int)
 
-        test.metadata["n_donor_high"] = n_high
+            for receiver in entity.detectors:
+                if donor == receiver:
+                    continue
 
-        if n_high > 0:
-            test.metrics["p_neg_given_high_donor"] = np.mean(receiver_values[donor_high] < 0)
-            test.metrics["p_neg_given_low_donor"] = np.mean(receiver_values[~donor_high] < 0)
+                coef = entity.spill.at[receiver, donor]
+                metadata = {
+                    "donor_channel": donor,
+                    "receiver_channel": receiver,
+                    "compensation_coefficient": coef,
+                    "high_quantile": high_quantile,
+                    "n_donor_high": n_high,
+                }
+                test = QCTestRecord(
+                    id=self.make_key(targets, metadata),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=metadata,
+                    metrics={
+                        "p_neg_given_high_donor": 0.0,
+                        "p_neg_given_low_donor": 0.0,
+                    },
+                    status="PENDING"
+                )
 
-        return test
+                # Extract receiver values
+                receiver_values = np.asarray(adata[:, receiver].X).ravel()
+
+                if n_high > 0:
+                    test.metrics["p_neg_given_high_donor"] = \
+                        float(np.mean(receiver_values[donor_high] < 0))
+                    test.metrics["p_neg_given_low_donor"] = float(np.mean(receiver_values[~donor_high] < 0))
+
+                yield test
 
     def classify(
         self,
@@ -587,7 +791,8 @@ class HighDonorCorrelationTest(QCTester):
 
     test_type = "compensation_pair"
     test_name = "high_donor_correlation"
-    key_fields = ("compensation_id", "donor_channel", "receiver_channel")
+    target_keys = ("compensation_id", "sample_id", "mask")
+    meta_keys = ("donor_channel", "receiver_channel")
     default_config = {"high_quantile": 0.99, "min_high_events": 1000}
     default_thresholds = {"spearman_given_high_donor": (0.3, 0.5)} # warn, severe thresholds for Spearman correlation
     plot_type = "scatter"
@@ -603,63 +808,110 @@ class HighDonorCorrelationTest(QCTester):
         cor_severe = self.thresholds["spearman_given_high_donor"][1]
         _validate_warn_severe("spearman_given_high_donor_warn", cor_warn, "spearman_given_high_donor_severe", cor_severe)
 
+    def _yield_skip_pair_records(
+        self,
+        entity: CompensationRef,
+        targets: dict[str, Any],
+        message: str = "Not enough events to test.",
+    ) -> Iterable[QCTestRecord]:
+        """Yield skip records for all donor-receiver pairs."""
+        high_quantile = self.metadata["high_quantile"]
+        for donor in entity.detectors:
+            for receiver in entity.detectors:
+                if donor == receiver:
+                    continue
+                metadata = {
+                    "spillover_coefficient": entity.spill.at[receiver, donor],
+                    "donor_channel": donor,
+                    "receiver_channel": receiver,
+                    "high_quantile": high_quantile,
+                }
+                yield QCTestRecord(
+                    id=self.make_key(targets, metadata),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=metadata,
+                    metrics={"spearman_given_high_donor": 0.0},
+                    status="SKIP",
+                    message=message,
+                )
+
     def fit(
         self,
         entity: CompensationRef,
+        targets: dict[str, Any],
         adata: AnnData,
-        donor: str | None = None,
-        receiver: str | None = None,
+        *,
+        mask: dict[str, np.ndarray] | None = None,
         **kwargs
-    ) -> QCTestRecord:
-        if donor is None or receiver is None:
-            raise ValueError("Donor and receiver channel names must be provided for HighDonorCorrelationTest.")
+    ) -> Iterable[QCTestRecord]:
+        """Compute test metrics for all donor-receiver pairs.
 
-        donor_values = np.asarray(adata[:, donor].X).ravel()  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
-        receiver_values = np.asarray(adata[:, receiver].X).ravel()  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
-        coef = entity.spill.at[receiver, donor]
-
+        Yields one QCTestRecord per pair.
+        """
         high_quantile = self.metadata["high_quantile"]
         min_high_events = self.metadata["min_high_events"]
-        metadata = {
-            "compensation_id": entity.id,
-            "spillover_coefficient": coef,
-            "donor_channel": donor,
-            "receiver_channel": receiver,
-            "high_quantile": high_quantile,
-        }
-        test = QCTestRecord(
-            id=self.make_key(metadata),
-            test_type=self.test_type,
-            test_name=self.test_name,
-            metadata=metadata,
-            metrics={"spearman_given_high_donor": 0.0},
-            status="PENDING"
-        )
+        mask_key = targets.get("mask", "root")
 
         if adata.X is None or adata.n_obs <= min_high_events * 2:
-            test.status = "SKIP"
-            test.message = "Not enough events to test."
-            return test
+            yield from self._yield_skip_pair_records(entity, targets, message="Not enough events to test.")
+            return
 
-        # Identify events with high donor values based on quantile threshold
-        donor_thr = np.quantile(donor_values, high_quantile)
-        donor_high = donor_values >= donor_thr
-        n_high = donor_high.sum()
+        # Handle mask parameter for subsetting (should be single parent mask only)
+        if mask is not None:
+            mask_array = mask[mask_key]
+            adata = adata[mask_array]
 
-        # Ensure at least min_high_events are included
-        if n_high < min_high_events:
-            high_quantile = 1.0 - (min_high_events / len(donor_values))
+        if adata.X is None or adata.n_obs <= min_high_events * 2:
+            yield from self._yield_skip_pair_records(entity, targets, message="Not enough events to test (after mask).")
+            return
+
+        # Iterate through all donor-receiver pairs
+        for donor in entity.detectors:
+            donor_values = np.asarray(adata[:, donor].X).ravel()  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+
+            # Compute donor threshold once (donor-specific, not receiver-specific)
             donor_thr = np.quantile(donor_values, high_quantile)
             donor_high = donor_values >= donor_thr
             n_high = donor_high.sum()
 
-        test.metadata["high_threshold"] = donor_thr
-        test.metadata["n_donor_high"] = n_high
+            # Ensure at least min_high_events are included
+            if n_high < min_high_events:
+                high_quantile_adj = 1.0 - (min_high_events / len(donor_values))
+                donor_thr = np.quantile(donor_values, high_quantile_adj)
+                donor_high = donor_values >= donor_thr
+                n_high = donor_high.sum()
 
-        corr, _ = spearmanr(donor_values[donor_high], receiver_values[donor_high])  # pyright: ignore
-        test.metrics["spearman_given_high_donor"] = corr  # pyright: ignore
+            for receiver in entity.detectors:
+                if donor == receiver:
+                    continue
 
-        return test
+                receiver_values = np.asarray(adata[:, receiver].X).ravel()  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                coef = entity.spill.at[receiver, donor]
+
+                metadata = {
+                    "spillover_coefficient": coef,
+                    "donor_channel": donor,
+                    "receiver_channel": receiver,
+                    "high_quantile": high_quantile,
+                    "high_threshold": donor_thr,
+                    "n_donor_high": n_high,
+                }
+                test = QCTestRecord(
+                    id=self.make_key(targets, metadata),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=metadata,
+                    metrics={"spearman_given_high_donor": 0.0},
+                    status="PENDING"
+                )
+
+                corr, _ = spearmanr(donor_values[donor_high], receiver_values[donor_high])  # pyright: ignore
+                test.metrics["spearman_given_high_donor"] = corr  # pyright: ignore
+
+                yield test
 
     def classify(
         self,
@@ -979,6 +1231,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     """QC evaluator for compensation entities."""
 
     entity_type = "compensation"
+    targets = ("compensation_id", "sample_id", "mask")
     _supported_tables = {
         "compensation_channel": {
             "description": "Per-channel negative fluorescence metrics across samples",
@@ -992,7 +1245,6 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     _supported_figures = {}  # Test plots are auto-discovered from registered tests
 
     default_config = {
-        "compute_pairwise": True,
         "subsample": 1.0,
         "high_quantile": 0.95,
         "neg_warn": 0.15,
@@ -1009,7 +1261,8 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         "transform_func": "logicle",
     }
 
-    def get_tests(self, entity: CompensationRef | None = None) -> dict[str, type[QCTester]]:
+    @classmethod
+    def get_tests(cls, entity: CompensationRef | None = None) -> dict[str, type[QCTester]]:
         """Return dictionary of test classes for compensation QC.
 
         Parameters
@@ -1032,8 +1285,8 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     def required_layer(self, entity: CompensationRef | None = None) -> str:
         return "comp"
 
-    def load_entity(self, repo: ProjectRepository, entity_id: Hashable) -> CompensationRef:
-        project = repo.load_project()
+    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> CompensationRef:
+        project = dataloader.load_data("project")
         if entity_id not in project.compensations:
             raise KeyError(f"Compensation '{entity_id}' not found in project.")
         return project.compensations[str(entity_id)]
@@ -1042,7 +1295,8 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         self,
         entity: CompensationRef,
         entity_qc: EntityQCStatus,
-        sample_data: Iterable[tuple[str, AnnData]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
     ) -> EntityQCStatus:
@@ -1052,11 +1306,12 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         ----------
         entity : CompensationRef
             The compensation entity to evaluate.
-        entity_qc : EntityQCStatus | None
-            Optional existing QC status to update. If None, creates a new one.
-        sample_data : dict[str, AnnData]
-            Dictionary mapping sample_id to compensated AnnData.
-            If None, no samples will be evaluated.
+        entity_qc : EntityQCStatus
+            QC status to update.
+        dataloader : UnifiedDataLoader | None
+            UnifiedDataLoader for loading sample data on the fly
+        dataloader_context : dict[str, Any] | None
+            Context with sample_ids, layer, etc. or specific pre-loaded adata
         context : dict[str, Any]
             Optional metadata to attach to the QC status.
 
@@ -1065,14 +1320,31 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         EntityQCStatus
             Updated QC status with test results and summary.
         """
+        # Default context to empty dict to avoid None checks
+        dataloader_context = dataloader_context or {}
+
         config = self.config.copy()
         config.update(context)
         entity_qc.context = config
 
-        if sample_data is None:
-            raise ValueError("No sample data provided for compensation QC evaluation.")
+        # Create adata iterator - either from pre-loaded data or via dataloader
+        if "adata" in dataloader_context:
+            # Use pre-loaded tuple iterator of (sample_id, adata)
+            adata_iter = dataloader_context["adata"]
+        elif dataloader is not None:
+            # Create iterator by loading data on the fly
+            sample_ids = dataloader_context.get("sample_ids") or list(entity_qc.sample_qc.keys())
+            layer = self.required_layer(entity)
+            adata_iter = ((sid, dataloader.load_adata(sid, layer=layer)) for sid in sample_ids)
+        else:
+            # No data source available - raise error
+            raise ValueError(
+                "Cannot evaluate compensation QC: dataloader_context must contain 'adata' "
+                "or a dataloader must be provided to load sample data."
+            )
 
-        for sample_id, adata in sample_data:
+        # Process all samples from the iterator
+        for sample_id, adata in adata_iter:
             self.check_compensated_adata(
                 entity=entity,
                 adata=adata,
@@ -1086,7 +1358,8 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         self,
         entity: CompensationRef,
         entity_qc: EntityQCStatus,
-        all_samples: Iterable[tuple[str, AnnData]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
     ) -> EntityQCStatus:
@@ -1151,7 +1424,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         all_tests: dict[str, list[tuple[str, QCTestRecord]]] = {"channel": [], "pairwise": []}
 
         # Call stateless function to get all test results
-        tests = self._run_compensation_tests(entity, adata, config=entity_qc.context)
+        tests = self._run_compensation_tests(entity, adata, sample_id=sample_id, config=entity_qc.context)
         step = entity_qc.get_sample_steps(sample_id).get_step("COMP_QC_OVERVIEW")
 
         # Separate into channel and pairwise
@@ -1176,8 +1449,9 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     def generate_figure(
         self,
         entity_qc: EntityQCStatus,
-        test_key: tuple | Mapping[str, str],
-        sample_data: Iterable[tuple[str, AnnData]] | None = None,
+        test_key: Mapping[str, str],
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
         figure_dir: PathLike | None = None,
         **kwargs
@@ -1190,30 +1464,65 @@ class CompensationQCEvaluator(EntityQCEvaluator):
             The QC status object containing test records.
         test_key : Hashable
             Test key to look up in the QC status (from QCStepStatus.tests).
-        sample_data : Mapping[str, AnnData] | None
-            Mapping of sample_id to compensated AnnData for plotting.
-            Must contain exactly one entry. Cannot be None.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading sample data (AnnData) for plotting.
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader (e.g., sample_id or sample_ids, layer).
+            Can optionally contain 'adata' with an iterable of (sample_id, adata) tuples.
+            If 'adata' not provided, it will be created on-the-fly from dataloader.
+            Note: Only single-sample figures are currently supported; multiple samples will raise an error.
         step_id : str | None
             Optional step ID to narrow down the search for the test.
             If None, searches all steps for the sample and returns the first match.
+        figure_dir : PathLike | None
+            Optional directory to save the figure.
 
         Returns
         -------
         go.Figure
             Plotly figure object ready to be serialized or displayed.
-        """
-        # Validate that sample_data is provided and contains exactly one (sample_id, adata) pair
-        if sample_data is None:
-            raise ValueError("generate_figure requires sample_data to be provided (cannot be None)")
 
-        sample_data = iter(sample_data)  # Ensure it's an iterator
-        sample_id, adata = next(sample_data)
-        try:
-            next(sample_data)
-            warnings.warn("generate_figure expects sample_data to contain exactly one (sample_id, adata) pair. Additional entries will be ignored.")
-        except StopIteration:
-            pass
-        # TODO: allow multiple samples to create a facet plot if multiple entries are provided?
+        Raises
+        ------
+        ValueError
+            If multiple samples are provided (faceted plots planned for future).
+        """
+        # Default context to empty dict to avoid None checks
+        dataloader_context = dataloader_context or {}
+
+        # Get sample_id: support both singular 'sample_id' and plural 'sample_ids'
+
+        # Build adata iterator: either from context or create on-the-fly from dataloader
+        if "adata" in dataloader_context:
+            # Use provided iterable of (sample_id, adata) tuples
+            adata_itr: Iterable[tuple[str, AnnData]] = dataloader_context["adata"]
+            sample_id, adata = next(iter(adata_itr), (None, None))
+        else:
+            # Create iterator on-the-fly from dataloader
+            if dataloader is None:
+                raise ValueError("dataloader must be provided if 'adata' is not in dataloader_context")
+
+            sample_ids: list[str] = list(dataloader_context.get("sample_ids") or entity_qc.sample_qc.keys())
+
+            # Validate and resolve sample_id
+            if len(sample_ids) > 1:
+                raise NotImplementedError(
+                    f"Multiple samples ({len(sample_ids)}) are not yet supported for figure generation. "
+                    "Faceted plots will be supported in a future release."
+                )
+            if len(sample_ids) == 0:
+                raise ValueError("sample_ids must not be empty")
+            # adata_itr = (
+            #     (sample_id, dataloader.load_adata(sample_id, layer="comp"))
+            #     for sample_id in sample_ids
+            # )
+            sample_id = sample_ids[0]
+            layer = self.required_layer()
+            adata = dataloader.load_adata(sample_id, layer="comp")
+
+
+        if adata is None:
+            raise ValueError(f"No AnnData found for sample {sample_id}")
 
         # Retrieve QC status for the sample
         if sample_id not in entity_qc.sample_qc:
@@ -1245,209 +1554,68 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         tester = tester_class.from_dict(test)
         return tester.plot(adata=adata, test=test)
 
-    def generate_table(
-        self,
-        entity_qc: EntityQCStatus,
-        table_type: str = "compensation_channel",
-        sample_data: Iterable[tuple[str, AnnData]] | None = None,
-        table_dir: PathLike | None = None,
-    ) -> pd.DataFrame:
-        """Generate a table for a compensation entity on demand.
-
-        Reconstructs the specified table (channel_tests or pairwise_tests) from
-        the stored test records in the QC status.
-
-        Parameters
-        ----------
-        entity_qc : EntityQCStatus
-            The QC status object containing test records.
-        table_type : str, default "channel_tests"
-            Type of table to generate: "channel_tests" or "pairwise_tests".
-        sample_data : Iterable[tuple[str, AnnData]] | None
-            Optional iterable of (sample_id, AnnData) tuples. If provided, results
-            will be filtered to only include samples in this iterable.
-            If None, returns all samples in the QC status.
-
-        Returns
-        -------
-        pd.DataFrame
-            Table with columns matching the QC output format.
-            For channel_tests: sample_id, compensation, channel, test_name, status,
-                              metric_name, metric_value.
-            For pairwise_tests: sample_id, compensation, coefficient, donor, receiver,
-                                test_name, status, metric_name, metric_value.
-        """
-        if sample_data is None:
-            sample_filter = set(entity_qc.sample_qc.keys())
-        else:
-            sample_filter = set(sid for sid, _ in sample_data)
-
-        test_types = self.get_test_types()
-        if table_type not in test_types:
-            raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
-
-        records = []
-        tests = self.get_tests(entity=None)
-        for sample_id, sample_run in entity_qc.sample_qc.items():
-            if sample_id not in sample_filter:
-                continue
-
-            for step in sample_run.steps.values():
-                for test in step.tests.values():
-                    if test.test_type != table_type:
-                        continue
-                    try:
-                        tester_class = tests[test.test_name]
-                    except KeyError:
-                        valid_names = [key for key, val in tests.items() if val.test_type == table_type]
-                        raise KeyError(f"Unknown test_name '{test.test_name}' for table_type '{table_type}'. Valid names are: {valid_names}")
-
-                    tester = tester_class.from_dict(test)
-                    key_dict = tester.key_dict(test.metadata)
-                    records.append({
-                        "sample_id": sample_id,
-                        "status": test.status,
-                        **key_dict,
-                        **test.metrics,
-                    })
-
-        if not records:
-            return pd.DataFrame()
-
-        df = pd.DataFrame.from_records(records)
-        id_vars = ["sample_id"] + list(key_dict.keys()) + ["status"] # pyright: ignore[reportPossiblyUnboundVariable]
-        df = df.melt(id_vars=[col for col in id_vars if col in df.columns], var_name="metric_name", value_name="metric_value")
-        df = df.dropna(subset=["metric_value"])
-
-        if table_dir is not None:
-            table_dir = Path(table_dir)
-            table_dir.mkdir(parents=True, exist_ok=True)
-            output_path = table_dir / f"{table_type}_table.csv"
-            if output_path.exists():
-                warnings.warn(f"Output path {output_path} already exists and will be updated with new samples.")
-                old = pd.read_csv(output_path, index_col=False)
-                self._update_qc_table(old, df).to_csv(output_path, index=False)
-            else:
-                df.to_csv(output_path, index=False)
-
-        return df
-
-    @staticmethod
-    def _update_qc_table(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
-        """Helper to update an existing QC table with new results based on key columns."""
-        if df_old.empty:
-            return df_new
-        if df_new.empty:
-            return df_old
-
-        # Merge old and new on key columns, prioritizing new metrics and status
-        test_type_old = df_old["test_type"].iloc[0] if "test_type" in df_old.columns else "unknown"
-        test_type_new = df_new["test_type"].iloc[0] if "test_type" in df_new.columns else "unknown"
-        if test_type_old != test_type_new:
-            raise ValueError(f"Cannot merge tables with different test types: '{test_type_old}' vs '{test_type_new}'")
-        if not df_old.columns == df_new.columns:
-            raise ValueError("Old and new DataFrames must have the same columns to merge.")
-
-        new_samples = set(df_new["sample_id"].unique())
-        df_old_filtered = df_old[~df_old["sample_id"].isin(new_samples)]
-        df_combined = pd.concat([df_old_filtered, df_new], ignore_index=True)
-        return df_combined
-
-
-    def _run_single_channel_tests(
-        self,
-        entity: CompensationRef,
-        adata: AnnData,
-        channel: str,
-        config: Mapping[str, Any]
-    ) -> Iterable[QCTestRecord]:
-        """Run negative-fluorescence checks for a single channel."""
-
-        neg_test_obj = NegativeFluorescenceTest(
-            thresholds={"ratio_neg": (config.get("neg_warn", self.default_config["neg_warn"]),
-                                      config.get("neg_severe", self.default_config["neg_severe"]))},
-        )
-        yield neg_test_obj.fit_classify(entity, adata, channel=channel)
-
-        very_neg_test_obj = VeryNegativeFluorescenceTest(
-            config={
-                "min_neg_events_for_sigma": config.get("min_neg_events_for_sigma", self.default_config["min_neg_events_for_sigma"]),
-                "k_sigma_threshold": config.get("k_sigma_threshold", self.default_config["k_sigma_threshold"]),
-            },
-            thresholds={"ratio_very_neg": (config.get("very_warn", self.default_config["very_warn"]),
-                                           config.get("very_severe", self.default_config["very_severe"]))},
-        )
-        yield very_neg_test_obj.fit_classify(entity, adata, channel=channel)
-
-    def _run_channel_pair_tests(
-        self,
-        entity: CompensationRef,
-        adata: AnnData,
-        donor: str,
-        receiver: str,
-        config: Mapping[str, Any],
-    ) -> Iterable[QCTestRecord]:
-        """Run pairwise donor->receiver checks."""
-
-        neg_enrich_test = NegativeEnrichmentTest(
-            config={
-                "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
-                "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
-            },
-            thresholds={
-                "p_neg_given_high_donor": (
-                    config.get("tail_neg_warn", self.default_config["tail_neg_warn"]),
-                    config.get("tail_neg_severe", self.default_config["tail_neg_severe"]),
-                ),
-            },
-        )
-        yield neg_enrich_test.fit_classify(
-            entity,
-            adata,
-            donor=donor,
-            receiver=receiver,
-        )
-
-        corr_test = HighDonorCorrelationTest(
-            config={
-                "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
-                "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
-            },
-            thresholds={
-                "spearman_given_high_donor": (
-                    config.get("tail_cor_warn", self.default_config["tail_cor_warn"]),
-                    config.get("tail_cor_severe", self.default_config["tail_cor_severe"]),
-                ),
-            },
-        )
-
-        yield corr_test.fit_classify(
-            entity,
-            adata,
-            donor=donor,
-            receiver=receiver,
-        )
-
     def _run_compensation_tests(
         self,
         entity: CompensationRef,
         adata: AnnData,
+        sample_id: str,
         config: Mapping[str, Any],
     ) -> Iterable[QCTestRecord]:
-        """Run all QC tests on compensated AnnData without step-level dependencies."""
+        """Run all compensation QC testers using a unified fit_classify interface."""
 
         missing = [channel for channel in entity.detectors if channel not in adata.var_names]
         if missing:
             raise ValueError(f"Channels {missing} from compensation entity not found in adata.var_names")
+        targets = {"compensation_id": entity.id, "sample_id": sample_id, "mask": "root"}  # TODO: handle multiple masks/gates in the future
 
-        for channel in entity.detectors:
-            yield from self._run_single_channel_tests(entity=entity, adata=adata, channel=channel, config=config)
+        testers: list[QCTester] = [
+            NegativeFluorescenceTest(
+                thresholds={
+                    "ratio_neg": (
+                        config.get("neg_warn", self.default_config["neg_warn"]),
+                        config.get("neg_severe", self.default_config["neg_severe"]),
+                    )
+                },
+            ),
+            VeryNegativeFluorescenceTest(
+                config={
+                    "min_neg_events_for_sigma": config.get(
+                        "min_neg_events_for_sigma", self.default_config["min_neg_events_for_sigma"]
+                    ),
+                    "k_sigma_threshold": config.get("k_sigma_threshold", self.default_config["k_sigma_threshold"]),
+                },
+                thresholds={
+                    "ratio_very_neg": (
+                        config.get("very_warn", self.default_config["very_warn"]),
+                        config.get("very_severe", self.default_config["very_severe"]),
+                    )
+                },
+            ),
+                NegativeEnrichmentTest(
+                    config={
+                        "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
+                        "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
+                    },
+                    thresholds={
+                        "p_neg_given_high_donor": (
+                            config.get("tail_neg_warn", self.default_config["tail_neg_warn"]),
+                            config.get("tail_neg_severe", self.default_config["tail_neg_severe"]),
+                        )
+                    },
+                ),
+                HighDonorCorrelationTest(
+                    config={
+                        "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
+                        "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
+                    },
+                    thresholds={
+                        "spearman_given_high_donor": (
+                            config.get("tail_cor_warn", self.default_config["tail_cor_warn"]),
+                            config.get("tail_cor_severe", self.default_config["tail_cor_severe"]),
+                        )
+                    },
+                ),
+            ]
 
-        if not config.get("compute_pairwise", True):
-            return
-
-        for donor in entity.detectors:
-            for receiver in entity.detectors:
-                if donor == receiver:
-                    continue
-                yield from self._run_channel_pair_tests(entity=entity, adata=adata, donor=donor, receiver=receiver, config=config)
+        for tester in testers:
+            yield from tester.fit_classify(entity=entity, targets=targets, adata=adata)

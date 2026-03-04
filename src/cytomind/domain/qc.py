@@ -56,6 +56,7 @@ class QCTestRecord:
     id: tuple                                                               # unique identifier for this test record
     test_type: str                                                          # refer to EntityQCEvalutor that generates this test
     test_name: str                                                          # the name of the test within the QC evaluator
+    targets: dict[str, Any] = field(default_factory=dict)                   # target identifiers (sample_id, compensation_id, strategy_id, etc.)
     metadata: dict[str, Any] = field(default_factory=dict)                  # context (gate_id, channel, cutpoint, bounds, etc.)
     metrics: dict[str, Numeric] = field(default_factory=dict)               # measured values (proportion_passing, r_squared, p_neg, etc.)
     thresholds: dict[str, Sequence[Numeric]] = field(default_factory=dict)  # threshold parameters (set by evaluator)
@@ -82,6 +83,7 @@ class QCTestRecord:
             test_type=data["test_type"],
             test_name=data["test_name"],
             id=tuple(data["id"]),
+            targets=data.get("targets", {}),
             metadata=data.get("metadata", {}),
             metrics=data.get("metrics", {}),
             thresholds=data.get("thresholds", {}),

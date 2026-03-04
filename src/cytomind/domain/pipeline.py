@@ -328,6 +328,8 @@ class StepRun:
         return cls(
             id=data["id"],
             step_type=data["step_type"],
+            status=data.get("status", "pending"),
+            created_at=data.get("created_at", ""),
             config=data.get("config", {}),
             inputs=data.get("inputs", {}),
             sample_outputs=data.get("sample_outputs", {}),
@@ -335,8 +337,6 @@ class StepRun:
             project_updates=data.get("project_updates", []),
             evaluable_products=data.get("evaluable_products", {}),
             _qc=qc,
-            status=data.get("status", "pending"),
-            created_at=data.get("created_at", ""),
         )
 
 

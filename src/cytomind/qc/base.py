@@ -4,9 +4,12 @@ Entity QC evaluators and registry.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
-from typing import Any, Hashable, Iterable, Mapping, Iterator, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Hashable, Mapping, Iterator, Iterable, TYPE_CHECKING
 import warnings
 
+import numpy as np
+import pandas as pd
 from anndata import AnnData
 
 from cytomind.infra.repo import ProjectRepository
@@ -18,11 +21,13 @@ from . import EntityQCEvaluatorRegistry
 if TYPE_CHECKING:
     from cytomind.domain.constants import PathLike
     from cytomind.domain.pipeline import StepRun
+    from cytomind.infra.dataloader import UnifiedDataLoader
     from pandas import DataFrame
     from plotly.graph_objects import Figure
 else:
     StepRun = object
     PathLike = object
+    UnifiedDataLoader = object
     Figure = object
     DataFrame = object
 
@@ -55,13 +60,15 @@ class QCTester(ABC):
 
     test_type: str                           # Evaluator type
     test_name: str                           # name of the test
-    key_fields: tuple[str, ...]              # Fields from metadata that uniquely identify this test instance (used for make_key)
+    target_keys: tuple[str, ...] = ()        # Fields from targets that identify tested entity instance(s)
+    meta_keys: tuple[str, ...] = ()          # Fields from metadata that identify tested dimensions
     default_config: dict[str, Any] = {}      # Default config parameters for the tester
     default_thresholds: dict[str, Any] = {}  # Default thresholds for classifying test results
-    plot_type: str = ""                       # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
-    plot_description: str = ""                # Human-readable description for frontend UI
+    plot_type: str = ""                      # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
+    plot_description: str = ""               # Human-readable description for frontend UI
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
+        # Keep a concrete, instance-level tuple for downstream code paths.
         cfg = dict(self.default_config)
         for key in cfg:
             if key in config:
@@ -73,31 +80,12 @@ class QCTester(ABC):
                 thres[key] = thresholds[key]
         self.thresholds = thres
 
-    @abstractmethod
-    def fit(self, entity: Any, adata: AnnData,  **kwargs) -> QCTestRecord:
-        """
-        Compute test metrics from AnnData.
+    @property
+    def key_fields(self) -> tuple[str, ...]:
+        return self.target_keys + ("test_type", "test_name") + self.meta_keys
 
-        Parameters
-        ----------
-        adata : AnnData
-            Annotated data object (may be subset or full sample)
-        plot_data : bool
-            If True, return additional data needed for plotting
-        **kwargs : dict
-            Entity-specific context (sample_id, gate_id, channel names, donors, parents, etc.)
-
-        Returns
-        -------
-        test : QCTestRecord
-            Test record with:
-            - id: unique identifier for this test instance (used for storing results)
-            - test_type, test_name: from class attributes
-            - metadata: context from kwargs
-            - metrics: computed values
-            - status: "PENDING"
-        """
-        pass
+    def fit(self, *args, **kwargs) -> Iterable[QCTestRecord]:
+        raise NotImplementedError("fit() method not implemented for this tester. This tester cannot be used for testing or plotting.")
 
     @abstractmethod
     def classify(self, test: QCTestRecord, **kwargs) -> QCTestRecord:
@@ -121,19 +109,15 @@ class QCTester(ABC):
         """
         pass
 
-    def fit_classify(
-        self,
-        entity: Any,
-        adata: AnnData,
-        *,
-        plot_data: bool = False,
-        classify_kwargs: dict[str, Any] = {},
-        **kwargs
-    ) -> QCTestRecord:
-        """Convenience method to run fit and classify sequentially."""
-        test = self.fit(entity, adata, plot_data=plot_data, **kwargs)
-        classified_test = self.classify(test, **classify_kwargs)
-        return classified_test
+    def fit_classify( self, **kwargs) -> Iterable[QCTestRecord]:
+        """
+        Convenience method to run fit and classify sequentially.
+
+        Iterates over records from fit(), classifies each, and yields classified records.
+        """
+        for test in self.fit(**kwargs):
+            classified_test = self.classify(test, **kwargs)
+            yield classified_test
 
     @abstractmethod
     def plot(self, adata: AnnData, test: QCTestRecord, output_path: PathLike | None = None, **kwargs) -> Figure:
@@ -162,14 +146,39 @@ class QCTester(ABC):
         """
         pass
 
-    def key_dict(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
-        d: dict[str, Any] = {"test_type": self.test_type, "test_name": self.test_name}
-        d.update({field: metadata[field] for field in self.key_fields})
+    def key_dict(
+        self,
+        targets: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+
+        targets = targets or {}
+        metadata = metadata or {}
+
+        missing = [key for key in self.target_keys if key not in targets]
+        if missing:
+            raise KeyError(f"Missing target keys: {missing}")
+        missing = [key for key in self.meta_keys if key not in metadata]
+        if missing:
+            raise KeyError(f"Missing metadata keys: {missing}")
+
+        d: dict[str, Any] = {
+            "test_type": self.test_type,
+            "test_name": self.test_name
+        }
+        for key in self.target_keys: d[key] = targets[key]
+        for key in self.meta_keys:   d[key] = metadata[key]
+
         return d
 
-    def make_key(self, metadata: Mapping[str, Any]) -> tuple:
-        return tuple((self.test_type, self.test_name) + \
-            tuple(metadata[field] for field in self.key_fields))
+    def make_key(
+        self,
+        targets: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> tuple:
+        keys =  self.target_keys + ("test_type", "test_name") + self.meta_keys
+        key_dict = self.key_dict(targets=targets, metadata=metadata)
+        return tuple(key_dict[key] for key in keys)
 
     @classmethod
     def from_dict(cls, test: QCTestRecord | Mapping[str, Any]) -> QCTester:
@@ -187,9 +196,12 @@ class QCTester(ABC):
             raise ValueError(f"Test record has type '{test.test_type}' but expected '{cls.test_type}'")
         if test.test_name != cls.test_name:
             raise ValueError(f"Test record has name '{test.test_name}' but expected '{cls.test_name}'")
-        for field in cls.key_fields:
+        for field in cls.target_keys:
+            if field not in test.targets:
+                raise ValueError(f"Test record is missing target key field '{field}' in targets")
+        for field in cls.meta_keys:
             if field not in test.metadata:
-                raise ValueError(f"Test record is missing key field '{field}' in metadata")
+                raise ValueError(f"Test record is missing metadata key field '{field}' in metadata")
 
 
 class EntityQCEvaluator(ABC):
@@ -235,6 +247,7 @@ class EntityQCEvaluator(ABC):
     """
 
     entity_type: str
+    targets: tuple[str, ...] = ()  # Fields that identify the entity instance (e.g., compensation_id, sample_id, mask)
     default_config: dict[str, Any] = {}
     _supported_tables: dict[str, dict[str, Any]] = {}    # Table type → artifact spec
     _supported_figures: dict[str, dict[str, Any]] = {}   # Figure type → artifact spec
@@ -250,7 +263,8 @@ class EntityQCEvaluator(ABC):
         """Return the set of test types for this evaluator."""
         return self.get_test_types()
 
-    def get_test_types(self, entity: Any = None) -> set[str]:
+    @classmethod
+    def get_test_types(cls, entity: Any = None) -> set[str]:
         """Return the set of test types for this evaluator.
 
         Parameters
@@ -263,10 +277,11 @@ class EntityQCEvaluator(ABC):
         set[str]
             Set of test type identifiers
         """
-        tests = self.get_tests(entity=entity)
+        tests = cls.get_tests(entity=entity)
         return set(tester.test_type for tester in tests.values())
 
-    def get_tests(self, entity: Any = None) -> dict[str, type[QCTester]]:
+    @classmethod
+    def get_tests(cls, entity: Any = None) -> dict[str, type[QCTester]]:
         """
         Return dictionary of test classes for this evaluator.
 
@@ -358,13 +373,69 @@ class EntityQCEvaluator(ABC):
             "figures": figures,
         }
 
+    def update_entity_qc(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> EntityQCStatus:
+        entity_qc = entity_qc or EntityQCStatus(entity_id=entity.id, entity_type=self.entity_type, generated_at=now_iso())
+        entity_qc = self.update_sample_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
+        entity_qc = self.update_batch_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
+        entity_qc.summary.update(self.basic_summary(entity_qc))
+        summary_dict = self.summarize_entity_qc(entity_qc)
+        if "status" in summary_dict:
+            raise ValueError("Summary dict cannot contain reserved key 'status'")
+        if "aggregated_flag_counts" in summary_dict:
+            raise ValueError("Summary dict cannot contain reserved key 'aggregated_flag_counts'")
+        entity_qc.summary.update(summary_dict)
+        return entity_qc
+
+    @abstractmethod
+    def update_sample_qc(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> EntityQCStatus:
+        """Update the QC for a specific entity instance.
+
+        This method is stateless - it takes the entity, QC status, and dataloader
+        and updates the per_sample_qc and batch_qc based on the tests defined for this entity type.
+
+        Parameters
+        ----------
+        entity : Any
+            The entity to evaluate (type depends on entity_type).
+        entity_qc : EntityQCStatus
+            QC status object to update.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading sample data (AnnData, masks, etc.)
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader (e.g., layer, sample_ids)
+        context : dict[str, Any]
+            Optional metadata to attach to the QC status.
+
+        Returns
+        -------
+        EntityQCStatus
+            Updated QC status with test results and summary.
+        """
+        pass
 
     @abstractmethod
     def update_batch_qc(
         self,
         entity: Any,
         entity_qc: EntityQCStatus,
-        all_samples: Iterable[tuple[str, AnnData]] | None = None,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
     ) -> EntityQCStatus:
@@ -380,8 +451,10 @@ class EntityQCEvaluator(ABC):
             The entity being evaluated
         entity_qc : EntityQCStatus
             QC status to update with batch test results
-        all_samples : Iterable[tuple[str, AnnData]] | None
-            Iterable of (sample_id, adata) tuples for all samples
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading sample data (AnnData, masks, etc.)
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader (e.g., layer, sample_ids)
         context : dict[str, Any]
             Optional evaluation context
 
@@ -389,59 +462,6 @@ class EntityQCEvaluator(ABC):
         -------
         EntityQCStatus
             Updated entity_qc with batch test results in batch_qc
-        """
-        pass
-
-    def update_entity_qc(
-        self,
-        entity: Any,
-        entity_qc: EntityQCStatus | None = None,
-        sample_data: Iterable[tuple[str, AnnData]] | None = None,
-        *,
-        context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
-        entity_qc = entity_qc or EntityQCStatus(entity_id=entity.id, entity_type=self.entity_type, generated_at=now_iso())
-        entity_qc = self.update_sample_qc(entity, entity_qc, sample_data, context=context)
-        entity_qc = self.update_batch_qc(entity, entity_qc, sample_data, context=context)  # TODO: problem if sample_data is iterator and is consumed by sample_qc?
-        entity_qc.summary.update(self.basic_summary(entity_qc))
-        summary_dict = self.summarize_entity_qc(entity_qc)
-        if "status" in summary_dict:
-            raise ValueError("Summary dict cannot contain reserved key 'status'")
-        if "aggregated_flag_counts" in summary_dict:
-            raise ValueError("Summary dict cannot contain reserved key 'aggregated_flag_counts'")
-        entity_qc.summary.update(summary_dict)
-        return entity_qc
-
-    @abstractmethod
-    def update_sample_qc(
-        self,
-        entity: Any,
-        entity_qc: EntityQCStatus,
-        sample_data: Iterable[tuple[str, AnnData]] | None = None,
-        *,
-        context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
-        """Update the QC for a specific entity instance.
-
-        This method is stateless - it takes the entity, QC status, and sample data
-        and updates the per_sample_qc and batch_qc based on the tests defined for this entity type.
-
-        Parameters
-        ----------
-        entity : Any
-            The entity to evaluate (type depends on entity_type).
-        entity_qc : EntityQCStatus | None
-            Optional existing QC status to update. If None, creates a new one.
-        sample_data : Iterable[tuple[str, AnnData]] | None
-            Iterable of tuples mapping sample_id to AnnData for evaluation.
-            If None, no samples will be evaluated.
-        context : dict[str, Any] | None
-            Optional metadata to attach to the QC status.
-
-        Returns
-        -------
-        EntityQCStatus
-            Updated QC status with test results and summary.
         """
         pass
 
@@ -549,13 +569,20 @@ class EntityQCEvaluator(ABC):
                 else:
                     sample_ids = list(step_run.sample_outputs.keys())  # Default to all samples in step outputs if not specified in context
                 qc_status = evaluator.parse_step(step_run, entity_id)
-                entity = evaluator.load_entity(repo, entity_id)  # Load full entity for evaluation
-                layer = evaluator.required_layer(entity)
-                if layer:
-                    sample_data = ((sid, repo.load_sample_adata(sid, layer=layer)) for sid in sample_ids)
-                else:
-                    sample_data = ((sid, AnnData()) for sid in sample_ids)
-                qc_status = evaluator.update_entity_qc(entity=entity, entity_qc=qc_status, sample_data=sample_data, context=context)
+                entity = evaluator.load_entity(repo._dataloader, entity_id)  # Load full entity for evaluation
+
+                # Build dataloader context with sample_ids only
+                dataloader_context = {}
+                if sample_ids:
+                    dataloader_context["sample_ids"] = sample_ids
+
+                qc_status = evaluator.update_entity_qc(
+                    entity=entity,
+                    entity_qc=qc_status,
+                    dataloader=repo._dataloader,
+                    dataloader_context=dataloader_context if dataloader_context else None,
+                    context=context,
+                )
                 yield qc_status
 
     def basic_summary(
@@ -606,44 +633,206 @@ class EntityQCEvaluator(ABC):
             }
         }
 
-    @abstractmethod
     def generate_table(
         self,
         entity_qc: EntityQCStatus,
         table_type: str,
-        sample_data: Iterable[tuple[str, AnnData]]| None = None,
-        table_dir: PathLike | None = None,
+        sample_ids: Iterable[str] | None = None,
+        table_path: PathLike | None = None,
     ) -> DataFrame:
-        """Generate a table from cached EntityQCStatus on demand.
+        """Generate a table from EntityQCStatus in long (melted) format.
 
-        Reconstructs the specified table type from the stored test records
-        in the QC status. This allows generating different views of the QC
-        data without re-running tests.
+        This is a generic implementation that extracts all tests for a given type,
+        converts them to a DataFrame, and melts metrics to name/value columns.
+
+        Subclasses can override this method to provide entity-specific table formats
+        by calling super().generate_table() and then reshaping the result as needed.
 
         Parameters
         ----------
         entity_qc : EntityQCStatus
             The QC status object containing test records.
         table_type : str
-            Type of table to generate (entity-specific).
-        sample_data : Mapping[str, AnnData] | None
-            Optional mapping of sample_id to AnnData. If provided, implementations
-            may filter results to only include samples in this mapping.
-            If None, returns all available data.
+            Type of tests to extract/table to generate (entity-specific).
+        sample_ids : Iterable[str] | None
+            Optional list of sample IDs to filter the table.
+        table_path : PathLike | None
+            Optional output path to save the table CSV.
 
         Returns
         -------
         DataFrame
-            Table with entity-specific columns matching the QC output format.
+            Table in long (melted) format with columns:
+            - sample_id, mask, status, [metadata keys from tester.key_dict()], metric, value
+
+        Examples
+        --------
+        >>> # In a subclass override:
+        >>> df_long = super().generate_table(entity_qc, table_type, ...)
+        >>> df_wide = df_long.pivot_table(...)  # Reshape as needed
+        >>> return df_wide
         """
-        pass
+        # Identify key columns from the first test of this type's target/meta keys
+        tests = self.get_tests(entity=None)
+        id_vars = []
+
+        # Get key fields from any test of the requested type
+        for tester_class in tests.values():
+            if tester_class.test_type == table_type:
+                id_vars = list(tester_class().key_fields)
+                break
+        if not id_vars:
+            raise ValueError(f"No tests found for table_type '{table_type}'. Cannot determine id_vars for table generation.")
+        id_vars += ["status"]  # Always include status as an id_var for melting
+
+        # Extract records using helper method
+        records = self._extract_table_records(entity_qc, table_type, sample_ids=sample_ids)
+
+        if not records:
+            # Return empty DataFrame with correct column structure
+            final_columns = id_vars + ["metric", "value"]
+            return pd.DataFrame(columns=final_columns)
+
+        df = pd.DataFrame.from_records(records)
+        df = df.melt(id_vars=id_vars, var_name="metric", value_name="value").dropna(subset=["value"])
+
+        # Save to file if output path provided
+        if table_path is not None:
+            output_path = Path(table_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.exists():
+                warnings.warn(f"Output path {output_path} already exists and will be updated with new samples.")
+                old = pd.read_csv(output_path, index_col=False)
+                # Use base class method to update the table
+                updated = self._update_qc_table(old, df)
+                updated.to_csv(output_path, index=False)
+            else:
+                df.to_csv(output_path, index=False)
+
+        return df
+
+    def _extract_table_records(
+        self,
+        entity_qc: EntityQCStatus,
+        table_type: str,
+        sample_ids: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Extract test records across all samples and steps into a flattened list.
+
+        This is a generalized helper method that iterates through all tests in the
+        EntityQCStatus and extracts their data into records containing sample_id,
+        status, test metadata (via key_dict), and all metrics.
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            The QC status object containing test records.
+        table_type : str
+            Type of tests to extract (matches test_type field).
+        sample_ids : Iterable[str] | None
+            Optional list of sample IDs to filter which samples to include.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            List of records, one per test, where each record contains:
+            - "sample_id": str
+            - "mask": str (from metadata.mask_key, defaults to "root")
+            - "status": str
+            - Test metadata from tester.key_dict() (e.g., "compensation_id", "channel")
+            - All test metrics flattened as individual columns
+        """
+        # Use sample_ids from argument if provided, otherwise use all samples
+        sample_filter = set(sample_ids or entity_qc.sample_qc.keys())
+
+        # Validate table_type
+        test_types = self.get_test_types()
+        if table_type not in test_types:
+            raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
+
+        records = []
+        tests = self.get_tests(entity=None)
+
+        # Iterate through samples, steps, and tests
+        for sample_id, sample_run in entity_qc.sample_qc.items():
+            if sample_id not in sample_filter:
+                continue
+
+            for step in sample_run.steps.values():
+                for test in step.tests.values():
+                    # Skip tests that don't match the requested table_type
+                    if test.test_type != table_type:
+                        continue
+
+                    # Get tester class and validate test_name
+                    try:
+                        tester_class = tests[test.test_name]
+                    except KeyError:
+                        valid_names = [key for key, val in tests.items() if val.test_type == table_type]
+                        raise KeyError(f"Unknown test_name '{test.test_name}' for table_type '{table_type}'. Valid names are: {valid_names}")
+
+                    # Create tester instance and extract metadata keys
+                    tester = tester_class.from_dict(test)
+                    key_dict = tester.key_dict(test.targets, test.metadata)
+
+                    # Build record with status, metadata, and all metrics
+                    records.append({
+                        "status": test.status,
+                        **key_dict,
+                        **test.metrics,
+                    })
+
+        return records
+
+    @staticmethod
+    def _update_qc_table(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
+        """Helper to update an existing QC table with new results based on sample_id and mask.
+
+        Merges old and new tables, prioritizing new data for samples that appear in both.
+        Validates that both tables have the same columns and test_type (if present).
+
+        Parameters
+        ----------
+        df_old : pd.DataFrame
+            Existing QC table
+        df_new : pd.DataFrame
+            New QC results to merge
+
+        Returns
+        -------
+        pd.DataFrame
+            Combined table with new results for updated samples and old results preserved for others
+        """
+        if df_old.empty:
+            return df_new
+        if df_new.empty:
+            return df_old
+
+        # Validate test_type compatibility if column exists
+        test_type_old = df_old["test_type"].iloc[0]
+        test_type_new = df_new["test_type"].iloc[0]
+        if test_type_old != test_type_new:
+            raise ValueError(f"Cannot merge tables with different test types: '{test_type_old}' vs '{test_type_new}'")
+
+        if not df_old.columns.equals(df_new.columns):
+            raise ValueError("Old and new DataFrames must have the same columns to merge.")
+
+        # Remove old rows for (sample_id, mask) keys being updated, then concatenate with new.
+        value_cols = {"metric", "value", "status"}  # Columns that contain test results
+        key_cols = [col for col in df_old.columns if col not in value_cols]  # All other columns are keys
+        update_keys = df_new[key_cols].drop_duplicates()
+        old_with_marker = df_old.merge(update_keys.assign(_to_replace=True), on=key_cols, how="left")
+        df_old_filtered = old_with_marker[old_with_marker["_to_replace"].isna()].drop(columns=["_to_replace"])
+        df_combined = pd.concat([df_old_filtered, df_new], ignore_index=True)
+        return df_combined
 
     @abstractmethod
     def generate_figure(
         self,
         entity_qc: EntityQCStatus,
-        test_key: Any,
-        sample_data: Iterable[tuple[str, AnnData]]| None = None,
+        test_key: Mapping[str, Any],
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
         figure_dir: PathLike | None = None,
         **kwargs: Any,
@@ -661,15 +850,20 @@ class EntityQCEvaluator(ABC):
         ----------
         entity_qc : EntityQCStatus
             The QC status object containing test records and data.
-        test_key : Any
+        test_key : Mapping[str, Any]
             Entity-specific identifier for which figure to generate.
             Could be a test record key, visualization type, or other lookup value.
-        sample_data : Mapping[str, AnnData] | None
-            Optional mapping of sample_id to AnnData for plotting.
-            Meaning and requirement depends on entity type.
+        dataloader : UnifiedDataLoader | None
+            Optional UnifiedDataLoader for loading additional data (AnnData, masks, etc.)
+            needed to generate the figure.
+        dataloader_context : dict[str, Any] | None
+            Optional context parameters for the dataloader (e.g., strategy_id,
+            layer, etc.). Used when loading data for figure generation.
         step_id : str | None
             Optional step ID to narrow scope of search/visualization.
             Meaning depends on entity type.
+        figure_dir : PathLike | None
+            Optional directory to save the figure.
         **kwargs : Any
             Additional entity-specific plotting options.
 
@@ -698,8 +892,8 @@ class EntityQCEvaluator(ABC):
         pass
 
     @abstractmethod
-    def load_entity(self, repo: ProjectRepository, entity_id: Hashable) -> Any:
-        """Load the entity object from the repository given its ID.
+    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> Any:
+        """Load the entity object from the dataloader given its ID.
 
         This method is used to retrieve the full entity (e.g., GateNode, CompensationRef)
         for a given entity_id when running QC. The implementation should handle loading
@@ -707,8 +901,8 @@ class EntityQCEvaluator(ABC):
 
         Parameters
         ----------
-        repo : ProjectRepository
-            Repository instance to load data from.
+        dataloader : UnifiedDataLoader
+            Dataloader instance to load data from.
         entity_id : str
             Unique identifier of the entity to load.
 
@@ -771,6 +965,7 @@ class EntityQCEvaluator(ABC):
 
         # Normalize test_key to dict if it was a tuple
         if test_key_dict is None:
-            test_key_dict = dict(zip(("test_type", "test_name") + tester_class.key_fields, test_key))
+            key_fields = tester_class.target_keys + tester_class.meta_keys
+            test_key_dict = dict(zip(("test_type", "test_name") + key_fields, test_key))
 
         return tester_class, test_key_dict
