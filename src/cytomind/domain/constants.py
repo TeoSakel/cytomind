@@ -15,7 +15,9 @@ from numpy.typing import NDArray
 GML_VERSION: Final[str] = os.getenv("CYTOMIND_GATINGML_VERSION", "2.0")
 
 PathLike = Path | str
-MaskLike = NDArray[np.bool_] | NDArray[np.int_] | slice
+BooleanArray = NDArray[np.bool_]
+FloatArray = NDArray[np.floating]
+MaskLike = BooleanArray | NDArray[np.int_] | slice
 
 @runtime_checkable
 class Serializable(Protocol):
