@@ -294,6 +294,37 @@ class GatingStrategyRef:
                 node.parent_ids = list(self.graph.predecessors(node_id))
                 yield node
 
+    def iter_descendants(self, root: str = "root") -> Iterable[str]:
+        """
+        Iterate over descendants of a node in topological order.
+
+        Parameters
+        ----------
+        root : str
+            The node ID whose descendants should be iterated.
+
+        Yields
+        ------
+        Iterable[str]
+            Descendant node IDs in topological order.
+
+        Raises
+        ------
+        KeyError
+            If the root node does not exist in the gating strategy.
+        """
+
+        if not self.graph.has_node(root):
+            raise KeyError(f"Gate node with id '{root}' not found in gating strategy.")
+
+        descendants = nx.descendants(self.graph, root)
+        if not descendants:
+            return
+
+        descendant_graph = nx.DiGraph(self.graph.subgraph(descendants))
+        for node_id in nx.topological_sort(descendant_graph):
+            yield node_id
+
     def get_node(self, node_id: str) -> GateNode:
         """
         Get a GateNode by its ID.
@@ -318,8 +349,15 @@ class GatingStrategyRef:
             raise KeyError(f"Gate node with id '{node_id}' not found in gating strategy.")
 
         node_data = self.graph.nodes[node_id]
+        # Add id back since it was popped during add_node()
+        node_data = {**node_data, "id": node_id}
         node = GateNode.from_dict(node_data)
-        node.parent_ids = list(self.graph.predecessors(node_id))
+        parent_ids = list(self.graph.predecessors(node_id))
+        try:
+            parent_ids.remove("root")
+        except ValueError:
+            pass
+        node.parent_ids = parent_ids
         return node
 
     def add_node(self, gate_node: GateNode | dict[str, Any]) -> None:

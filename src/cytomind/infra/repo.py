@@ -631,13 +631,14 @@ class ProjectRepository:
         KeyError
             If the node is not found in the strategy.
         """
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
+        if  isinstance(strategy, GatingStrategyRef):
+            return strategy.get_node(node_id)
 
-        return self._dataloader.load_gate_node(
-            strategy_id=strategy_id,
-            node_id=node_id,
-            parse_func=GateNode.from_dict,
-        )
+        project = self.load_project()
+        if strategy not in project.gating_strategies:
+            raise KeyError(f"Gating strategy '{strategy}' not found in project.")
+        strategy_ref = project.gating_strategies[strategy]
+        return strategy_ref.get_node(node_id)
 
     def save_gate_node(self, strategy: str | GatingStrategyRef, node: GateNode, force: bool = False) -> None:
         """

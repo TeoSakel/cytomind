@@ -316,9 +316,7 @@ class AddGateStep(BaseStep):
 
         # Create GateNode from config
         gate_node: GateNode = output_info["gate_node"]
-        # Extract full param structure from gate: {"hyperparams": {...}, "params": {...}, "diagnostics": {...}}
-        full_gate_params = output_info["gate"].to_node_params() if output_info.get("fit_on_batch", False) else {}
-        gate_node.params = full_gate_params
+        gate_node.params = output_info["gate"].to_node_params()
 
         # Store sample-specific parameter overrides (only if sample was actually fitted)
         for sample_id, sample_info in step_run.sample_outputs.items():
@@ -340,9 +338,9 @@ class AddGateStep(BaseStep):
 
         # For QuadrantGate, create individual GateNodes for each quadrant
         if gate_node.glm_type == "QuadrantGate":
-            gate: QuadrantGate = output_info["gate"]
+            gate = output_info["gate"]
             # Extract nested "params" dict which contains computed quadrants
-            nested_params = full_gate_params.get("params", {}) if full_gate_params else {}
+            quadrants = gate_node.params["params"]["quadrants"]
             for qid, loc in gate.locations.items():  # type: ignore[attr-defined]
                 # Create a GateNode for this quadrant
                 quadrant_node = GateNode(
@@ -354,7 +352,7 @@ class AddGateStep(BaseStep):
                     name=qid,
                     parent_ids=[gate_node.id],
                     use_as_complement=False,
-                    params=nested_params.get(qid, {}) if nested_params else {},
+                    params=quadrants[qid],
                     custom_gates={
                         sid: sample_info.get("params", {}).get(qid, {})
                         for sid, sample_info in step_run.sample_outputs.items()

@@ -6,15 +6,105 @@ from typing import Any, Sequence, Mapping, TYPE_CHECKING
 import anndata as ad
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
 from .base import Gate
 from . import GateRegistry
+from cytomind.visualization.gates import (
+    _compute_density_colors,
+    _create_scatter_trace,
+    _create_rectangle_trace,
+    _create_polygon_trace,
+    _create_ellipse_trace,
+    _create_subplot_grid,
+    _format_gate_plot,
+)
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
-    BooleanMask = NDArray[np.bool_]
+    from cytomind.domain.constants import BooleanArray, FloatArray
 else:
-    BooleanMask = object
+    BooleanArray = object
+    FloatArray = object
+
+
+def _downsample_indices(n_points: int, max_points: int, seed: int) -> np.ndarray | None:
+    """Return random row indices for downsampling, or None when no downsampling is needed."""
+    if max_points <= 0 or n_points <= max_points:
+        return None
+    rng = np.random.default_rng(seed)
+    return rng.choice(n_points, size=max_points, replace=False)
+
+
+@GateRegistry.register("Root")
+class RootGate(Gate):
+    """
+    Trivial root gate that passes all events through.
+
+    Used as the entry point for gating strategies to avoid special-casing
+    the "root" node when loading masks etc. This gate has no dimensions,
+    no hyperparameters, requires no fitting, and apply() always passes
+    all events through.
+    """
+
+    gate_type = "Root"
+    glm_type = None
+    tunable = False
+
+    def __init__(self, gate_name: str = "root", use_as_complement: bool = False) -> None:
+        """
+        Parameters
+        ----------
+        gate_name : str
+            Human-readable name (defaults to "root")
+        use_as_complement : bool
+            Must be False for Root gate (raises ValueError if True)
+
+        Raises
+        ------
+        ValueError
+            If use_as_complement is True
+        """
+        if use_as_complement:
+            raise ValueError("RootGate does not support use_as_complement")
+        super().__init__(gate_name, [], {}, use_as_complement)
+
+    def _fit_gate(self, events_slice: pd.DataFrame) -> None:
+        """No fitting needed for Root gate."""
+        pass
+
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
+        """Root gate passes all events through."""
+        mask = np.ones(len(events_slice), dtype=np.bool_)
+        return {self.gate_name: mask}
+
+    def apply(self, events: ad.AnnData, mask: dict[str, BooleanArray] = {}) -> dict[str, BooleanArray]:
+        """
+        Apply root gate - passes all events through.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data
+        mask : dict[str, BooleanArray], default {}
+            Parent gate masks (ignored for Root gate, can be empty)
+
+        Returns
+        -------
+        dict[str, BooleanArray]
+            Dictionary mapping root gate name to boolean mask of all True
+        """
+        if events.isbacked:
+            events = events.to_memory()
+
+        # Root gate passes all events through
+        all_mask = np.ones(events.n_obs, dtype=np.bool_)
+        return {self.gate_name: all_mask}
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Root gate has no meaningful visualization."""
+        fig = go.Figure()
+        fig.add_annotation(text="Root Gate - passes all events through")
+        return fig
 
 
 @GateRegistry.register("Rectangle")
@@ -102,26 +192,226 @@ class RectangleGate(Gate):
         """For RectangleGate, fit just copies hyperparams to params."""
         pass
 
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         """Apply rectangular bounds to events."""
         mask = np.ones(len(events_slice), dtype=np.bool_)
 
         for dim in self.dimensions:
             col_vals = np.asarray(events_slice[dim].values)
-            try:
-                np.bitwise_and(mask, col_vals >= self.min_vals[dim], out=mask)
-            except KeyError:
-                pass
-            try:
-                np.bitwise_and(mask, col_vals < self.max_vals[dim], out=mask)
-            except KeyError:
-                pass
+            if dim in self.min_vals:
+                mask &= col_vals >= self.min_vals[dim]
+            if dim in self.max_vals:
+                mask &= col_vals < self.max_vals[dim]
 
         # Apply complement if requested
         if self.use_as_complement:
-            mask = ~mask
+            np.logical_not(mask, out=mask)
 
         return {self.gate_name: mask}
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Plot events with rectangular gate boundaries.
+
+        For 1D gates: creates a histogram with vertical threshold lines.
+        For 2D gates: creates a scatter plot with rectangle overlay.
+        For N-D gates: creates pairwise projection grid.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data (pre-filtered by parent mask)
+        mask : dict[str, BooleanArray]
+            Parent gate mask (required but not used for plotting)
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with events and gate boundaries
+
+        Examples
+        --------
+        >>> gate = RectangleGate("live", ["FSC-A"], min_vals={"FSC-A": 1000})
+        >>> fig = gate.plot(events, {"root": root_mask})
+        >>> fig.show()
+        """
+        n_dims = len(self.dimensions)
+        if n_dims == 1:
+            return self._plot_1D(events, **kwargs)
+        if n_dims == 2:
+            return self._plot_2D(events, **kwargs)
+        return self._plot_nD(events, **kwargs)
+
+    def _plot_1D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        dim = self.dimensions[0]
+        data = np.asarray(events[:, dim].X).ravel()
+        nbins = int(kwargs.get("hist_nbins", 100))
+        hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(
+            x=data,
+            nbinsx=nbins,
+            name="Events",
+            marker=dict(color=hist_color),
+        ))
+
+        if dim in self.min_vals:
+            fig.add_vline(
+                x=self.min_vals[dim],
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="min",
+            )
+        if dim in self.max_vals:
+            fig.add_vline(
+                x=self.max_vals[dim],
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="max",
+            )
+
+        fig.update_xaxes(title=dim)
+        fig.update_yaxes(title="Count")
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = self.dimensions
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            x_data = x_data[downsample_idx]
+            y_data = y_data[downsample_idx]
+
+        density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+
+        fig = go.Figure()
+        fig.add_trace(_create_scatter_trace(
+            x_data,
+            y_data,
+            density,
+            marker_size=marker_size,
+            colorscale=colorscale,
+            use_gl=use_gl,
+        ))
+
+        x_min = self.min_vals.get(x_dim)
+        x_max = self.max_vals.get(x_dim)
+        y_min = self.min_vals.get(y_dim)
+        y_max = self.max_vals.get(y_dim)
+
+        data_x_range = (x_data.min(), x_data.max())
+        data_y_range = (y_data.min(), y_data.max())
+
+        fig.add_trace(_create_rectangle_trace(
+            x_min, x_max, y_min, y_max,
+            data_x_range, data_y_range,
+            line_color=gate_line_color,
+            line_width=gate_line_width,
+            name=self.gate_name,
+            use_gl=use_gl,
+        ))
+
+        fig.update_xaxes(title=x_dim)
+        fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(self.dimensions))
+        n_cols = int(np.ceil(np.sqrt(len(pairs))))
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name} (Pairwise Projections)"))
+        downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
+
+        for idx, (i, j) in enumerate(pairs):
+            row = idx // n_cols + 1
+            col = idx % n_cols + 1
+
+            x_dim = self.dimensions[i]
+            y_dim = self.dimensions[j]
+            x_data = np.asarray(events[:, x_dim].X).ravel()
+            y_data = np.asarray(events[:, y_dim].X).ravel()
+            if downsample_idx is not None:
+                x_data = x_data[downsample_idx]
+                y_data = y_data[downsample_idx]
+
+            density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+            fig.add_trace(
+                _create_scatter_trace(
+                    x_data,
+                    y_data,
+                    density,
+                    marker_size=marker_size,
+                    colorscale=colorscale,
+                    use_gl=use_gl,
+                    showlegend=False,
+                ),
+                row=row, col=col,
+            )
+
+            x_min = self.min_vals.get(x_dim)
+            x_max = self.max_vals.get(x_dim)
+            y_min = self.min_vals.get(y_dim)
+            y_max = self.max_vals.get(y_dim)
+
+            data_x_range = (x_data.min(), x_data.max())
+            data_y_range = (y_data.min(), y_data.max())
+
+            fig.add_trace(
+                _create_rectangle_trace(
+                    x_min, x_max, y_min, y_max,
+                    data_x_range, data_y_range,
+                    line_color=gate_line_color,
+                    line_width=gate_line_width,
+                    use_gl=use_gl,
+                    name=self.gate_name if idx == 0 else None,
+                ),
+                row=row, col=col,
+            )
+
+            fig.update_xaxes(title=x_dim, row=row, col=col)
+            fig.update_yaxes(title=y_dim, row=row, col=col)
+
+        n_plots = len(pairs)
+        n_rows = int(np.ceil(n_plots / n_cols))
+        height = int(kwargs.get("height", 400 * n_rows))
+        width = int(kwargs.get("width", 400 * n_cols))
+
+        return _format_gate_plot(
+            fig,
+            title=title,
+            width=width,
+            height=height,
+        )
 
 
 @GateRegistry.register("Polygon")
@@ -163,7 +453,7 @@ class PolygonGate(Gate):
         self.vertices = self._hyperparams["vertices"]
 
     @property
-    def vertices(self) -> NDArray[np.float64]:
+    def vertices(self) -> FloatArray:
         """Access vertices hyperparameter or fitted params."""
         try:
             return np.asarray(self.params["vertices"])
@@ -187,24 +477,110 @@ class PolygonGate(Gate):
         if np.isnan(coords).any():
             raise ValueError("Vertex coordinates cannot be NaN")
 
+        # Fix vertex order to be consistent (counterclockwise) by sorting based on angle from centroid
+        centered = coords - coords.mean(axis=0)
+        angles = np.arctan2(centered[:, 1], centered[:, 0])
+        sorted_indices = np.argsort(angles)
+        coords = coords[sorted_indices]
+
         self.params["vertices"] = coords
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For PolygonGate, fit just copies hyperparams to params."""
         pass
 
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         """Apply polygon gate using winding number algorithm."""
 
         from flowutils import gating
-        coords = events_slice[self.dimensions].values
-        mask: NDArray[np.bool_] = gating.points_in_polygon(self.vertices, coords)
+        coords = events_slice.values
+        mask: BooleanArray = gating.points_in_polygon(self.vertices, coords)
 
         # Apply complement if requested
         if self.use_as_complement:
-            mask = ~mask
+            np.logical_not(mask, out=mask)
 
         return {self.gate_name: mask}
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Plot events with polygon gate boundary.
+
+        Creates a 2D scatter plot with polygon boundary overlaid.
+        The polygon interior is filled with semi-transparent color.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data (pre-filtered by parent mask)
+        mask : dict[str, BooleanArray]
+            Parent gate mask (required but not used for plotting)
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with events and polygon boundary
+
+        Examples
+        --------
+        >>> gate = PolygonGate("lymph", ["FSC-A", "SSC-A"], vertices=[[0, 0], [1, 1], [0, 1]])
+        >>> fig = gate.plot(events, {"root": root_mask})
+        >>> fig.show()
+        """
+        x_dim, y_dim = self.dimensions
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", False))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_fill = bool(kwargs.get("gate_fill", True))
+        gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
+        title = str(kwargs.get("title", f"PolygonGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        # Downsample large clouds to keep interactive plotting responsive.
+        n_points = x_data.shape[0]
+        if max_points > 0 and n_points > max_points:
+            rng = np.random.default_rng(downsample_seed)
+            idx = rng.choice(n_points, size=max_points, replace=False)
+            x_data = x_data[idx]
+            y_data = y_data[idx]
+
+        # Compute density colors
+        density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+
+        fig = go.Figure()
+
+        # Add scatter trace
+        fig.add_trace(_create_scatter_trace(
+            x_data,
+            y_data,
+            density,
+            marker_size=marker_size,
+            colorscale=colorscale,
+            use_gl=use_gl,
+        ))
+
+        # Add polygon boundary
+        fig.add_trace(_create_polygon_trace(
+            self.vertices,
+            line_color=gate_line_color,
+            line_width=gate_line_width,
+            fill=gate_fill,
+            fill_color=gate_fill_color,
+            name=self.gate_name,
+            use_gl=use_gl,
+        ))
+
+        fig.update_xaxes(title=x_dim)
+        fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=title, width=width, height=height)
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
@@ -228,8 +604,8 @@ class EllipsoidGate(Gate):
         self,
         gate_name: str,
         dimensions: Sequence[str],
-        center: Sequence[float] | NDArray,
-        covariance_matrix: Sequence[Sequence[float]] | NDArray,
+        center: Sequence[float] | FloatArray,
+        covariance_matrix: Sequence[Sequence[float]] | FloatArray,
         distance_square: float,
         use_as_complement: bool = False,
     ) -> None:
@@ -265,7 +641,7 @@ class EllipsoidGate(Gate):
         self.distance_square = self.hyperparams["distance_square"]
 
     @property
-    def center(self) -> NDArray[np.float64]:
+    def center(self) -> FloatArray:
         """Access center hyperparameter or fitted params."""
         try:
             return np.asarray(self.params["center"])
@@ -273,7 +649,7 @@ class EllipsoidGate(Gate):
             raise ValueError("EllipsoidGate center has not been set. Please fit the gate first.")
 
     @center.setter
-    def center(self, value: NDArray[np.float64]) -> None:
+    def center(self, value: FloatArray) -> None:
         """Set center hyperparameter."""
         try:
             value = np.asarray(value, dtype=np.float64)
@@ -286,7 +662,7 @@ class EllipsoidGate(Gate):
         self.params["center"] = value
 
     @property
-    def covariance_matrix(self) -> NDArray[np.float64]:
+    def covariance_matrix(self) -> FloatArray:
         """Access covariance_matrix hyperparameter or fitted params."""
         try:
             return np.asarray(self.params["covariance_matrix"])
@@ -294,7 +670,7 @@ class EllipsoidGate(Gate):
             raise ValueError("EllipsoidGate covariance_matrix has not been set. Please fit the gate first.")
 
     @covariance_matrix.setter
-    def covariance_matrix(self, value: NDArray[np.float64]) -> None:
+    def covariance_matrix(self, value: FloatArray) -> None:
         """Set covariance_matrix hyperparameter."""
         try:
             value = np.asarray(value, dtype=np.float64)
@@ -342,7 +718,7 @@ class EllipsoidGate(Gate):
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         pass
 
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         """Apply ellipsoid gate using Mahalanobis distance."""
 
         try:
@@ -354,13 +730,169 @@ class EllipsoidGate(Gate):
         coords = events_slice.values
 
         from flowutils import gating
-        mask: NDArray[np.bool_] = gating.points_in_ellipsoid(cov_matrix, center, distance_sq, coords)
+        mask: BooleanArray = gating.points_in_ellipsoid(cov_matrix, center, distance_sq, coords)
 
-        # Apply complement if requested
         if self.use_as_complement:
-            mask = ~mask
+            np.logical_not(mask, out=mask)
 
         return {self.gate_name: mask}
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Plot events with ellipsoid gate boundary.
+
+        For 2D gates: creates a scatter plot with ellipse overlay.
+        For N-D gates: creates pairwise projection grid showing ellipsoid projections.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data (pre-filtered by parent mask)
+        mask : dict[str, BooleanArray]
+            Parent gate mask (required but not used for plotting)
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with events and ellipsoid boundary
+
+        Examples
+        --------
+        >>> gate = EllipsoidGate("lymph", ["FSC-A", "SSC-A"], center=[50000, 30000],
+        ...                      covariance_matrix=[[1e8, 0], [0, 1e7]], distance_square=9)
+        >>> fig = gate.plot(events, {"root": root_mask})
+        >>> fig.show()
+        """
+        if len(self.dimensions) == 2:
+            return self._plot_2D(events, **kwargs)
+        return self._plot_nD(events, **kwargs)
+
+    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = self.dimensions
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_fill = bool(kwargs.get("gate_fill", True))
+        gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
+        title = str(kwargs.get("title", f"EllipsoidGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            x_data = x_data[downsample_idx]
+            y_data = y_data[downsample_idx]
+
+        density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+
+        fig = go.Figure()
+        fig.add_trace(_create_scatter_trace(
+            x_data,
+            y_data,
+            density,
+            marker_size=marker_size,
+            colorscale=colorscale,
+            use_gl=use_gl,
+        ))
+        fig.add_trace(_create_ellipse_trace(
+            self.center,
+            self.covariance_matrix,
+            self.distance_square,
+            line_color=gate_line_color,
+            line_width=gate_line_width,
+            fill=gate_fill,
+            fill_color=gate_fill_color,
+            name=self.gate_name,
+            use_gl=use_gl,
+        ))
+
+        fig.update_xaxes(title=x_dim)
+        fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(self.dimensions))
+        n_cols = int(np.ceil(np.sqrt(len(pairs))))
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_fill = bool(kwargs.get("gate_fill", True))
+        gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
+        title = str(kwargs.get("title", f"EllipsoidGate: {self.gate_name} (Pairwise Projections)"))
+        downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
+
+        for idx, (i, j) in enumerate(pairs):
+            row = idx // n_cols + 1
+            col = idx % n_cols + 1
+
+            x_dim = self.dimensions[i]
+            y_dim = self.dimensions[j]
+            x_data = np.asarray(events[:, x_dim].X).ravel()
+            y_data = np.asarray(events[:, y_dim].X).ravel()
+            if downsample_idx is not None:
+                x_data = x_data[downsample_idx]
+                y_data = y_data[downsample_idx]
+
+            density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+            fig.add_trace(
+                _create_scatter_trace(
+                    x_data,
+                    y_data,
+                    density,
+                    marker_size=marker_size,
+                    colorscale=colorscale,
+                    use_gl=use_gl,
+                    showlegend=False,
+                ),
+                row=row, col=col,
+            )
+
+            indices = [i, j]
+            center_2d = self.center[indices]
+            cov_2d = self.covariance_matrix[np.ix_(indices, indices)]
+
+            fig.add_trace(
+                _create_ellipse_trace(
+                    center_2d,
+                    cov_2d,
+                    self.distance_square,
+                    line_color=gate_line_color,
+                    line_width=gate_line_width,
+                    fill=gate_fill,
+                    fill_color=gate_fill_color,
+                    use_gl=use_gl,
+                    name=self.gate_name if idx == 0 else None,
+                ),
+                row=row, col=col,
+            )
+
+            fig.update_xaxes(title=x_dim, row=row, col=col)
+            fig.update_yaxes(title=y_dim, row=row, col=col)
+
+        n_plots = len(pairs)
+        n_rows = int(np.ceil(n_plots / n_cols))
+        height = int(kwargs.get("height", 400 * n_rows))
+        width = int(kwargs.get("width", 400 * n_cols))
+
+        return _format_gate_plot(
+            fig,
+            title=title,
+            width=width,
+            height=height,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
@@ -372,6 +904,7 @@ class EllipsoidGate(Gate):
         return base
 
 
+# TODO: add a "Quadrant" gate for each individual quadrant for completeness
 @GateRegistry.register("Quadrant")
 class QuadrantGate(Gate):
     """
@@ -520,17 +1053,17 @@ class QuadrantGate(Gate):
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
 
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         """
         Apply quadrant gate to generate masks for each quadrant.
 
         Returns
         -------
-        dict[str, NDArray[np.bool_]]
+        dict[str, BooleanArray]
             Dictionary mapping quadrant_id to boolean mask for that quadrant.
             Each mask indicates which events fall within the quadrant's bounds.
         """
-        results: dict[str, NDArray[np.bool_]] = {}
+        results: dict[str, BooleanArray] = {}
 
         for quad_id, quad_def in self.quadrants.items():
             # Start with all events True for this quadrant
@@ -541,13 +1074,211 @@ class QuadrantGate(Gate):
                 col_vals = np.asarray(events_slice[div_id].values)
 
                 if min_val is not None:
-                    np.bitwise_and(quad_mask, col_vals >= min_val, out=quad_mask)
+                    quad_mask &= col_vals >= min_val
                 if max_val is not None:
-                    np.bitwise_and(quad_mask, col_vals < max_val, out=quad_mask)
+                    quad_mask &= col_vals < max_val
 
             results[quad_id] = quad_mask
 
         return results
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Plot events with quadrant divider lines.
+
+        For 2D gates: creates a scatter plot with divider lines creating a grid.
+        For N-D gates: creates pairwise projection grid showing dividers.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data (pre-filtered by parent mask)
+        mask : dict[str, BooleanArray]
+            Parent gate mask (required but not used for plotting)
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with events and quadrant dividers
+
+        Examples
+        --------
+        >>> gate = QuadrantGate("quads", dividers={"CD4": [100], "CD8": [100]},
+        ...                     quadrants={"Q1": [("CD4", 150), ("CD8", 150)]})
+        >>> fig = gate.plot(events, {"root": root_mask})
+        >>> fig.show()
+        """
+        n_dims = len(self.dimensions)
+        if n_dims == 1:
+            return self._plot_1D(events, **kwargs)
+        if n_dims == 2:
+            return self._plot_2D(events, **kwargs)
+        return self._plot_nD(events, **kwargs)
+
+    def _plot_1D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        dim = self.dimensions[0]
+        data = np.asarray(events[:, dim].X).ravel()
+        nbins = int(kwargs.get("hist_nbins", 100))
+        hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(
+            x=data,
+            nbinsx=nbins,
+            name="Events",
+            marker=dict(color=hist_color),
+        ))
+
+        for divider_val in self.dividers[dim]:
+            fig.add_vline(
+                x=divider_val,
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+            )
+
+        fig.update_xaxes(title=dim)
+        fig.update_yaxes(title="Count")
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = self.dimensions
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name}"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            x_data = x_data[downsample_idx]
+            y_data = y_data[downsample_idx]
+
+        density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+
+        fig = go.Figure()
+        fig.add_trace(_create_scatter_trace(
+            x_data,
+            y_data,
+            density,
+            marker_size=marker_size,
+            colorscale=colorscale,
+            use_gl=use_gl,
+        ))
+
+        if x_dim in self.dividers:
+            for divider_val in self.dividers[x_dim]:
+                fig.add_vline(
+                    x=divider_val,
+                    line_color=gate_line_color,
+                    line_width=gate_line_width,
+                    line_dash=gate_line_dash,
+                )
+
+        if y_dim in self.dividers:
+            for divider_val in self.dividers[y_dim]:
+                fig.add_hline(
+                    y=divider_val,
+                    line_color=gate_line_color,
+                    line_width=gate_line_width,
+                    line_dash=gate_line_dash,
+                )
+
+        fig.update_xaxes(title=x_dim)
+        fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(self.dimensions))
+        n_cols = int(np.ceil(np.sqrt(len(pairs))))
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name} (Pairwise Projections)"))
+        downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
+
+        for idx, (i, j) in enumerate(pairs):
+            row = idx // n_cols + 1
+            col = idx % n_cols + 1
+
+            x_dim = self.dimensions[i]
+            y_dim = self.dimensions[j]
+            x_data = np.asarray(events[:, x_dim].X).ravel()
+            y_data = np.asarray(events[:, y_dim].X).ravel()
+            if downsample_idx is not None:
+                x_data = x_data[downsample_idx]
+                y_data = y_data[downsample_idx]
+
+            density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+            fig.add_trace(
+                _create_scatter_trace(
+                    x_data,
+                    y_data,
+                    density,
+                    marker_size=marker_size,
+                    colorscale=colorscale,
+                    use_gl=use_gl,
+                    showlegend=False,
+                ),
+                row=row, col=col,
+            )
+
+            if x_dim in self.dividers:
+                for divider_val in self.dividers[x_dim]:
+                    fig.add_vline(
+                        x=divider_val,
+                        line_color=gate_line_color,
+                        line_width=gate_line_width,
+                        line_dash=gate_line_dash,
+                        row=row, col=col,  # type: ignore
+                    )
+
+            if y_dim in self.dividers:
+                for divider_val in self.dividers[y_dim]:
+                    fig.add_hline(
+                        y=divider_val,
+                        line_color=gate_line_color,
+                        line_width=gate_line_width,
+                        line_dash=gate_line_dash,
+                        row=row, col=col,  # type: ignore
+                    )
+
+            fig.update_xaxes(title=x_dim, row=row, col=col)
+            fig.update_yaxes(title=y_dim, row=row, col=col)
+
+        n_plots = len(pairs)
+        n_rows = int(np.ceil(n_plots / n_cols))
+        height = int(kwargs.get("height", 400 * n_rows))
+        width = int(kwargs.get("width", 400 * n_cols))
+
+        return _format_gate_plot(
+            fig,
+            title=title,
+            width=width,
+            height=height,
+        )
 
 @GateRegistry.register("Boolean")
 class BooleanGate(Gate):
@@ -655,7 +1386,7 @@ class BooleanGate(Gate):
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
 
-    def apply(self, events: ad.AnnData, mask: dict[str, BooleanMask]) -> dict[str, BooleanMask]:
+    def apply(self, events: ad.AnnData, mask: dict[str, BooleanArray]) -> dict[str, BooleanArray]:
         """
         Apply boolean expression to masks from parent gates.
 
@@ -666,13 +1397,13 @@ class BooleanGate(Gate):
         ----------
         events : ad.AnnData
             Not used for BooleanGate, but required for interface compatibility
-        mask : dict[str, BooleanMask]
+        mask : dict[str, BooleanArray]
             Dictionary of masks from parent gates, mapping variable names to boolean arrays.
             Must contain all variables referenced in the expression.
 
         Returns
         -------
-        dict[str, NDArray[np.bool_]]
+        dict[str, BooleanArray]
             Dictionary with single key self.gate_name containing the result of the expression.
             Mask size equals the size of the input mask arrays.
         """
@@ -695,14 +1426,113 @@ class BooleanGate(Gate):
 
         result = np.asarray(result, dtype=bool)
 
-        # Apply complement if requested
         if self.use_as_complement:
-            result = ~result
+            np.logical_not(result, out=result)
 
         return {self.gate_name: result}
 
-    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, NDArray[np.bool_]]:
+    def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         raise NotImplementedError("BooleanGate uses apply() override instead of _apply_gate")
+
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+        """Plot events colored by boolean gate result.
+
+        Since BooleanGate has no geometric boundaries (defined by expression over parent masks),
+        this creates a simple scatter plot of the first two available dimensions,
+        with points colored by whether they pass the gate.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data (pre-filtered by parent mask)
+        mask : dict[str, BooleanArray]
+            Parent gate masks (used to evaluate the boolean expression)
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with events colored by gate result
+
+        Examples
+        --------
+        >>> gate = BooleanGate("double_pos", "CD4_pos & CD8_pos")
+        >>> fig = gate.plot(events, {"CD4_pos": cd4_mask, "CD8_pos": cd8_mask})
+        >>> fig.show()
+
+        Notes
+        -----
+        BooleanGate visualization is limited because it has no geometric boundaries.
+        For complete understanding, view the parent gate plots separately.
+        """
+        # Apply the boolean gate to get result
+        result_mask = self.apply(events, mask)
+        gate_result = result_mask[self.gate_name]
+
+        # Get first two dimensions from event data for visualization
+        if events.n_vars < 2:
+            raise ValueError(
+                f"BooleanGate plot requires at least 2 dimensions in events, got {events.n_vars}"
+            )
+
+        x_dim = events.var_names[0]
+        y_dim = events.var_names[1]
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+        marker_size = int(kwargs.get("marker_size", 3))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.3)"))
+        pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.5)"))
+        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression})"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        fig = go.Figure()
+
+        pass_mask = gate_result.astype(bool)
+        fail_mask = ~pass_mask
+
+        downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            x_data = x_data[downsample_idx]
+            y_data = y_data[downsample_idx]
+            pass_mask = pass_mask[downsample_idx]
+            fail_mask = fail_mask[downsample_idx]
+
+        # Add fail events (red)
+        if fail_mask.any():
+            trace_cls = go.Scattergl if use_gl else go.Scatter
+            fig.add_trace(trace_cls(
+                x=x_data[fail_mask],
+                y=y_data[fail_mask],
+                mode="markers",
+                marker=dict(size=marker_size, color=fail_color, line=dict(width=0)),
+                name="Fail",
+                hoverinfo="x+y",
+            ))
+
+        # Add pass events (green)
+        if pass_mask.any():
+            trace_cls = go.Scattergl if use_gl else go.Scatter
+            fig.add_trace(trace_cls(
+                x=x_data[pass_mask],
+                y=y_data[pass_mask],
+                mode="markers",
+                marker=dict(size=marker_size, color=pass_color, line=dict(width=0)),
+                name="Pass",
+                hoverinfo="x+y",
+            ))
+
+        fig.update_xaxes(title=x_dim)
+        fig.update_yaxes(title=y_dim)
+
+        return _format_gate_plot(
+            fig,
+            title=title,
+            width=width,
+            height=height,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize gate to dictionary."""

@@ -2,23 +2,15 @@ from abc import ABC, abstractmethod
 from typing import Any, Sequence, Mapping, TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
 
 if TYPE_CHECKING:
-    from cytomind.qc.base import QCTester
     from cytomind.domain.gates import GateNode
-else:
-    QCTester = object
-    GateNode = object
-
-if TYPE_CHECKING:
-    from cytomind.domain.constants import MaskLike
-    BooleanMask = NDArray[np.bool_]
+    from cytomind.domain.constants import BooleanArray
     from anndata import AnnData
     from pandas import DataFrame
 else:
-    MaskLike = object
-    BooleanMask = object
+    GateNode = object
+    BooleanArray = object
     AnnData = object
     DataFrame = object
 
@@ -69,7 +61,7 @@ class Gate(ABC):
     """
 
     gate_type: str
-    glm_type: str
+    glm_type: str | None
     tunable: bool
 
     def __init__(
@@ -158,7 +150,7 @@ class Gate(ABC):
         return gate
 
     @classmethod
-    def from_node(cls, node: "GateNode", sample_id: str | None = None) -> "Gate":
+    def from_node(cls, node: GateNode, sample_id: str | None = None) -> "Gate":
         """Reconstruct a Gate instance from a persisted GateNode.
 
         Handles the parameter precedence logic:
@@ -346,7 +338,7 @@ class Gate(ABC):
         """
         return {}
 
-    def fit(self, events: AnnData, mask: dict[str, BooleanMask] = {}) -> "Gate":
+    def fit(self, events: AnnData, mask: dict[str, BooleanArray] = {}) -> "Gate":
         """
         Fit gate parameters from events (optional for parameter-only gates).
 
@@ -358,7 +350,7 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, MaskLike], default {}
+        mask : dict[str, BooleanArray], default {}
             Dictionary of boolean masks from parent gates (optional).
             - {}: empty dict (default), fit using all events
             - {key: mask_array}: single or multiple entries, fit using masked subset
@@ -392,7 +384,7 @@ class Gate(ABC):
         """
         pass
 
-    def apply(self, events: AnnData, mask: dict[str, BooleanMask],) -> dict[str, BooleanMask]:
+    def apply(self, events: AnnData, mask: dict[str, BooleanArray],) -> dict[str, BooleanArray]:
         """
         Apply gate to pre-filtered events and expand result to parent-mask length.
 
@@ -400,13 +392,13 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Pre-filtered event data for this gate (already subset by AddGateStep).
-        mask : dict[str, MaskLike]
+        mask : dict[str, BooleanArray]
             Parent gate masks (required, must be non-empty).
             Exactly one parent/root mask for standard gates.
 
         Returns
         -------
-        dict[str, BooleanMask]
+        dict[str, BooleanArray]
             Dictionary mapping region/quadrant IDs to boolean masks.
             Output mask size equals the size of the input mask array.
 
@@ -429,6 +421,10 @@ class Gate(ABC):
         parent_mask = np.asarray(parent_mask)
         if parent_mask.dtype != np.bool_:
             raise ValueError("Gate.apply parent mask must be boolean.")
+
+        missing = [dim for dim in self.dimensions if dim not in events.var_names]
+        if missing:
+            raise ValueError(f"Events is missing required dimension(s): {missing}")
 
         if events.isbacked:
             events = events.to_memory()
@@ -457,7 +453,7 @@ class Gate(ABC):
         return result
 
     @abstractmethod
-    def _apply_gate(self, events_slice: DataFrame) -> dict[str, BooleanMask]:
+    def _apply_gate(self, events_slice: DataFrame) -> dict[str, BooleanArray]:
         """
         Internal apply implementation for subclasses to override.
 
@@ -468,13 +464,13 @@ class Gate(ABC):
 
         Returns
         -------
-        dict[str, BooleanMask]
+        dict[str, BooleanArray]
             Dictionary mapping region/quadrant IDs to boolean masks.
             Single-region gates should use a consistent key like "default".
         """
         pass
 
-    def fit_apply(self, events: AnnData, mask: dict[str, BooleanMask] = {}) -> dict[str, BooleanMask]:
+    def fit_apply(self, events: AnnData, mask: dict[str, BooleanArray] = {}) -> dict[str, BooleanArray]:
         """
         Convenience method to fit and then apply the gate in one step.
 
@@ -482,13 +478,34 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, BooleanMask]
+        mask : dict[str, BooleanArray]
             Dictionary of boolean masks from parent gates (default: empty dict)
 
         Returns
         -------
-        dict[str, BooleanMask]
+        dict[str, BooleanArray]
             Dictionary mapping region/quadrant IDs to boolean masks
         """
         return self.fit(events, mask).apply(events, mask)
 
+    @abstractmethod
+    def plot(self, events: AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> Any:
+        """
+        Generate diagnostic plot for the gate.
+
+        Parameters
+        ----------
+        events : ad.AnnData
+            Event data with dimension IDs as var_names
+        mask : dict[str, BooleanArray]
+            Dictionary of boolean masks from parent gates (default: empty dict)
+        **kwargs : Any
+            Optional plot configuration parameters passed through by callers.
+
+        Returns
+        -------
+        Any
+            Plot object (e.g., matplotlib figure, plotly figure) for visualization.
+            Subclasses should define the specific type and content of the plot.
+        """
+        pass
