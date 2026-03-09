@@ -20,6 +20,7 @@ from cytomind.visualization.transforms import apply_transform
 
 from . import EntityQCEvaluatorRegistry
 from .base import EntityQCEvaluator, QCTester
+from .utils import validate_percentage
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -33,36 +34,8 @@ else:
     PathLike = object
 
 # ============================================================================
-# Validator helpers for threshold checks
-# ============================================================================
-
-def _validate_percentage(name: str, value: float) -> None:
-	"""Raise ValueError if value is not in [0,1]."""
-	if value is None:
-		return
-	if not (0.0 <= value <= 1.0):
-		raise ValueError(f"{name} must be in [0, 1] range.")
-
-def _validate_warn_severe(
-    warn_name: str,
-    warn: float,
-    severe_name: str,
-    severe: float,
-    are_percentage: bool=True
-) -> None:
-	"""Validate two percentage thresholds: each in [0,1] and severe >= warn."""
-	if are_percentage:
-		_validate_percentage(warn_name, warn)
-		_validate_percentage(severe_name, severe)
-	if severe < warn:
-		raise ValueError(f"{severe_name} must be greater than or equal to {warn_name}.")
-
-
-# ============================================================================
 # QC Test Classes
 # ============================================================================
-
-# TODO: Refactor tests based on common test_type to reduce code duplication
 
 class NegativeFluorescenceTest(QCTester):
     """Test for negative fluorescence in a single channel."""
@@ -72,22 +45,16 @@ class NegativeFluorescenceTest(QCTester):
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("channel",)
     default_config = {}
-    default_thresholds = {"ratio_neg": (0.15, 0.30)} # warn, severe thresholds for ratio of negative events
+    meta_fields = [("channel", "Channel name")]
+    metric_fields = [("ratio_neg", "Proportion of events with negative fluorescence")]
+    default_thresholds = {
+        "ratio_neg": {"warn": (None, 0.15), "severe": (None, 0.30)}
+    }
     plot_type = "histogram"
     plot_description = "Distribution of compensated fluorescence values in channel"
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         super().__init__(config=config, thresholds=thresholds)
-        neg_warn, neg_severe = self.thresholds["ratio_neg"]
-        _validate_warn_severe("neg_warn", neg_warn, "neg_severe", neg_severe, are_percentage=True)
-
-    @property
-    def neg_warn(self) -> float:
-        return self.thresholds["ratio_neg"][0]
-
-    @property
-    def neg_severe(self) -> float:
-        return self.thresholds["ratio_neg"][1]
 
     def _yield_skip_channel_records(
         self,
@@ -188,34 +155,6 @@ class NegativeFluorescenceTest(QCTester):
             )
             yield test
 
-    def classify(
-        self,
-        test: QCTestRecord,
-        neg_warn: float | None = None,
-        neg_severe: float | None = None,
-        **kwargs
-    ) -> QCTestRecord:
-        """Classify test results based on thresholds."""
-        _neg_warn = neg_warn if neg_warn is not None else self.neg_warn
-        _neg_severe = neg_severe if neg_severe is not None else self.neg_severe
-        _validate_warn_severe("neg_warn", _neg_warn, "neg_severe", _neg_severe)
-
-        test.thresholds["ratio_neg"] = (_neg_warn, _neg_severe)
-
-        if test.status == "SKIP":
-            return test
-
-        if test.metrics["ratio_neg"] > _neg_severe:
-            test.status = "SEVERE"
-            test.message = "High proportion of negative events."
-        elif test.metrics["ratio_neg"] > _neg_warn:
-            test.status = "WARN"
-            test.message = "Moderate proportion of negative events."
-        else:
-            test.status = "PASS"
-
-        return test
-
     def plot(
         self,
         adata: AnnData,
@@ -277,7 +216,15 @@ class VeryNegativeFluorescenceTest(QCTester):
         "min_neg_events_for_sigma": 50,
         "k_sigma_threshold": 4.0,
     }
-    default_thresholds = {"ratio_very_neg": (0.01, 0.05)} # warn, severe thresholds for ratio of very negative events
+    meta_fields = [
+           ("channel", "Channel name"),
+           ("min_events_for_sigma", "Minimum events for sigma estimation"),
+           ("k_sigma_threshold", "Sigma multiplier for cutoff"),
+       ]
+    metric_fields = [("ratio_very_neg", "Proportion of very negative events (below k-sigma cutoff)")]
+    default_thresholds = {
+           "ratio_very_neg": {"warn": (None, 0.01), "severe": (None, 0.05)}
+       }
     plot_type = "histogram"
     plot_description = "Distribution showing very negative events and sigma cutoff thresholds"
 
@@ -295,22 +242,6 @@ class VeryNegativeFluorescenceTest(QCTester):
         if self.metadata["k_sigma_threshold"] <= 0:
             raise ValueError("k_sigma_threshold must be positive.")
 
-        # Validate thresholds
-        _validate_warn_severe(
-            "ratio_very_neg",
-            self.very_warn,
-            "ratio_very_neg",
-            self.very_severe,
-            are_percentage=True
-        )
-
-    @property
-    def very_warn(self) -> float:
-        return self.thresholds["ratio_very_neg"][0]
-
-    @property
-    def very_severe(self) -> float:
-        return self.thresholds["ratio_very_neg"][1]
 
     def _yield_skip_channel_records(
         self,
@@ -436,28 +367,6 @@ class VeryNegativeFluorescenceTest(QCTester):
             )
             yield test
 
-    def classify(self, test: QCTestRecord, **kwargs) -> QCTestRecord:
-        """Classify test results based on thresholds."""
-        _very_warn = kwargs.get("very_warn", self.very_warn)
-        _very_severe = kwargs.get("very_severe", self.very_severe)
-        _validate_warn_severe("very_warn", _very_warn, "very_severe", _very_severe)
-
-        test.thresholds["ratio_very_neg"] = (_very_warn, _very_severe)
-
-        if test.status == "SKIP":
-            return test
-
-        if test.metrics["ratio_very_neg"] > _very_severe:
-            test.status = "SEVERE"
-            test.message = "High proportion of very negative events."
-        elif test.metrics["ratio_very_neg"] > _very_warn:
-            test.status = "WARN"
-            test.message = "Moderate proportion of very negative events."
-        else:
-            test.status = "PASS"
-
-        return test
-
     def plot(
         self,
         adata: AnnData,
@@ -533,7 +442,20 @@ class NegativeEnrichmentTest(QCTester):
         "high_quantile": 0.99,
         "min_high_events": 1000,
     }
-    default_thresholds = {"p_neg_given_high_donor": (0.05, 0.15)}
+    meta_fields = [
+           ("donor_channel", "Donor channel name"),
+           ("receiver_channel", "Receiver channel name"),
+           ("compensation_coefficient", "Spillover compensation coefficient"),
+           ("high_quantile", "Quantile threshold for high donor events"),
+           ("n_donor_high", "Number of events with high donor signal"),
+           ("p_neg_given_low_donor", "Proportion of negative receiver values when donor is low"),
+       ]
+    metric_fields = [
+           ("p_neg_given_high_donor", "Proportion of negative receiver values when donor is high"),
+       ]
+    default_thresholds = {
+           "p_neg_given_high_donor": {"warn": (None, 0.20), "severe": (None, 0.40)}
+       }
     plot_type = "scatter"
     plot_description = "Donor-receiver fluorescence correlation in high-donor population"
 
@@ -554,11 +476,6 @@ class NegativeEnrichmentTest(QCTester):
         if min_events <= 0:
             raise ValueError("min_high_events must be positive.")
         self.metadata["min_high_events"] = min_events
-
-        # Validate thresholds
-        warn_val = self.thresholds.get("p_neg_given_high_donor", (0.05, 0.15))[0]
-        severe_val = self.thresholds.get("p_neg_given_high_donor", (0.05, 0.15))[1]
-        _validate_warn_severe("p_neg_given_high_donor", warn_val, "p_neg_given_high_donor", severe_val)
 
     def _yield_skip_pair_records(
         self,
@@ -650,12 +567,40 @@ class NegativeEnrichmentTest(QCTester):
                     continue
 
                 coef = entity.spill.at[receiver, donor]
+                # Check if we have enough high-donor events
+                if n_high < min_high_events:
+                    metadata = {
+                        "donor_channel": donor,
+                        "receiver_channel": receiver,
+                        "compensation_coefficient": coef,
+                        "high_quantile": high_quantile,
+                        "n_donor_high": n_high,
+                        "p_neg_given_low_donor": 0.0,
+                    }
+                    yield QCTestRecord(
+                        id=self.make_key(targets, metadata),
+                        test_type=self.test_type,
+                        test_name=self.test_name,
+                        targets=targets,
+                        metadata=metadata,
+                        metrics={"p_neg_given_high_donor": 0.0},
+                        status="SKIP",
+                        message=f"Insufficient high-donor events ({n_high} < {min_high_events})"
+                    )
+                    continue
+
+                # Extract receiver values
+                receiver_values = np.asarray(adata[:, receiver].X).ravel()
+                p_neg_high = float(np.mean(receiver_values[donor_high] < 0))
+                p_neg_low = float(np.mean(receiver_values[~donor_high] < 0))
+
                 metadata = {
                     "donor_channel": donor,
                     "receiver_channel": receiver,
                     "compensation_coefficient": coef,
                     "high_quantile": high_quantile,
                     "n_donor_high": n_high,
+                    "p_neg_given_low_donor": p_neg_low,
                 }
                 test = QCTestRecord(
                     id=self.make_key(targets, metadata),
@@ -663,56 +608,11 @@ class NegativeEnrichmentTest(QCTester):
                     test_name=self.test_name,
                     targets=targets,
                     metadata=metadata,
-                    metrics={
-                        "p_neg_given_high_donor": 0.0,
-                        "p_neg_given_low_donor": 0.0,
-                    },
+                    metrics={"p_neg_given_high_donor": p_neg_high},
                     status="PENDING"
                 )
 
-                # Extract receiver values
-                receiver_values = np.asarray(adata[:, receiver].X).ravel()
-
-                if n_high > 0:
-                    test.metrics["p_neg_given_high_donor"] = \
-                        float(np.mean(receiver_values[donor_high] < 0))
-                    test.metrics["p_neg_given_low_donor"] = float(np.mean(receiver_values[~donor_high] < 0))
-
                 yield test
-
-    def classify(
-        self,
-        test: QCTestRecord,
-        **kwargs,
-    ) -> QCTestRecord:
-        """Classify test results based on thresholds."""
-        _min_high_events = kwargs.get("min_high_events", self.metadata["min_high_events"])
-        _neg_warn = kwargs.get("neg_warn", self.thresholds["p_neg_given_high_donor"][0])
-        _neg_severe = kwargs.get("neg_severe", self.thresholds["p_neg_given_high_donor"][1])
-        _validate_warn_severe("p_neg_given_high_donor", _neg_warn, "p_neg_given_high_donor", _neg_severe)
-
-        test.thresholds["p_neg_given_high_donor"] = (_neg_warn, _neg_severe)
-        test.thresholds["n_donor_high"] = (_min_high_events,)
-
-        if test.status == "SKIP":
-            return test
-
-        n_high = test.metadata["n_donor_high"]
-        p_neg = test.metrics["p_neg_given_high_donor"]
-
-        if n_high < _min_high_events:
-            test.status = "SKIP"
-            test.message = f"Insufficient high-donor events ({n_high} < {_min_high_events})"
-        elif p_neg > _neg_severe:
-            test.status = "SEVERE"
-            test.message = "High proportion of negative receiver events given high values of donor."
-        elif p_neg > _neg_warn:
-            test.status = "WARN"
-            test.message = "Moderate proportion of negative receiver events given high values of donor."
-        else:
-            test.status = "PASS"
-
-        return test
 
     def plot(
         self,
@@ -794,19 +694,28 @@ class HighDonorCorrelationTest(QCTester):
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("donor_channel", "receiver_channel")
     default_config = {"high_quantile": 0.99, "min_high_events": 1000}
-    default_thresholds = {"spearman_given_high_donor": (0.3, 0.5)} # warn, severe thresholds for Spearman correlation
+    meta_fields = [
+           ("donor_channel", "Donor channel name"),
+           ("receiver_channel", "Receiver channel name"),
+           ("spillover_coefficient", "Spillover compensation coefficient"),
+           ("high_quantile", "Quantile threshold for high donor events"),
+           ("high_threshold", "Actual fluorescence threshold for high donor"),
+           ("n_donor_high", "Number of events with high donor signal"),
+           ("spearman_given_high_donor", "Spearman correlation of donor-receiver in high-donor population"),
+       ]
+    metric_fields = [("donor_receiver_concordance", "Signed correlation (Spearman × sign of spillover coefficient)")]
+    default_thresholds = {
+           "donor_receiver_concordance": {"warn": (None, 0.7), "severe": (None, 0.9)}
+       }
     plot_type = "scatter"
     plot_description = "Donor-receiver correlation scatter in high-donor population"
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         super().__init__(config, thresholds)
-        _validate_percentage("high_quantile", self.metadata["high_quantile"])
+        validate_percentage("high_quantile", self.metadata["high_quantile"])
         if self.metadata["min_high_events"] <= 0:
             raise ValueError("min_high_events must be positive.")
 
-        cor_warn = self.thresholds["spearman_given_high_donor"][0]
-        cor_severe = self.thresholds["spearman_given_high_donor"][1]
-        _validate_warn_severe("spearman_given_high_donor_warn", cor_warn, "spearman_given_high_donor_severe", cor_severe)
 
     def _yield_skip_pair_records(
         self,
@@ -832,7 +741,7 @@ class HighDonorCorrelationTest(QCTester):
                     test_name=self.test_name,
                     targets=targets,
                     metadata=metadata,
-                    metrics={"spearman_given_high_donor": 0.0},
+                    metrics={"donor_receiver_concordance": 0.0},
                     status="SKIP",
                     message=message,
                 )
@@ -864,7 +773,11 @@ class HighDonorCorrelationTest(QCTester):
             adata = adata[mask_array]
 
         if adata.X is None or adata.n_obs <= min_high_events * 2:
-            yield from self._yield_skip_pair_records(entity, targets, message="Not enough events to test (after mask).")
+            yield from self._yield_skip_pair_records(
+                entity,
+                targets,
+                message="Not enough events to test (after mask)."
+            )
             return
 
         # Iterate through all donor-receiver pairs
@@ -898,60 +811,42 @@ class HighDonorCorrelationTest(QCTester):
                     "high_threshold": donor_thr,
                     "n_donor_high": n_high,
                 }
+
+                # Check if we have enough high-donor events
+                if n_high < min_high_events:
+                    metadata["spearman_given_high_donor"] = 0.0
+                    yield QCTestRecord(
+                        id=self.make_key(targets, metadata),
+                        test_type=self.test_type,
+                        test_name=self.test_name,
+                        targets=targets,
+                        metadata=metadata,
+                        metrics={"donor_receiver_concordance": 0.0},
+                        status="SKIP",
+                        message=f"Insufficient high-donor events ({n_high} < {min_high_events})"
+                    )
+                    continue
+
+                # Compute Spearman correlation for high-donor events
+                corr, _ = spearmanr(donor_values[donor_high], receiver_values[donor_high])  # pyright: ignore
+
+                # Compute concordance: signed correlation based on spillover coefficient
+                concordance = float(corr * np.sign(coef))  # pyright: ignore
+
+                # Store both in metadata for reference and in metric for threshold checking
+                metadata["spearman_given_high_donor"] = float(corr)  # pyright: ignore
+
                 test = QCTestRecord(
                     id=self.make_key(targets, metadata),
                     test_type=self.test_type,
                     test_name=self.test_name,
                     targets=targets,
                     metadata=metadata,
-                    metrics={"spearman_given_high_donor": 0.0},
+                    metrics={"donor_receiver_concordance": concordance},
                     status="PENDING"
                 )
 
-                corr, _ = spearmanr(donor_values[donor_high], receiver_values[donor_high])  # pyright: ignore
-                test.metrics["spearman_given_high_donor"] = corr  # pyright: ignore
-
                 yield test
-
-    def classify(
-        self,
-        test: QCTestRecord,
-        **kwargs
-    ) -> QCTestRecord:
-        """Classify test results based on thresholds."""
-        _min_high_events = kwargs.get("min_high_events", self.metadata["min_high_events"])
-        _cor_warn = kwargs.get("cor_warn", self.thresholds["spearman_given_high_donor"][0])
-        _cor_severe = kwargs.get("cor_severe", self.thresholds["spearman_given_high_donor"][1])
-        _validate_warn_severe("cor_warn", _cor_warn, "cor_severe", _cor_severe)
-
-        test.thresholds["spearman_given_high_donor"] = (_cor_warn, _cor_severe)
-        test.thresholds["n_donor_high"] = (_min_high_events,)
-
-        if test.status == "SKIP":
-            return test
-
-        n_high = test.metadata["n_donor_high"]
-        if n_high < _min_high_events:
-            test.status = "SKIP"
-            test.message = f"Insufficient high-donor events ({n_high} < {_min_high_events})"
-            return test
-
-        spill_coeff = test.metadata.get("spillover_coefficient", None)
-        if spill_coeff is None:
-            cor = np.abs(test.metrics["spearman_given_high_donor"])
-        else:
-            cor = np.sign(spill_coeff) * test.metrics["spearman_given_high_donor"]
-
-        if cor > _cor_severe:
-            test.status = "SEVERE"
-            test.message = "High Spearman correlation in high-donor subset."
-        elif cor > _cor_warn:
-            test.status = "WARN"
-            test.message = "Moderate Spearman correlation in high-donor subset."
-        else:
-            test.status = "PASS"
-
-        return test
 
     def _plot_simple(
         self,
@@ -1275,17 +1170,23 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         dict[str, type[QCTester]]
             Mapping of test_name → QCTester subclass
         """
-        return {
-            "negative_fluorescence": NegativeFluorescenceTest,
-            "very_negative_fluorescence": VeryNegativeFluorescenceTest,
-            "negative_enrichment": NegativeEnrichmentTest,
-            "high_donor_correlation": HighDonorCorrelationTest,
-        }
+        qc_testers = (
+            NegativeFluorescenceTest,
+            VeryNegativeFluorescenceTest,
+            NegativeEnrichmentTest,
+            HighDonorCorrelationTest,
+        )
+        return {tester.test_name: tester for tester in qc_testers}
 
     def required_layer(self, entity: CompensationRef | None = None) -> str:
         return "comp"
 
-    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> CompensationRef:
+    def load_entity(
+        self,
+        dataloader: UnifiedDataLoader,
+        entity_id: Hashable,
+        context: dict[str, Any] | None = None
+    ) -> CompensationRef:
         project = dataloader.load_data("project")
         if entity_id not in project.compensations:
             raise KeyError(f"Compensation '{entity_id}' not found in project.")
@@ -1299,7 +1200,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
+    ) -> None:
         """Evaluate compensation QC against a sample context.
 
         Parameters
@@ -1317,8 +1218,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
 
         Returns
         -------
-        EntityQCStatus
-            Updated QC status with test results and summary.
+        None
         """
         # Default context to empty dict to avoid None checks
         dataloader_context = dataloader_context or {}
@@ -1352,43 +1252,6 @@ class CompensationQCEvaluator(EntityQCEvaluator):
                 sample_id=sample_id,
             )
 
-        return entity_qc
-
-    def update_batch_qc(
-        self,
-        entity: CompensationRef,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader | None = None,
-        dataloader_context: dict[str, Any] | None = None,
-        *,
-        context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
-        """Update batch-level QC tests for compensation.
-
-        Compensation has no batch-level tests, so this is a no-op.
-
-        Parameters
-        ----------
-        entity : CompensationRef
-            The compensation entity being evaluated
-        entity_qc : EntityQCStatus
-            QC status to update
-        all_samples : Iterable[tuple[str, AnnData]] | None
-            Iterable of (sample_id, adata) tuples (unused)
-        context : dict[str, Any]
-            Optional evaluation context (unused)
-
-        Returns
-        -------
-        EntityQCStatus
-            Unchanged entity_qc (no batch tests for compensation)
-        """
-        return entity_qc
-
-    def summarize_entity_qc(self, entity_qc: EntityQCStatus) -> dict[str, Any]:
-        # TODO: check for outlier samples in metrics
-        return {}
-
     def check_compensated_adata(
         self,
         entity: CompensationRef,
@@ -1419,7 +1282,10 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         """
         comp_id = adata.uns.get("compensation_id", None)
         if not comp_id or comp_id != entity.id:
-            warnings.warn(f"Sample {sample_id} compensation_id '{comp_id}' does not match entity ID '{entity.id}'")
+            warnings.warn(
+                f"Sample {sample_id} compensation_id '{comp_id}' "
+                f"does not match entity ID '{entity.id}'"
+            )
 
         all_tests: dict[str, list[tuple[str, QCTestRecord]]] = {"channel": [], "pairwise": []}
 
@@ -1453,7 +1319,6 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
-        figure_dir: PathLike | None = None,
         **kwargs
     ) -> go.Figure:
         """Generate a figure for a specific test on demand.
@@ -1487,12 +1352,8 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         ValueError
             If multiple samples are provided (faceted plots planned for future).
         """
-        # Default context to empty dict to avoid None checks
         dataloader_context = dataloader_context or {}
 
-        # Get sample_id: support both singular 'sample_id' and plural 'sample_ids'
-
-        # Build adata iterator: either from context or create on-the-fly from dataloader
         if "adata" in dataloader_context:
             # Use provided iterable of (sample_id, adata) tuples
             adata_itr: Iterable[tuple[str, AnnData]] = dataloader_context["adata"]
@@ -1503,8 +1364,6 @@ class CompensationQCEvaluator(EntityQCEvaluator):
                 raise ValueError("dataloader must be provided if 'adata' is not in dataloader_context")
 
             sample_ids: list[str] = list(dataloader_context.get("sample_ids") or entity_qc.sample_qc.keys())
-
-            # Validate and resolve sample_id
             if len(sample_ids) > 1:
                 raise NotImplementedError(
                     f"Multiple samples ({len(sample_ids)}) are not yet supported for figure generation. "
@@ -1512,27 +1371,20 @@ class CompensationQCEvaluator(EntityQCEvaluator):
                 )
             if len(sample_ids) == 0:
                 raise ValueError("sample_ids must not be empty")
-            # adata_itr = (
-            #     (sample_id, dataloader.load_adata(sample_id, layer="comp"))
-            #     for sample_id in sample_ids
-            # )
+
             sample_id = sample_ids[0]
             layer = self.required_layer()
-            adata = dataloader.load_adata(sample_id, layer="comp")
-
+            adata = dataloader.load_adata(sample_id, layer=layer)
 
         if adata is None:
             raise ValueError(f"No AnnData found for sample {sample_id}")
 
-        # Retrieve QC status for the sample
         if sample_id not in entity_qc.sample_qc:
             raise KeyError(f"Sample {sample_id} not found in QC status for entity {entity_qc.entity_id}")
         sample_run = entity_qc.sample_qc[sample_id]
 
         # Parse and validate test_key using helper
         tester_class, test_key_dict = self._parse_test_key(test_key)
-
-        # Generate test key tuple using tester's make_key method
         tester = tester_class()
         test_key_tuple = tester.make_key(test_key_dict)
 
@@ -1563,6 +1415,9 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     ) -> Iterable[QCTestRecord]:
         """Run all compensation QC testers using a unified fit_classify interface."""
 
+        cfg = self.config.copy()
+        cfg.update(config)
+
         missing = [channel for channel in entity.detectors if channel not in adata.var_names]
         if missing:
             raise ValueError(f"Channels {missing} from compensation entity not found in adata.var_names")
@@ -1570,49 +1425,29 @@ class CompensationQCEvaluator(EntityQCEvaluator):
 
         testers: list[QCTester] = [
             NegativeFluorescenceTest(
-                thresholds={
-                    "ratio_neg": (
-                        config.get("neg_warn", self.default_config["neg_warn"]),
-                        config.get("neg_severe", self.default_config["neg_severe"]),
-                    )
-                },
+                thresholds={"ratio_neg": {"warn": (None, cfg["neg_warn"]), "severe": (None, cfg["neg_severe"])}},
             ),
             VeryNegativeFluorescenceTest(
                 config={
-                    "min_neg_events_for_sigma": config.get(
-                        "min_neg_events_for_sigma", self.default_config["min_neg_events_for_sigma"]
-                    ),
-                    "k_sigma_threshold": config.get("k_sigma_threshold", self.default_config["k_sigma_threshold"]),
+                    "min_neg_events_for_sigma": cfg["min_neg_events_for_sigma"],
+                    "k_sigma_threshold": cfg["k_sigma_threshold"],
                 },
-                thresholds={
-                    "ratio_very_neg": (
-                        config.get("very_warn", self.default_config["very_warn"]),
-                        config.get("very_severe", self.default_config["very_severe"]),
-                    )
-                },
+                thresholds={"ratio_very_neg": {"warn": (None, cfg["very_warn"]), "severe": (None, cfg["very_severe"])}},
             ),
                 NegativeEnrichmentTest(
                     config={
-                        "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
-                        "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
+                        "high_quantile": cfg["high_quantile"],
+                        "min_high_events": cfg["min_high_events"],
                     },
-                    thresholds={
-                        "p_neg_given_high_donor": (
-                            config.get("tail_neg_warn", self.default_config["tail_neg_warn"]),
-                            config.get("tail_neg_severe", self.default_config["tail_neg_severe"]),
-                        )
-                    },
+                    thresholds={"p_neg_given_high_donor": {"warn": (None, cfg["tail_neg_warn"]), "severe": (None, cfg["tail_neg_severe"])}},
                 ),
                 HighDonorCorrelationTest(
                     config={
-                        "high_quantile": config.get("high_quantile", self.default_config["high_quantile"]),
-                        "min_high_events": config.get("min_high_events", self.default_config["min_high_events"]),
+                        "high_quantile": cfg["high_quantile"],
+                        "min_high_events": cfg["min_high_events"],
                     },
                     thresholds={
-                        "spearman_given_high_donor": (
-                            config.get("tail_cor_warn", self.default_config["tail_cor_warn"]),
-                            config.get("tail_cor_severe", self.default_config["tail_cor_severe"]),
-                        )
+                        "donor_receiver_concordance": {"warn": (None, cfg["tail_cor_warn"]), "severe": (None, cfg["tail_cor_severe"])}
                     },
                 ),
             ]

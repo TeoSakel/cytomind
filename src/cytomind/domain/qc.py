@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Mapping, Iterable, Sequence, Any, TYPE_CHECKING, cast
+from typing import Mapping, Iterable, Any, TYPE_CHECKING, cast
 
 
 if TYPE_CHECKING:
@@ -59,7 +59,8 @@ class QCTestRecord:
     targets: dict[str, Any] = field(default_factory=dict)                   # target identifiers (sample_id, compensation_id, strategy_id, etc.)
     metadata: dict[str, Any] = field(default_factory=dict)                  # context (gate_id, channel, cutpoint, bounds, etc.)
     metrics: dict[str, Numeric] = field(default_factory=dict)               # measured values (proportion_passing, r_squared, p_neg, etc.)
-    thresholds: dict[str, Sequence[Numeric]] = field(default_factory=dict)  # threshold parameters (set by evaluator)
+    thresholds: dict[str, dict[str, tuple[Numeric | None, Numeric | None]]] = field(default_factory=dict)
+    # standardized threshold parameters: {metric_name: {"warn": (low, high), "severe": (low, high)}}
     status: str = "PENDING"                                                 # "PENDING" (execution) → "PASS"/"WARN"/"SEVERE"/"FAIL"/"SKIP" (evaluator)
     message: str = ""                                                       # human-readable summary (set by evaluator)
 
@@ -232,6 +233,13 @@ class QCRunStatus:
                 messages = cast(list[str], messages)  # avoid type confusion with tests which are tuples
                 out.update(messages)
         return list(out)
+
+    @property
+    def all_tests(self) -> dict[tuple, QCTestRecord]:
+        tests = {}
+        for step in self.steps.values():
+            tests.update(step.tests)
+        return tests
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict."""

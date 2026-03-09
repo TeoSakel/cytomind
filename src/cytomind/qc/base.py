@@ -6,13 +6,12 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from pathlib import Path
 from typing import Any, Hashable, Mapping, Iterator, Iterable, TYPE_CHECKING
+import math
 import warnings
 
-import numpy as np
 import pandas as pd
 from anndata import AnnData
 
-from cytomind.infra.repo import ProjectRepository
 from cytomind.domain.qc import EntityQCStatus, QCTestRecord
 from cytomind.utils import now_iso
 
@@ -21,6 +20,7 @@ from . import EntityQCEvaluatorRegistry
 if TYPE_CHECKING:
     from cytomind.domain.constants import PathLike
     from cytomind.domain.pipeline import StepRun
+    from cytomind.infra.repo import ProjectRepository
     from cytomind.infra.dataloader import UnifiedDataLoader
     from pandas import DataFrame
     from plotly.graph_objects import Figure
@@ -28,6 +28,7 @@ else:
     StepRun = object
     PathLike = object
     UnifiedDataLoader = object
+    ProjectRepository = object
     Figure = object
     DataFrame = object
 
@@ -52,7 +53,11 @@ class QCTester(ABC):
 
     Concrete implementations should:
     - Set test_type and test_name class attributes
+    - Define meta_fields: list[tuple[name, description]] for metadata created in QCTestRecord.metadata
+    - Define metric_fields: list[tuple[name, description]] for metrics created in QCTestRecord.metrics
     - Define default_config and default_thresholds
+    - Use systematic threshold format: {metric_name: {"warn": (low, high), "severe": (low, high)}}
+      where low/high can be None if no threshold in that direction
     - Implement fit/classify/plot/make_key for their specific entity type
     - If plot() is implemented, populate plot_type and plot_description
     - Use **kwargs for entity-specific dimensions (donors, parents, receivers, etc.)
@@ -62,12 +67,19 @@ class QCTester(ABC):
     test_name: str                           # name of the test
     target_keys: tuple[str, ...] = ()        # Fields from targets that identify tested entity instance(s)
     meta_keys: tuple[str, ...] = ()          # Fields from metadata that identify tested dimensions
+    meta_fields: list[tuple[str, str]] = []   # [(name, description)] for metadata keys in QCTestRecord.metadata
+    metric_fields: list[tuple[str, str]] = [] # [(name, description)] for metric keys in QCTestRecord.metrics
     default_config: dict[str, Any] = {}      # Default config parameters for the tester
     default_thresholds: dict[str, Any] = {}  # Default thresholds for classifying test results
+                                             # Format: {metric_name: {"warn": (low, high), "severe": (low, high)}}
+                                             # where low/high can be None if no threshold in that direction
     plot_type: str = ""                      # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
     plot_description: str = ""               # Human-readable description for frontend UI
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
+        # Validate threshold format
+        self._validate_thresholds_format(thresholds if thresholds else self.default_thresholds)
+
         # Keep a concrete, instance-level tuple for downstream code paths.
         cfg = dict(self.default_config)
         for key in cfg:
@@ -80,14 +92,139 @@ class QCTester(ABC):
                 thres[key] = thresholds[key]
         self.thresholds = thres
 
+    @classmethod
+    def _validate_thresholds_format(cls, thresholds: Mapping[str, Any]) -> None:
+        """
+        Validate that thresholds follow the systematic format:
+        {metric_name: {"warn": (low, high), "severe": (low, high)}}
+
+        Parameters
+        ----------
+        thresholds : Mapping[str, Any]
+            Threshold dictionary to validate
+
+        Raises
+        ------
+        ValueError
+            If thresholds don't follow the expected format
+        """
+        for metric_name, threshold_spec in thresholds.items():
+            if not isinstance(threshold_spec, dict):
+                raise ValueError(
+                    f"Threshold for metric '{metric_name}' must be a dict with 'warn' and 'severe' keys, "
+                    f"got {type(threshold_spec).__name__}"
+                )
+
+            required_keys = {"warn", "severe"}
+            if not required_keys.issubset(threshold_spec.keys()):
+                missing = required_keys - threshold_spec.keys()
+                raise ValueError(
+                    f"Threshold for metric '{metric_name}' missing required keys: {missing}. "
+                    f"Expected format: {{'warn': (low, high), 'severe': (low, high)}}"
+                )
+
+            for level in ["warn", "severe"]:
+                value = threshold_spec[level]
+                if not isinstance(value, (tuple, list)):
+                    raise ValueError(
+                        f"Threshold '{metric_name}.{level}' must be a tuple/list (low, high), "
+                        f"got {type(value).__name__}"
+                    )
+                if len(value) != 2:
+                    raise ValueError(
+                        f"Threshold '{metric_name}.{level}' must have exactly 2 elements (low, high), "
+                        f"got {len(value)} elements"
+                    )
+                low, high = value
+                if low is not None and not isinstance(low, (int, float)):
+                    raise ValueError(
+                        f"Threshold '{metric_name}.{level}' low bound must be numeric or None, "
+                        f"got {type(low).__name__}"
+                    )
+                if high is not None and not isinstance(high, (int, float)):
+                    raise ValueError(
+                        f"Threshold '{metric_name}.{level}' high bound must be numeric or None, "
+                        f"got {type(high).__name__}"
+                    )
+                if low is not None and high is not None and low > high:
+                    raise ValueError(
+                        f"Threshold '{metric_name}.{level}' low bound ({low}) cannot be greater than "
+                        f"high bound ({high})"
+                    )
+
     @property
     def key_fields(self) -> tuple[str, ...]:
         return self.target_keys + ("test_type", "test_name") + self.meta_keys
 
+    @classmethod
+    def _meta_field_names(cls) -> tuple[str, ...]:
+        return tuple(name for name, _ in cls.meta_fields)
+
+    @classmethod
+    def _metric_field_names(cls) -> tuple[str, ...]:
+        return tuple(name for name, _ in cls.metric_fields)
+
+    def get_threshold(self, metric_name: str, level: str = "warn") -> tuple[float | None, float | None]:
+        """
+        Get threshold bounds for a specific metric and level.
+
+        Parameters
+        ----------
+        metric_name : str
+            Name of the metric
+        level : str
+            Threshold level: "warn" or "severe"
+
+        Returns
+        -------
+        tuple[float | None, float | None]
+            (low, high) bounds where None means no threshold in that direction
+
+        Raises
+        ------
+        KeyError
+            If metric_name or level not found in thresholds
+        """
+        if metric_name not in self.thresholds:
+            raise KeyError(f"Metric '{metric_name}' not found in thresholds")
+        if level not in self.thresholds[metric_name]:
+            raise KeyError(f"Level '{level}' not found in thresholds for metric '{metric_name}'")
+        return tuple(self.thresholds[metric_name][level])
+
+    def check_threshold(
+        self,
+        value: float,
+        metric_name: str,
+        level: str = "warn"
+    ) -> bool:
+        """
+        Check if a value violates the threshold for a metric at a given level.
+
+        Parameters
+        ----------
+        value : float
+            The metric value to check
+        metric_name : str
+            Name of the metric
+        level : str
+            Threshold level: "warn" or "severe"
+
+        Returns
+        -------
+        bool
+            True if value violates threshold (outside bounds), False otherwise
+        """
+        low, high = self.get_threshold(metric_name, level)
+
+        if low is not None and value < low:
+            return True
+        if high is not None and value > high:
+            return True
+        return False
+
     def fit(self, *args, **kwargs) -> Iterable[QCTestRecord]:
         raise NotImplementedError("fit() method not implemented for this tester. This tester cannot be used for testing or plotting.")
 
-    @abstractmethod
     def classify(self, test: QCTestRecord, **kwargs) -> QCTestRecord:
         """
         Populate test_record.status based on metrics and thresholds.
@@ -107,9 +244,61 @@ class QCTester(ABC):
             - thresholds: applied threshold values
             - message: human-readable summary
         """
-        pass
+        if test.status == "SKIP":
+            return test
 
-    def fit_classify( self, **kwargs) -> Iterable[QCTestRecord]:
+        thresholds = kwargs.get("thresholds", self.thresholds)
+        self._validate_thresholds_format(thresholds)
+        test.thresholds = dict(thresholds)
+
+        severe_hits: list[str] = []
+        warn_hits: list[str] = []
+        skipped_metrics: list[str] = []
+
+        for metric_name, threshold_spec in thresholds.items():
+            if metric_name not in test.metrics:
+                continue
+
+            raw_value = test.metrics[metric_name]
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                skipped_metrics.append(metric_name)
+                continue
+
+            if math.isnan(value):
+                skipped_metrics.append(metric_name)
+                continue
+
+            severe_low, severe_high = threshold_spec["severe"]
+            warn_low, warn_high = threshold_spec["warn"]
+
+            severe = ((severe_low is not None and value < severe_low) or
+                      (severe_high is not None and value > severe_high))
+            warn = ((warn_low is not None and value < warn_low) or
+                    (warn_high is not None and value > warn_high))
+
+            if severe:
+                severe_hits.append(metric_name)
+            elif warn:
+                warn_hits.append(metric_name)
+
+        if severe_hits:
+            test.status = "SEVERE"
+            test.message = f"Severe threshold violation for: {', '.join(sorted(severe_hits))}"
+        elif warn_hits:
+            test.status = "WARN"
+            test.message = f"Warning threshold violation for: {', '.join(sorted(warn_hits))}"
+        elif skipped_metrics and len(skipped_metrics) == len(thresholds):
+            test.status = "SKIP"
+            test.message = "No valid metric values available for threshold classification."
+        else:
+            test.status = "PASS"
+            test.message = "All metric values are within configured thresholds."
+
+        return test
+
+    def fit_classify(self, **kwargs) -> Iterable[QCTestRecord]:
         """
         Convenience method to run fit and classify sequentially.
 
@@ -119,7 +308,6 @@ class QCTester(ABC):
             classified_test = self.classify(test, **kwargs)
             yield classified_test
 
-    @abstractmethod
     def plot(self, adata: AnnData, test: QCTestRecord, output_path: PathLike | None = None, **kwargs) -> Figure:
         """
         Generate diagnostic plot for test.
@@ -144,7 +332,7 @@ class QCTester(ABC):
         Figure
             Plotly figure object
         """
-        pass
+        raise NotImplementedError("This tester does not support plotting.")
 
     def key_dict(
         self,
@@ -154,11 +342,13 @@ class QCTester(ABC):
 
         targets = targets or {}
         metadata = metadata or {}
+        common = {**targets, **metadata}
 
-        missing = [key for key in self.target_keys if key not in targets]
+
+        missing = [key for key in self.target_keys if key not in common]
         if missing:
             raise KeyError(f"Missing target keys: {missing}")
-        missing = [key for key in self.meta_keys if key not in metadata]
+        missing = [key for key in self.meta_keys if key not in common]
         if missing:
             raise KeyError(f"Missing metadata keys: {missing}")
 
@@ -166,8 +356,8 @@ class QCTester(ABC):
             "test_type": self.test_type,
             "test_name": self.test_name
         }
-        for key in self.target_keys: d[key] = targets[key]
-        for key in self.meta_keys:   d[key] = metadata[key]
+        keys = self.target_keys + self.meta_keys
+        for key in keys: d[key] = common[key]
 
         return d
 
@@ -179,6 +369,39 @@ class QCTester(ABC):
         keys =  self.target_keys + ("test_type", "test_name") + self.meta_keys
         key_dict = self.key_dict(targets=targets, metadata=metadata)
         return tuple(key_dict[key] for key in keys)
+
+    def to_record(self, test: QCTestRecord) -> dict[str, Any]:
+        """
+        Create a row record from a QCTestRecord, including key fields, status, and metrics.
+
+        The record combines:
+        - Key fields from key_dict (targets + test_type + test_name + metadata keys)
+        - Status from the test record
+        - All metrics from the test record
+
+        Parameters
+        ----------
+        test : QCTestRecord
+            The test record to convert to a table row
+
+        Returns
+        -------
+        dict[str, Any]
+            Record dict with keys from key_dict, 'status', and all metrics
+        """
+        # Build key_dict with targets and test metadata
+        key_dict = self.key_dict(test.targets, test.metadata)
+
+        # Build record starting with key_dict and status
+        record = {
+            **key_dict,
+            "status": test.status,
+        }
+
+        # Add all metrics
+        record.update(test.metrics)
+
+        return record
 
     @classmethod
     def from_dict(cls, test: QCTestRecord | Mapping[str, Any]) -> QCTester:
@@ -202,6 +425,18 @@ class QCTester(ABC):
         for field in cls.meta_keys:
             if field not in test.metadata:
                 raise ValueError(f"Test record is missing metadata key field '{field}' in metadata")
+
+        # meta_fields can include conditional metadata (method-specific values, etc.).
+        # Only meta_keys are strictly required for record identity.
+
+        # Validate metric_fields if defined
+        if cls.metric_fields:
+            for field in cls._metric_field_names():
+                if field not in test.metrics:
+                    raise ValueError(f"Test record is missing expected metric field '{field}' in metrics")
+
+        # Validate thresholds format
+        cls._validate_thresholds_format(test.thresholds)
 
 
 class EntityQCEvaluator(ABC):
@@ -382,9 +617,14 @@ class EntityQCEvaluator(ABC):
         *,
         context: dict[str, Any] = {},
     ) -> EntityQCStatus:
-        entity_qc = entity_qc or EntityQCStatus(entity_id=entity.id, entity_type=self.entity_type, generated_at=now_iso())
-        entity_qc = self.update_sample_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
-        entity_qc = self.update_batch_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
+        if entity_qc is None:
+            entity_qc = EntityQCStatus(
+                entity_id=entity.id,
+                entity_type=self.entity_type,
+                generated_at=now_iso()
+            )
+        self.update_sample_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
+        self.update_batch_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
         entity_qc.summary.update(self.basic_summary(entity_qc))
         summary_dict = self.summarize_entity_qc(entity_qc)
         if "status" in summary_dict:
@@ -394,7 +634,6 @@ class EntityQCEvaluator(ABC):
         entity_qc.summary.update(summary_dict)
         return entity_qc
 
-    @abstractmethod
     def update_sample_qc(
         self,
         entity: Any,
@@ -403,7 +642,7 @@ class EntityQCEvaluator(ABC):
         dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
+    ) -> None:
         """Update the QC for a specific entity instance.
 
         This method is stateless - it takes the entity, QC status, and dataloader
@@ -427,9 +666,8 @@ class EntityQCEvaluator(ABC):
         EntityQCStatus
             Updated QC status with test results and summary.
         """
-        pass
+        return
 
-    @abstractmethod
     def update_batch_qc(
         self,
         entity: Any,
@@ -438,7 +676,7 @@ class EntityQCEvaluator(ABC):
         dataloader_context: dict[str, Any] | None = None,
         *,
         context: dict[str, Any] = {},
-    ) -> EntityQCStatus:
+    ) -> None:
         """
         Update batch-level QC tests (run once across all samples).
 
@@ -460,12 +698,10 @@ class EntityQCEvaluator(ABC):
 
         Returns
         -------
-        EntityQCStatus
-            Updated entity_qc with batch test results in batch_qc
+        None
         """
-        pass
+        return
 
-    @abstractmethod
     def summarize_entity_qc(
         self,
         entity_qc: EntityQCStatus,
@@ -485,7 +721,7 @@ class EntityQCEvaluator(ABC):
         dict
             User-facing summary with tables, metrics, recommendations
         """
-        pass
+        return {}
 
 
     def parse_step(
@@ -553,23 +789,23 @@ class EntityQCEvaluator(ABC):
         Iterator[EntityQCStatus]
             Iterator over EntityQCStatus objects for each product entity
         """
-        # Loop through evaluable products only (products explicitly marked as ready for QC)
-        for entity_type, entities in step_run.evaluable_products.items():
+        evaluable_products = step_run.evaluable_products
 
-            # Check if evaluator exists for this entity type
-            evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
-            if not evaluator_class:
-                warnings.warn(f"No EntityQCEvaluator registered for entity type '{entity_type}'. Skipping QC evaluation for these products.")
+        # Process entity types in evaluator registry order (priority, then registration order).
+        for entity_type, evaluator_class in EntityQCEvaluatorRegistry.iter_evaluators():
+            entities = evaluable_products.get(entity_type)
+            if not entities:
                 continue
 
             evaluator = evaluator_class()  # TODO: consider passing entity-specific config if needed
-            for entity_id, context in entities.items():
-                if "sample_ids" in context:
-                    sample_ids: list[str] = context.pop("sample_ids")
-                else:
-                    sample_ids = list(step_run.sample_outputs.keys())  # Default to all samples in step outputs if not specified in context
+
+            # Preserve caller-provided order within entity type.
+            for entity_id, raw_context in entities.items():
+                context = dict(raw_context)
+                sample_ids = context.pop("sample_ids", list(step_run.sample_outputs.keys()))
+
                 qc_status = evaluator.parse_step(step_run, entity_id)
-                entity = evaluator.load_entity(repo._dataloader, entity_id)  # Load full entity for evaluation
+                entity = evaluator.load_entity(repo._dataloader, entity_id, context=context)  # Load full entity for evaluation
 
                 # Build dataloader context with sample_ids only
                 dataloader_context = {}
@@ -584,6 +820,14 @@ class EntityQCEvaluator(ABC):
                     context=context,
                 )
                 yield qc_status
+
+        # Warn for unknown types encountered in step output.
+        for entity_type in evaluable_products:
+            if EntityQCEvaluatorRegistry.get(entity_type) is None:
+                warnings.warn(
+                    f"No EntityQCEvaluator registered for entity type '{entity_type}'. "
+                    "Skipping QC evaluation for these products."
+                )
 
     def basic_summary(
         self,
@@ -606,7 +850,10 @@ class EntityQCEvaluator(ABC):
             User-facing summary with tables, metrics, recommendations
         """
         if entity_qc.entity_type != self.entity_type:
-            raise TypeError(f"EntityQCEvaluator for '{self.entity_type}' cannot summarize QC for entity type '{entity_qc.entity_type}'")
+            raise TypeError(
+                f"EntityQCEvaluator for '{self.entity_type}' cannot summarize "
+                f"QC for entity type '{entity_qc.entity_type}'"
+            )
 
         per_sample_flags = {sid: flag.value for sid, flag in entity_qc.sample_flags.items()}
         sample_counts = Counter(qc.overall_flag.value for qc in entity_qc.sample_qc.values())
@@ -616,9 +863,13 @@ class EntityQCEvaluator(ABC):
         for sample_id in entity_qc.sample_qc:
             for step_name, test_key, test in entity_qc.iter_sample_tests(sample_id):
                 if step_name not in test_summary:
-                    test_summary[step_name] = {test_key: {"PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0}}
+                    test_summary[step_name] = {
+                        test_key: {"PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0}
+                    }
                 if test_key not in test_summary[step_name]:
-                    test_summary[step_name][test_key] = {"PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0}
+                    test_summary[step_name][test_key] = {
+                        "PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0
+                    }
                 test_summary[step_name][test_key][test.status] += 1
 
         return {
@@ -629,7 +880,10 @@ class EntityQCEvaluator(ABC):
             },
             "aggregated_flag_counts": {
                 "overall": dict(sample_counts),
-                "by_test": {step_name: list(test_dict.items()) for step_name, test_dict in test_summary.items()},
+                "by_test": {
+                    step_name: list(test_dict.items())
+                    for step_name, test_dict in test_summary.items()
+                },
             }
         }
 
@@ -637,6 +891,7 @@ class EntityQCEvaluator(ABC):
         self,
         entity_qc: EntityQCStatus,
         table_type: str,
+        test_name: str | None = None,
         sample_ids: Iterable[str] | None = None,
         table_path: PathLike | None = None,
     ) -> DataFrame:
@@ -658,12 +913,17 @@ class EntityQCEvaluator(ABC):
             Optional list of sample IDs to filter the table.
         table_path : PathLike | None
             Optional output path to save the table CSV.
+        test_name : str | None
+            Optional specific test name to filter by. If provided, takes precedence over table_type.
 
         Returns
         -------
         DataFrame
             Table in long (melted) format with columns:
-            - sample_id, mask, status, [metadata keys from tester.key_dict()], metric, value
+            - Key fields from tester.key_fields (targets, test_type, test_name, metadata keys)
+            - status
+            - Tester configuration metadata (if any)
+            - Melted metrics as 'metric' and 'value' columns
 
         Examples
         --------
@@ -675,18 +935,31 @@ class EntityQCEvaluator(ABC):
         # Identify key columns from the first test of this type's target/meta keys
         tests = self.get_tests(entity=None)
         id_vars = []
+        tester_instance = None
 
-        # Get key fields from any test of the requested type
-        for tester_class in tests.values():
-            if tester_class.test_type == table_type:
-                id_vars = list(tester_class().key_fields)
-                break
+        # Get key fields from the appropriate test
+        if test_name is not None:
+            # If test_name is specified, use that test's fields
+            if test_name in tests:
+                tester_instance = tests[test_name]()
+                id_vars = list(tester_instance.key_fields)
+        else:
+            # Otherwise use the first test of the requested table_type
+            for tester_class in tests.values():
+                if tester_class.test_type == table_type:
+                    id_vars = list(tester_class().key_fields)
+                    break
+
         if not id_vars:
-            raise ValueError(f"No tests found for table_type '{table_type}'. Cannot determine id_vars for table generation.")
+            raise ValueError(
+                f"No tests found for table_type '{table_type}'"
+                + (f" with test_name '{test_name}'" if test_name else "")
+                + ". Cannot determine id_vars for table generation."
+            )
         id_vars += ["status"]  # Always include status as an id_var for melting
 
         # Extract records using helper method
-        records = self._extract_table_records(entity_qc, table_type, sample_ids=sample_ids)
+        records = self._extract_table_records(entity_qc, table_type, sample_ids=sample_ids, test_name=test_name)
 
         if not records:
             # Return empty DataFrame with correct column structure
@@ -701,7 +974,10 @@ class EntityQCEvaluator(ABC):
             output_path = Path(table_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             if output_path.exists():
-                warnings.warn(f"Output path {output_path} already exists and will be updated with new samples.")
+                warnings.warn(
+                    f"Output path {output_path} already exists "
+                    "and will be updated with new samples."
+                )
                 old = pd.read_csv(output_path, index_col=False)
                 # Use base class method to update the table
                 updated = self._update_qc_table(old, df)
@@ -716,12 +992,13 @@ class EntityQCEvaluator(ABC):
         entity_qc: EntityQCStatus,
         table_type: str,
         sample_ids: Iterable[str] | None = None,
+        test_name: str | None = None,
     ) -> list[dict[str, Any]]:
         """Extract test records across all samples and steps into a flattened list.
 
         This is a generalized helper method that iterates through all tests in the
         EntityQCStatus and extracts their data into records containing sample_id,
-        status, test metadata (via key_dict), and all metrics.
+        status, test metadata, and metrics.
 
         Parameters
         ----------
@@ -731,56 +1008,76 @@ class EntityQCEvaluator(ABC):
             Type of tests to extract (matches test_type field).
         sample_ids : Iterable[str] | None
             Optional list of sample IDs to filter which samples to include.
+        test_name : str | None
+            Optional specific test name to filter by. If provided, takes precedence over table_type
+            and only tests matching this name will be included. Must be a valid test name from get_tests().
 
         Returns
         -------
         list[dict[str, Any]]
             List of records, one per test, where each record contains:
-            - "sample_id": str
-            - "mask": str (from metadata.mask_key, defaults to "root")
+            - Key fields from tester.key_dict() (test_type, test_name, targets, metadata keys)
             - "status": str
-            - Test metadata from tester.key_dict() (e.g., "compensation_id", "channel")
             - All test metrics flattened as individual columns
         """
         # Use sample_ids from argument if provided, otherwise use all samples
         sample_filter = set(sample_ids or entity_qc.sample_qc.keys())
 
-        # Validate table_type
-        test_types = self.get_test_types()
-        if table_type not in test_types:
-            raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
-
-        records = []
+        # Get all available tests and validate parameters
         tests = self.get_tests(entity=None)
 
-        # Iterate through samples, steps, and tests
+        # Validate test_name against available test keys if specified
+        if test_name is not None:
+            if test_name not in tests:
+                valid_names = sorted(tests.keys())
+                raise ValueError(
+                    f"Invalid test_name '{test_name}'. Must be one of {valid_names}."
+                )
+        else:
+            # Validate table_type
+            test_types = self.get_test_types()
+            if table_type not in test_types:
+                raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
+
+        records = []
+
+        def append_test_record(test: QCTestRecord) -> None:
+            # If test_name is specified, filter by that; otherwise filter by table_type
+            if test_name is not None:
+                if test.test_name != test_name:
+                    return
+            else:
+                if test.test_type != table_type:
+                    return
+
+            # Get tester class and validate test_name
+            try:
+                tester_class = tests[test.test_name]
+            except KeyError:
+                valid_names = [key for key, val in tests.items() if val.test_type == table_type]
+                raise KeyError(
+                    f"Unknown test_name '{test.test_name}' for table_type '{table_type}'."
+                    f" Valid names are: {valid_names}"
+                )
+
+            # Create tester instance and use to_record to create the row record
+            tester = tester_class.from_dict(test)
+            record = tester.to_record(test)
+            records.append(record)
+
+        # Iterate through sample-level tests
         for sample_id, sample_run in entity_qc.sample_qc.items():
             if sample_id not in sample_filter:
                 continue
 
             for step in sample_run.steps.values():
                 for test in step.tests.values():
-                    # Skip tests that don't match the requested table_type
-                    if test.test_type != table_type:
-                        continue
+                    append_test_record(test)
 
-                    # Get tester class and validate test_name
-                    try:
-                        tester_class = tests[test.test_name]
-                    except KeyError:
-                        valid_names = [key for key, val in tests.items() if val.test_type == table_type]
-                        raise KeyError(f"Unknown test_name '{test.test_name}' for table_type '{table_type}'. Valid names are: {valid_names}")
-
-                    # Create tester instance and extract metadata keys
-                    tester = tester_class.from_dict(test)
-                    key_dict = tester.key_dict(test.targets, test.metadata)
-
-                    # Build record with status, metadata, and all metrics
-                    records.append({
-                        "status": test.status,
-                        **key_dict,
-                        **test.metrics,
-                    })
+        # Iterate through batch-level tests as well
+        for step in entity_qc.batch_qc.steps.values():
+            for test in step.tests.values():
+                append_test_record(test)
 
         return records
 
@@ -812,7 +1109,10 @@ class EntityQCEvaluator(ABC):
         test_type_old = df_old["test_type"].iloc[0]
         test_type_new = df_new["test_type"].iloc[0]
         if test_type_old != test_type_new:
-            raise ValueError(f"Cannot merge tables with different test types: '{test_type_old}' vs '{test_type_new}'")
+            raise ValueError(
+                "Cannot merge tables with different test types: "
+                f"'{test_type_old}' vs '{test_type_new}'"
+            )
 
         if not df_old.columns.equals(df_new.columns):
             raise ValueError("Old and new DataFrames must have the same columns to merge.")
@@ -826,7 +1126,6 @@ class EntityQCEvaluator(ABC):
         df_combined = pd.concat([df_old_filtered, df_new], ignore_index=True)
         return df_combined
 
-    @abstractmethod
     def generate_figure(
         self,
         entity_qc: EntityQCStatus,
@@ -834,7 +1133,6 @@ class EntityQCEvaluator(ABC):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
-        figure_dir: PathLike | None = None,
         **kwargs: Any,
     ) -> Figure:
         """Generate a diagnostic figure on demand.
@@ -862,8 +1160,6 @@ class EntityQCEvaluator(ABC):
         step_id : str | None
             Optional step ID to narrow scope of search/visualization.
             Meaning depends on entity type.
-        figure_dir : PathLike | None
-            Optional directory to save the figure.
         **kwargs : Any
             Additional entity-specific plotting options.
 
@@ -872,9 +1168,8 @@ class EntityQCEvaluator(ABC):
         Figure
             Plotly figure object ready to be serialized or displayed.
         """
-        pass
+        raise NotImplementedError("This evaluator does not support figure generation.")
 
-    @abstractmethod
     def required_layer(self, entity: Any = None) -> str | None:
         """Return the name of the AnnData layer required for this evaluator's tests.
 
@@ -889,10 +1184,15 @@ class EntityQCEvaluator(ABC):
             Name of the required AnnData layer (e.g., "raw_counts", "compensated", "gate_mask").
             If None, no layer is required.
         """
-        pass
+        return None
 
     @abstractmethod
-    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> Any:
+    def load_entity(
+        self,
+        dataloader: UnifiedDataLoader,
+        entity_id: Hashable,
+        context: dict[str, Any] | None = None
+    ) -> Any:
         """Load the entity object from the dataloader given its ID.
 
         This method is used to retrieve the full entity (e.g., GateNode, CompensationRef)
@@ -905,6 +1205,8 @@ class EntityQCEvaluator(ABC):
             Dataloader instance to load data from.
         entity_id : str
             Unique identifier of the entity to load.
+        context : dict[str, Any] | None
+            Optional context dict with additional metadata (e.g., strategy_id for gate nodes).
 
         Returns
         -------
@@ -950,11 +1252,17 @@ class EntityQCEvaluator(ABC):
             test_name = str(test_key[1])
             test_key_dict = None
         else:
-            raise ValueError("test_key must be either a tuple or a mapping with 'test_type' and 'test_name' keys.")
+            raise ValueError(
+                "test_key must be either a tuple or a mapping with "
+                "'test_type' and 'test_name' keys."
+            )
 
         # Validate test_type
         if test_type not in self.get_test_types():
-            raise ValueError(f"Unsupported test_type '{test_type}'. Expected one of: {self.get_test_types()}")
+            raise ValueError(
+                f"Unsupported test_type '{test_type}'. "
+                f"Expected one of: {self.get_test_types()}"
+            )
 
         # Look up tester_class from get_tests()
         tests = self.get_tests(entity=None)

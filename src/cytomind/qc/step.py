@@ -2,7 +2,7 @@
 Step-level QC summarization.
 """
 from __future__ import annotations
-from typing import Any, Hashable, TYPE_CHECKING
+from typing import Any, Hashable, TYPE_CHECKING, Iterable
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,19 +10,15 @@ import networkx as nx
 
 from . import EntityQCEvaluatorRegistry
 from .base import EntityQCEvaluator
-from cytomind.domain.qc import QCFlag
+from cytomind.domain.qc import EntityQCStatus, QCFlag
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import PathLike
-    from cytomind.domain.qc import EntityQCStatus
     from cytomind.domain.pipeline import StepRun
-    from cytomind.infra.repo import ProjectRepository
     from cytomind.infra.dataloader import UnifiedDataLoader
 else:
     PathLike = object
-    EntityQCStatus = object
     StepRun = object
-    ProjectRepository = object
     UnifiedDataLoader = object
 
 
@@ -64,101 +60,12 @@ class StepQCEvaluator(EntityQCEvaluator):
         },
     }
 
-    def get_tests(self, entity: StepRun | None = None) -> dict[str, type]:
-        """Return dictionary of test classes for step QC.
-
-        Steps have no tests of their own; QC data comes from execution phases.
-
-        Parameters
-        ----------
-        entity : Any, optional
-            Entity parameter (ignored for step evaluator).
-
-        Returns
-        -------
-        dict[str, type]
-            Empty dict (no tests for step QC)
-        """
-        return {}
-
-    def required_layer(self, entity: StepRun | None = None) -> str | None:
-        return None
-
-    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable) -> StepRun:
+    def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable, context: dict[str, Any] | None = None) -> StepRun:
         return dataloader.load_data("step_run", step_id=str(entity_id))
 
     def parse_step(self, step_run: StepRun, entity_id: str | None = None) -> EntityQCStatus:
         """Return the step_run's execution QC, preserving all data from run phases."""
         return step_run.qc
-
-    def update_sample_qc(
-        self,
-        entity: StepRun,
-        entity_qc: EntityQCStatus | None = None,
-        dataloader: UnifiedDataLoader | None = None,
-        dataloader_context: dict[str, Any] | None = None,
-        *,
-        context: dict[str, Any] | None = None,
-    ) -> EntityQCStatus:
-        """Run QC for step execution.
-
-        Parameters
-        ----------
-        entity : StepRun
-            The step run to evaluate.
-        entity_qc : EntityQCStatus | None
-            Optional existing QC status to update. If None, uses step_run.qc.
-        dataloader : UnifiedDataLoader | None
-            Optional UnifiedDataLoader (not used for step QC).
-        dataloader_context : dict[str, Any] | None
-            Optional context (not used for step QC).
-        context : dict[str, Any] | None
-            Optional metadata to attach to the QC status.
-
-        Returns
-        -------
-        EntityQCStatus
-            QC status for the step run.
-        """
-        if entity_qc is not None:
-            return entity_qc
-        return entity.qc
-
-    def update_batch_qc(
-        self,
-        entity: StepRun,
-        entity_qc: EntityQCStatus | None = None,
-        dataloader: UnifiedDataLoader | None = None,
-        dataloader_context: dict[str, Any] | None = None,
-        *,
-        context: dict[str, Any] | None = None,
-    ) -> EntityQCStatus:
-        """Update batch-level QC tests for step.
-
-        Steps have no batch-level tests, so this is a no-op.
-
-        Parameters
-        ----------
-        entity : StepRun
-            The step run being evaluated (unused)
-        entity_qc : EntityQCStatus | None
-            QC status to update
-        all_samples : Iterable[tuple[str, Any]] | None
-            Iterable of (sample_id, data) tuples (unused)
-        context : dict[str, Any] | None
-            Optional evaluation context (unused)
-
-        Returns
-        -------
-        EntityQCStatus
-            Unchanged entity_qc (no batch tests for steps)
-        """
-        if entity_qc is not None:
-            return entity_qc
-        return entity.qc
-
-    def summarize_entity_qc(self, entity_qc: EntityQCStatus) -> dict:
-        return {}
 
     def _get_step_order(self, entity_qc: EntityQCStatus) -> list[str]:
         """Get steps in execution order using topological sort.
@@ -209,8 +116,8 @@ class StepQCEvaluator(EntityQCEvaluator):
         self,
         entity_qc: EntityQCStatus,
         table_type: str = "per_sample_step",
-        dataloader: UnifiedDataLoader | None = None,
-        dataloader_context: dict[str, Any] | None = None,
+        test_name: str | None = None,
+        sample_ids: Iterable[str] | None = None,
         table_path: PathLike | None = None,
     ) -> pd.DataFrame:
         """Generate tables from step-level QC status.
@@ -238,11 +145,8 @@ class StepQCEvaluator(EntityQCEvaluator):
         pd.DataFrame
             Table in the requested format.
         """
-        # Default context to empty dict to avoid None checks
-        dataloader_context = dataloader_context or {}
-
         # Use sample_ids from context if provided, otherwise use all samples
-        sample_filter = set(dataloader_context.get("sample_ids") or entity_qc.sample_qc.keys())
+        sample_filter = set(sample_ids or entity_qc.sample_qc.keys())
 
         df_all = self._generate_all_tests(entity_qc, sample_filter)
         df_sample_step = self._aggregate_per_sample_step(df_all)
@@ -629,7 +533,6 @@ class StepQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         step_id: str | None = None,
-        figure_dir: PathLike | None = None,
         **kwargs: Any,
     ) -> go.Figure:
         """Generate a diagnostic figure identified by test_key.
@@ -650,8 +553,6 @@ class StepQCEvaluator(EntityQCEvaluator):
             Optional context parameters for the dataloader.
         step_id : str | None
             Unused for step-level QC (placeholder for interface compatibility).
-        figure_dir : PathLike | None
-            Optional directory to save the figure.
         **kwargs : Any
             Additional plotting options (passed to visualization functions).
 
