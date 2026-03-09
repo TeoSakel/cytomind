@@ -407,11 +407,11 @@ class BaseRevisionHandler(ABC):
         return self.workspace.get_or_create_viz_subset(
             sample_id=sample_id,
             layer=layer,
+            n_subset=n_subset,
+            seed=seed,
             mask_id=mask_id,
             mask=mask,
             select=select,
-            n_subset=n_subset,
-            seed=seed,
         )
 
     # ---- Optional lifecycle methods ----

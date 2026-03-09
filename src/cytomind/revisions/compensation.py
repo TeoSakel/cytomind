@@ -294,8 +294,16 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         qc_status = self.load_entity_qc_cache(comp_id)
         if sample_id not in qc_status.sample_qc:
             comp_ref = self.get_comp_ref(comp_id)
-            adata = self.load_viz_data_compensated(sample_id, comp_id, n_subset=self.samples[sample_id]["n_events"])
-            qc_status = self.qc_evaluator.update_entity_qc(entity=comp_ref, entity_qc=qc_status, sample_data=[(sample_id, adata)])
+            # Load data through dataloader (will use visualization subset via fallback)
+            dataloader_context = {
+                "sample_ids": [sample_id],
+            }
+            qc_status = self.qc_evaluator.update_entity_qc(
+                entity=comp_ref,
+                entity_qc=qc_status,
+                dataloader=self.workspace,  # Use workspace dataloader
+                dataloader_context=dataloader_context,
+            )
             self.save_entity_qc_cache(comp_id, qc_status)
 
         # Update session metadata
@@ -539,15 +547,25 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         # If a sample not in QC status, update it
         missing = [sid for sid in sample_ids if sid not in qc_status.sample_qc]
         if missing:
-            n_subset: int = max(self.samples[sid]["n_events"] for sid in missing)
-            sample_data = ((sid, self.load_viz_data_compensated(sid, comp_id_resolved, n_subset)) for sid in missing)
             comp_ref = self.get_comp_ref(comp_id_resolved)
-            qc_status = self.qc_evaluator.update_entity_qc(entity=comp_ref, entity_qc=qc_status, sample_data=sample_data)
+            # Load data through dataloader for missing samples
+            dataloader_context = {
+                "sample_ids": missing,
+            }
+            qc_status = self.qc_evaluator.update_entity_qc(
+                entity=comp_ref,
+                entity_qc=qc_status,
+                dataloader=self.workspace,  # Use workspace dataloader
+                dataloader_context=dataloader_context,
+            )
             self.save_entity_qc_cache(comp_id_resolved, qc_status)
 
         # Generate table using the evaluator
-        sample_data = ((sid, ad.AnnData()) for sid in sample_ids)
-        df = self.qc_evaluator.generate_table(qc_status, table_type=table_type, sample_data=sample_data)
+        df = self.qc_evaluator.generate_table(
+            qc_status,
+            table_type=table_type,
+            sample_ids=sample_ids,
+        )
 
         return df
 
@@ -1078,10 +1096,15 @@ class CompensationRevisionHandler(BaseRevisionHandler):
         adata = self.load_viz_data_compensated(sample_id, compensation_id, n_subset)
 
         # Generate figure using evaluator
+        # Note: we're passing the already-loaded adata as a tuple iterator
+        dataloader_context = {
+            "adata": ((sample_id, adata),),  # Tuple iterator of (sample_id, adata) pairs
+        }
         fig = self.qc_evaluator.generate_figure(
             entity_qc=qc_status,
             test_key=test_key_dict,
-            sample_data=[(sample_id, adata)],
+            dataloader=None,  # No dataloader needed, adata already loaded
+            dataloader_context=dataloader_context,
             step_id=step_id,
         )
 

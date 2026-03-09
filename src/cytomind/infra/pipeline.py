@@ -3,7 +3,16 @@ from typing import Iterable, Sequence, Mapping, Any, TYPE_CHECKING
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef
+from .repo import ProjectRepository
+from cytomind.gates import GateRegistry
+from cytomind.steps import StepRegistry
+from cytomind.qc import EntityQCEvaluatorRegistry
+from cytomind.revisions import RevisionHandlerRegistry
+from cytomind.utils import now_iso
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import PathLike
@@ -11,15 +20,6 @@ if TYPE_CHECKING:
 else:
     PathLike = object
     BaseRevisionHandler = object
-
-
-from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef
-from cytomind.domain.qc import QCFlag
-from .repo import ProjectRepository
-from cytomind.steps import StepRegistry
-from cytomind.qc import EntityQCEvaluatorRegistry
-from cytomind.revisions import RevisionHandlerRegistry
-from cytomind.utils import now_iso
 
 
 class InteractivePipeline:
@@ -176,7 +176,10 @@ class InteractivePipeline:
                 session_id=session_id
             )
         except FileNotFoundError:
-            raise FileNotFoundError(f"No revision session found for entity_type '{entity_type}' with session_id '{session_id}'.")
+            raise FileNotFoundError(
+                "No revision session found for entity_type "
+                f"'{entity_type}' with session_id '{session_id}'."
+            )
 
         # Create handler
         handler = handler_class(
@@ -221,6 +224,7 @@ class InteractivePipeline:
         entity_id: str,
         table_type: str,
         sample_ids: Sequence[str] | None = None,
+        test_name: str | None = None,
     ) -> Any:
         """
         Generate a QC table for an entity from its cached QC status.
@@ -235,6 +239,9 @@ class InteractivePipeline:
             Type of table to generate (entity-specific)
         sample_ids : Sequence[str] | None
             Optional list of sample IDs to include. If None, includes all samples.
+        test_name : str | None
+            Optional specific test name to filter by. If provided, takes precedence over table_type
+            and only tests matching this name will be included in the table.
 
         Returns
         -------
@@ -262,7 +269,8 @@ class InteractivePipeline:
         return qc_evaluator.generate_table(
             entity_qc=qc_status,
             table_type=table_type,
-            sample_ids=sample_ids
+            sample_ids=sample_ids,
+            test_name=test_name
         )
 
     def get_entity_qc_figure(
@@ -464,15 +472,15 @@ class InteractivePipeline:
         table_type: str | Sequence[str] | None,
         sample_ids: Sequence[str] | None = None,
         entity_ids: Sequence[str] | None = None,
-        by: str = "target",
+        by: str | Sequence[str] = "target",
     ) -> pd.DataFrame:
         """
         Aggregate QC metrics across samples by collecting metrics and combining status flags.
 
         This method calls collect_qc_metrics internally and then aggregates the result by
-        the specified grouping dimension. Currently, only "target" grouping is supported,
-        which groups by target columns (all columns except test metadata/status fields).
-        For each target group, it combines the status values using QCFlag logic
+        the specified grouping dimension(s). The `by` parameter determines which columns
+        to group by - it can be a predefined shortcut or any subset of target columns.
+        For each group, it combines the status values using QCFlag logic
         (FAIL > SEVERE > WARN > PASS) and counts how many tests have each flag value.
 
         If table_type is "all" (or contains "all" when a sequence is provided), all test
@@ -498,9 +506,17 @@ class InteractivePipeline:
         entity_ids : Sequence[str] | None, default None
             For sample-based entities (compensation, gating_strategy): ignored.
             For non-sample-based entities (step): required. List of entity IDs to aggregate across.
-        by : str, default "target"
-            Grouping dimension for aggregation. Currently only "target" is supported,
-            which groups by columns before "test_type".
+        by : str | Sequence[str], default "target"
+            Grouping dimension(s) for aggregation. Can be:
+            - "target": Groups by all target columns (entity_id, sample_id, etc.)
+            - "sample": Groups by sample_id only (if present in targets)
+            - "entity": Groups by entity identifier (first target column, or first 2 for gates)
+            - A sequence of column names: Groups by any subset of target columns
+
+            Target columns vary by entity type:
+            - compensation: ["compensation_id", "sample_id", "mask"]
+            - gating_strategy: ["gating_strategy_id", "sample_id", "gate_id"]
+            - step: ["step_id", "sample_id"]
 
         Returns
         -------
@@ -518,42 +534,89 @@ class InteractivePipeline:
         ValueError
             If any sample_ids are not found in project
             If entity_ids is required for entity_type but not provided
-            If by parameter is not "target"
+            If `by` is a string not in {"target", "sample", "entity"}
+            If `by` is a sequence containing columns not in target columns
 
         Examples
         --------
-        Aggregate compensation QC metrics across all samples:
+        Aggregate compensation QC metrics across all samples (by all targets):
 
         >>> pipeline = InteractivePipeline("/path/to/project")
         >>> df_agg = pipeline.aggregate_qc_metrics(
         ...     entity_type="compensation",
         ...     table_type="compensation_channel",
+        ...     by="target",  # Groups by compensation_id, sample_id, mask
         ... )
-        >>> # Returns aggregated table grouped by compensation_id, sample_id, mask
-        >>> # with combined flags and test counts per sample-compensation combination
 
-        Aggregate for specific samples:
+        Aggregate by sample only:
 
         >>> df_agg = pipeline.aggregate_qc_metrics(
         ...     entity_type="compensation",
-        ...     table_type=["compensation_channel", "compensation_pair"],
-        ...     sample_ids=["sample_001", "sample_002"],
+        ...     table_type="compensation_channel",
+        ...     by="sample",  # Groups by sample_id only
+        ... )
+
+        Aggregate by custom columns:
+
+        >>> df_agg = pipeline.aggregate_qc_metrics(
+        ...     entity_type="compensation",
+        ...     table_type="compensation_channel",
+        ...     by=["compensation_id", "sample_id"],  # Custom grouping
         ... )
         """
-        # Validate 'by' parameter
+        # Validate entity type
         qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
         if qc_evaluator_class is None:
             raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
 
-        targets = list(qc_evaluator_class.targets)
+        qc_evaluator = qc_evaluator_class()
+
+        # Get target columns from evaluator
+        targets =  list(qc_evaluator_class.targets) + ["test_type", "test_name"]
         all_types = sorted(qc_evaluator_class.get_test_types())
 
-        if by == "target":
-            id_vars = targets
-            value_vars = ["TOTAL", "PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
-            subset_vars = targets + ["test_type", "test_name", "status", "metric"]
+        # Determine id_vars based on 'by' parameter
+        if isinstance(by, str):
+            if by == "target":
+                id_vars = targets[:-2] # All target columns except test_type and test_name
+            elif by == "test":
+                id_vars = ["test_type", "test_name"]
+            elif by == "sample":
+                if "sample_id" not in targets:
+                    raise ValueError(
+                        f"Cannot group by 'sample': 'sample_id' not in target columns {targets}"
+                    )
+                id_vars = ["sample_id"]
+            elif by == "entity":
+                # For gate entities, include strategy_id + gate_id
+                if entity_type in ("gate_node", "gate"):
+                    id_vars = targets[:2] if len(targets) >= 2 else targets
+                else:
+                    id_vars = [targets[0]]  # First target is typically the entity ID
+            else:
+                # Treat as a single column name
+                if by not in targets:
+                    raise ValueError(
+                        f"Column '{by}' not found in target columns {targets}. "
+                        f"Use one of: 'target', 'sample', 'entity', or a valid column name."
+                    )
+                id_vars = [by]
+        elif isinstance(by, (list, tuple)):
+            by_list = list(by)
+            invalid = set(by_list) - set(targets)
+            if invalid:
+                raise ValueError(
+                    f"Invalid columns in 'by': {sorted(invalid)}. "
+                    f"Must be a subset of target columns: {targets}"
+                )
+            id_vars = by_list
         else:
-            raise ValueError(f"Unsupported aggregation dimension '{by}'. Currently only 'target' is supported.")
+            raise ValueError(
+                f"'by' must be a string or sequence of strings, got {type(by).__name__}"
+            )
+
+        value_vars = ["TOTAL", "PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
+        subset_vars = targets + ["status", "metric"]
 
         cols = id_vars + ["status"] + value_vars
 
@@ -565,7 +628,10 @@ class InteractivePipeline:
             table_types = list(table_type)
         unknown_types = set(table_types) - set(all_types) - {"all"}
         if unknown_types:
-            raise ValueError(f"Unknown table_type(s) {sorted(unknown_types)} for entity_type '{entity_type}'. Known types are: {sorted(all_types)} or 'all'.")
+            raise ValueError(
+                f"Unknown table_type(s) {sorted(unknown_types)} for entity_type '{entity_type}'. "
+                f"Known types are: {sorted(all_types)} or 'all'."
+            )
 
         if not table_types:
             return pd.DataFrame(columns=cols)
@@ -636,14 +702,16 @@ class InteractivePipeline:
             try:
                 qc_status = self.repo.load_qc_entity_status("compensation", comp_id)
             except FileNotFoundError:
-                raise FileNotFoundError(f"QC status for compensation {comp_id!r} not found. Cannot aggregate QC metrics for samples {comp_sample_ids!r}.")
+                raise FileNotFoundError(
+                    f"QC status for compensation {comp_id!r} not found. "
+                    f"Cannot aggregate QC metrics for samples {comp_sample_ids!r}."
+                )
 
             try:
                 df = qc_evaluator.generate_table(
                     entity_qc=qc_status,
                     table_type=table_type,
-                    dataloader=self.repo._dataloader,
-                    dataloader_context={"sample_ids": comp_sample_ids},
+                    sample_ids=comp_sample_ids,
                 )
                 if not df.empty:
                     tables.append(df)
@@ -669,7 +737,10 @@ class InteractivePipeline:
                 try:
                     qc_status = self.repo.load_qc_entity_status("gating_strategy", gs_id)
                 except FileNotFoundError:
-                    raise FileNotFoundError(f"QC status for gating_strategy {gs_id!r} not found. Cannot aggregate QC metrics for sample {sample_id!r}.")
+                    raise FileNotFoundError(
+                        f"QC status for gating_strategy {gs_id!r} not found. "
+                        f"Cannot aggregate QC metrics for sample {sample_id!r}."
+                    )
 
                 if sample_id not in qc_status.sample_qc:
                     continue
@@ -678,8 +749,7 @@ class InteractivePipeline:
                     df = qc_evaluator.generate_table(
                         entity_qc=qc_status,
                         table_type=table_type,
-                        dataloader=self.repo._dataloader,
-                        dataloader_context={"sample_ids": [sample_id]},
+                        sample_ids=[sample_id],
                     )
                     if not df.empty:
                         tables.append(df)
@@ -711,7 +781,10 @@ class InteractivePipeline:
             try:
                 qc_status = self.repo.load_qc_entity_status(entity_type, entity_id)
             except FileNotFoundError:
-                raise FileNotFoundError(f"QC status for entity {entity_id!r} not found. Cannot aggregate QC metrics for samples {sample_ids!r}.")
+                raise FileNotFoundError(
+                    f"QC status for entity {entity_id!r} not found. "
+                    f"Cannot aggregate QC metrics for samples {sample_ids!r}."
+                )
 
             dataloader_context = {"sample_ids": [sid for sid in sample_ids if sid in qc_status.sample_qc]}
 
@@ -719,8 +792,7 @@ class InteractivePipeline:
                 df = qc_evaluator.generate_table(
                     entity_qc=qc_status,
                     table_type=table_type,
-                    dataloader=self.repo._dataloader,
-                    dataloader_context=dataloader_context if dataloader_context["sample_ids"] else None,
+                    sample_ids=dataloader_context["sample_ids"] if dataloader_context["sample_ids"] else None,
                 )
                 if not df.empty:
                     tables.append(df)
@@ -765,8 +837,13 @@ class InteractivePipeline:
         # The step will create SampleRef instances internally, but we need placeholders for BaseStep.run
         # Temporarily register minimal samples in project so run can iterate
         sample_refs = [SampleRef(id=sid, fcs=Path(fcs).as_posix()) for sid, fcs in samples.items()]
-        batch_refs = [BatchRef(id="__all__", sample_ids={sref.id for sref in sample_refs}, tags={"all_samples"}, meta={}) ]
-        self.repo.update_project_metadata(samples=sample_refs, batches=batch_refs)
+        batch_ref = BatchRef(
+            id="__all__",
+            sample_ids={sref.id for sref in sample_refs},
+            tags={"all_samples"},
+            meta={}
+        )
+        self.repo.update_project_metadata(samples=sample_refs, batches=[batch_ref])
 
         # Add channel_mapping to config if provided
         step_config = dict(config)
@@ -952,6 +1029,109 @@ class InteractivePipeline:
                 "batch_ids": [batch_id],
             },
         )
+
+    def plot_gate(
+        self,
+        strategy_id: str,
+        gate_id: str,
+        sample_id: str,
+        plot_all_events: bool = False,
+        layer: str | None = None,
+        select: Sequence[str] | None = None,
+        **plot_kwargs: Any,
+    ) -> Any:
+        """Plot a gate for a specific strategy/sample context.
+
+        Parameters
+        ----------
+        strategy_id : str
+            Gating strategy identifier.
+        gate_id : str
+            Gate node identifier within the strategy.
+        sample_id : str
+            Sample identifier used for per-sample gate parameters and masks.
+        plot_all_events : bool
+            If True, load all sample events. If False, parent masks are loaded,
+            collapsed with OR across parents, and used to filter loaded events.
+        layer : str | None
+            Optional data layer override. If None, uses the gate node layer.
+        select : Sequence[str] | None
+            Optional dimensions to load for plotting. If None, loads gate
+            dimensions; for gates without dimensions (e.g., Boolean), loads all.
+        **plot_kwargs : Any
+            Additional keyword arguments passed directly to ``Gate.plot``.
+
+        Returns
+        -------
+        Any
+            Figure returned by the underlying gate implementation.
+
+        Raises
+        ------
+        ValueError
+            If the gate type is unknown or required gate dimensions are missing
+            from ``select``.
+        """
+        gate_node = self.repo.load_gate_node(strategy=strategy_id, node_id=gate_id)
+
+        try:
+            gate_class = GateRegistry.get(gate_node.gate_type)
+        except KeyError as e:
+            available = sorted(GateRegistry.list_gates().keys())
+            raise ValueError(
+                f"Unknown gate type {gate_node.gate_type!r} for gate {gate_id!r}. "
+                f"Known gate types are: {available}"
+            ) from e
+
+        gate = gate_class.from_node(gate_node, sample_id=sample_id)
+
+        if select is None:
+            selected_dims: Sequence[str] | slice = list(gate.dimensions) if gate.dimensions else slice(None)
+        else:
+            selected_dims = list(select)
+            if gate.dimensions:
+                missing = sorted(set(gate.dimensions) - set(selected_dims))
+                if missing:
+                    raise ValueError(
+                        f"select is missing required gate dimensions for {gate_id!r}: {missing}"
+                    )
+
+        parent_ids = [parent_id for parent_id in gate_node.parent_ids if parent_id != "root"]
+        parent_masks: dict[str, Any] = {}
+
+        if plot_all_events:
+            event_mask = slice(None)
+        elif parent_ids:
+            parent_masks = self.repo.load_gating_masks(
+                strategy=strategy_id,
+                sample=sample_id,
+                mask_ids=parent_ids,
+            )
+            parent_arrays = [np.asarray(mask, dtype=bool) for mask in parent_masks.values()]
+            event_mask = np.logical_or.reduce(parent_arrays)
+        else:
+            event_mask = slice(None)
+
+        plot_layer = layer or gate_node.layer
+        events = self.repo.load_sample_adata(
+            sample_id=sample_id,
+            layer=plot_layer,
+            mask=event_mask,
+            select=selected_dims,
+        )
+
+        if parent_masks:
+            if isinstance(event_mask, slice):
+                plot_masks = {key: np.asarray(mask, dtype=bool) for key, mask in parent_masks.items()}
+            else:
+                plot_masks = {
+                    key: np.asarray(mask, dtype=bool)[event_mask]
+                    for key, mask in parent_masks.items()
+                }
+        else:
+            plot_masks = {"root": np.ones(events.n_obs, dtype=bool)}
+
+        return gate.plot(events=events, mask=plot_masks, **plot_kwargs)
 
     def add_layer(
         self,
