@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+import warnings
 from typing import Any, Sequence, Mapping, TYPE_CHECKING
 
 import anndata as ad
@@ -33,6 +34,53 @@ def _downsample_indices(n_points: int, max_points: int, seed: int) -> np.ndarray
         return None
     rng = np.random.default_rng(seed)
     return rng.choice(n_points, size=max_points, replace=False)
+
+
+def _warn_unused_plot_kwargs(gate_cls_name: str, kwargs: Mapping[str, Any]) -> None:
+    """Warn when unexpected plotting kwargs are provided."""
+    if not kwargs:
+        return
+    unused = ", ".join(sorted(kwargs.keys()))
+    warnings.warn(
+        f"{gate_cls_name}.plot() got unexpected keyword argument(s): {unused}",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _resolve_plot_dimensions(
+    requested_dimensions: Sequence[str] | None,
+    gate_dimensions: Sequence[str],
+    *,
+    gate_cls_name: str,
+    min_dims: int = 1,
+    max_dims: int | None = None,
+) -> list[str]:
+    """Resolve and validate dimensions used for plotting."""
+    if requested_dimensions is None:
+        dims = list(gate_dimensions)
+    else:
+        dims = list(requested_dimensions)
+
+    if not dims:
+        raise ValueError(f"{gate_cls_name}.plot() requires at least one dimension")
+
+    unknown = [dim for dim in dims if dim not in gate_dimensions]
+    if unknown:
+        raise ValueError(
+            f"{gate_cls_name}.plot() received dimensions not in gate dimensions: {unknown}. "
+            f"Available dimensions: {list(gate_dimensions)}"
+        )
+
+    if len(set(dims)) != len(dims):
+        raise ValueError(f"{gate_cls_name}.plot() dimensions must be unique")
+
+    if len(dims) < min_dims:
+        raise ValueError(f"{gate_cls_name}.plot() requires at least {min_dims} dimensions")
+    if max_dims is not None and len(dims) > max_dims:
+        raise ValueError(f"{gate_cls_name}.plot() supports at most {max_dims} dimensions")
+
+    return dims
 
 
 @GateRegistry.register("Root")
@@ -100,8 +148,17 @@ class RootGate(Gate):
         all_mask = np.ones(events.n_obs, dtype=np.bool_)
         return {self.gate_name: all_mask}
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Root gate has no meaningful visualization."""
+        if dimensions is not None:
+            _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
         fig = go.Figure()
         fig.add_annotation(text="Root Gate - passes all events through")
         return fig
@@ -209,7 +266,30 @@ class RectangleGate(Gate):
 
         return {self.gate_name: mask}
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: Sequence[str] | None = None,
+        *,
+        hist_nbins: int = 100,
+        hist_color: str = "rgba(100, 100, 200, 0.6)",
+        histnorm: str = "probability",
+        density_nbins: int = 50,
+        density_log_scale: bool = True,
+        marker_size: int = 3,
+        colorscale: str = "Viridis",
+        use_gl: bool = True,
+        max_points: int = 50000,
+        downsample_seed: int = 0,
+        gate_line_color: str = "red",
+        gate_line_width: int = 2,
+        gate_line_dash: str = "dash",
+        title: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Plot events with rectangular gate boundaries.
 
         For 1D gates: creates a histogram with vertical threshold lines.
@@ -234,15 +314,32 @@ class RectangleGate(Gate):
         >>> fig = gate.plot(events, {"root": root_mask})
         >>> fig.show()
         """
-        n_dims = len(self.dimensions)
-        if n_dims == 1:
-            return self._plot_1D(events, **kwargs)
-        if n_dims == 2:
-            return self._plot_2D(events, **kwargs)
-        return self._plot_nD(events, **kwargs)
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
+        plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        n_dims = len(plot_dims)
+        plot_kwargs: dict[str, Any] = {
+            "hist_nbins": hist_nbins,
+            "hist_color": hist_color,
+            "histnorm": histnorm,
+            "density_nbins": density_nbins,
+            "density_log_scale": density_log_scale,
+            "marker_size": marker_size,
+            "colorscale": colorscale,
+            "use_gl": use_gl,
+            "max_points": max_points,
+            "downsample_seed": downsample_seed,
+            "gate_line_color": gate_line_color,
+            "gate_line_width": gate_line_width,
+            "gate_line_dash": gate_line_dash,
+            "title": title,
+            "width": width,
+            "height": height,
+        }
+        plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
+        return plot_fn(events, plot_dims, **plot_kwargs)
 
-    def _plot_1D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        dim = self.dimensions[0]
+    def _plot_1D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        dim = plot_dims[0]
         data = np.asarray(events[:, dim].X).ravel()
         nbins = int(kwargs.get("hist_nbins", 100))
         hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
@@ -250,9 +347,12 @@ class RectangleGate(Gate):
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
-        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"RectangleGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         fig = go.Figure()
         fig.add_trace(go.Histogram(
@@ -283,10 +383,10 @@ class RectangleGate(Gate):
         yaxis_title = histnorm.title() if histnorm else "Count"
         fig.update_xaxes(title=dim)
         fig.update_yaxes(title=yaxis_title)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        x_dim, y_dim = self.dimensions
+    def _plot_2D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = plot_dims
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
         density_nbins = int(kwargs.get("density_nbins", 50))
@@ -298,9 +398,12 @@ class RectangleGate(Gate):
         downsample_seed = int(kwargs.get("downsample_seed", 0))
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
-        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"RectangleGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
         if downsample_idx is not None:
@@ -338,10 +441,10 @@ class RectangleGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        fig, pairs = _create_subplot_grid(len(self.dimensions))
+    def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(plot_dims))
         n_cols = int(np.ceil(np.sqrt(len(pairs))))
         density_nbins = int(kwargs.get("density_nbins", 50))
         density_log_scale = bool(kwargs.get("density_log_scale", True))
@@ -352,15 +455,16 @@ class RectangleGate(Gate):
         downsample_seed = int(kwargs.get("downsample_seed", 0))
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
-        title = str(kwargs.get("title", f"RectangleGate: {self.gate_name} (Pairwise Projections)"))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"RectangleGate: {self.gate_name} (Pairwise Projections)"
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
 
         for idx, (i, j) in enumerate(pairs):
             row = idx // n_cols + 1
             col = idx % n_cols + 1
 
-            x_dim = self.dimensions[i]
-            y_dim = self.dimensions[j]
+            x_dim = plot_dims[i]
+            y_dim = plot_dims[j]
             x_data = np.asarray(events[:, x_dim].X).ravel()
             y_data = np.asarray(events[:, y_dim].X).ravel()
             if downsample_idx is not None:
@@ -406,14 +510,16 @@ class RectangleGate(Gate):
 
         n_plots = len(pairs)
         n_rows = int(np.ceil(n_plots / n_cols))
-        height = int(kwargs.get("height", 400 * n_rows))
-        width = int(kwargs.get("width", 400 * n_cols))
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_height = int(height) if height is not None else 400 * n_rows
+        plot_width = int(width) if width is not None else 400 * n_cols
 
         return _format_gate_plot(
             fig,
-            title=title,
-            width=width,
-            height=height,
+            title=plot_title,
+            width=plot_width,
+            height=plot_height,
         )
 
 
@@ -505,7 +611,28 @@ class PolygonGate(Gate):
 
         return {self.gate_name: mask}
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: Sequence[str] | None = None,
+        *,
+        density_nbins: int = 50,
+        density_log_scale: bool = True,
+        marker_size: int = 3,
+        colorscale: str = "Viridis",
+        use_gl: bool = False,
+        max_points: int = 50000,
+        downsample_seed: int = 0,
+        gate_line_color: str = "red",
+        gate_line_width: int = 2,
+        gate_fill: bool = True,
+        gate_fill_color: str = "rgba(255, 0, 0, 0.1)",
+        title: str | None = None,
+        width: int = 800,
+        height: int = 600,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Plot events with polygon gate boundary.
 
         Creates a 2D scatter plot with polygon boundary overlaid.
@@ -529,23 +656,22 @@ class PolygonGate(Gate):
         >>> fig = gate.plot(events, {"root": root_mask})
         >>> fig.show()
         """
-        x_dim, y_dim = self.dimensions
+        plot_dims = _resolve_plot_dimensions(
+            dimensions,
+            self.dimensions,
+            gate_cls_name=self.__class__.__name__,
+            min_dims=2,
+            max_dims=2,
+        )
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
+        x_dim, y_dim = plot_dims
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
-        density_nbins = int(kwargs.get("density_nbins", 50))
-        density_log_scale = bool(kwargs.get("density_log_scale", True))
-        marker_size = int(kwargs.get("marker_size", 3))
-        colorscale = str(kwargs.get("colorscale", "Viridis"))
-        use_gl = bool(kwargs.get("use_gl", False))
-        max_points = int(kwargs.get("max_points", 50000))
-        downsample_seed = int(kwargs.get("downsample_seed", 0))
-        gate_line_color = str(kwargs.get("gate_line_color", "red"))
-        gate_line_width = int(kwargs.get("gate_line_width", 2))
-        gate_fill = bool(kwargs.get("gate_fill", True))
-        gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
-        title = str(kwargs.get("title", f"PolygonGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        plot_title = title if title is not None else f"PolygonGate: {self.gate_name}"
+
+        base_dims = list(self.dimensions)
+        base_indices = [base_dims.index(x_dim), base_dims.index(y_dim)]
+        vertices_for_dims = self.vertices[:, base_indices]
 
         # Downsample large clouds to keep interactive plotting responsive.
         n_points = x_data.shape[0]
@@ -572,7 +698,7 @@ class PolygonGate(Gate):
 
         # Add polygon boundary
         fig.add_trace(_create_polygon_trace(
-            self.vertices,
+            vertices_for_dims,
             line_color=gate_line_color,
             line_width=gate_line_width,
             fill=gate_fill,
@@ -583,7 +709,7 @@ class PolygonGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=width, height=height)
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
@@ -740,7 +866,28 @@ class EllipsoidGate(Gate):
 
         return {self.gate_name: mask}
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: Sequence[str] | None = None,
+        *,
+        density_nbins: int = 50,
+        density_log_scale: bool = True,
+        marker_size: int = 3,
+        colorscale: str = "Viridis",
+        use_gl: bool = True,
+        max_points: int = 50000,
+        downsample_seed: int = 0,
+        gate_line_color: str = "red",
+        gate_line_width: int = 2,
+        gate_fill: bool = True,
+        gate_fill_color: str = "rgba(255, 0, 0, 0.1)",
+        title: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Plot events with ellipsoid gate boundary.
 
         For 2D gates: creates a scatter plot with ellipse overlay.
@@ -765,12 +912,34 @@ class EllipsoidGate(Gate):
         >>> fig = gate.plot(events, {"root": root_mask})
         >>> fig.show()
         """
-        if len(self.dimensions) == 2:
-            return self._plot_2D(events, **kwargs)
-        return self._plot_nD(events, **kwargs)
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
+        plot_dims = _resolve_plot_dimensions(
+            dimensions,
+            self.dimensions,
+            gate_cls_name=self.__class__.__name__,
+            min_dims=2,
+        )
+        plot_kwargs: dict[str, Any] = {
+            "density_nbins": density_nbins,
+            "density_log_scale": density_log_scale,
+            "marker_size": marker_size,
+            "colorscale": colorscale,
+            "use_gl": use_gl,
+            "max_points": max_points,
+            "downsample_seed": downsample_seed,
+            "gate_line_color": gate_line_color,
+            "gate_line_width": gate_line_width,
+            "gate_fill": gate_fill,
+            "gate_fill_color": gate_fill_color,
+            "title": title,
+            "width": width,
+            "height": height,
+        }
+        plot_fn = self._plot_2D if len(plot_dims) == 2 else self._plot_nD
+        return plot_fn(events, plot_dims, **plot_kwargs)
 
-    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        x_dim, y_dim = self.dimensions
+    def _plot_2D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = plot_dims
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
         density_nbins = int(kwargs.get("density_nbins", 50))
@@ -784,9 +953,12 @@ class EllipsoidGate(Gate):
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_fill = bool(kwargs.get("gate_fill", True))
         gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
-        title = str(kwargs.get("title", f"EllipsoidGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"EllipsoidGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
         if downsample_idx is not None:
@@ -805,8 +977,11 @@ class EllipsoidGate(Gate):
             use_gl=use_gl,
         ))
         fig.add_trace(_create_ellipse_trace(
-            self.center,
-            self.covariance_matrix,
+            self.center[[list(self.dimensions).index(x_dim), list(self.dimensions).index(y_dim)]],
+            self.covariance_matrix[np.ix_(
+                [list(self.dimensions).index(x_dim), list(self.dimensions).index(y_dim)],
+                [list(self.dimensions).index(x_dim), list(self.dimensions).index(y_dim)],
+            )],
             self.distance_square,
             line_color=gate_line_color,
             line_width=gate_line_width,
@@ -818,10 +993,10 @@ class EllipsoidGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        fig, pairs = _create_subplot_grid(len(self.dimensions))
+    def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(plot_dims))
         n_cols = int(np.ceil(np.sqrt(len(pairs))))
         density_nbins = int(kwargs.get("density_nbins", 50))
         density_log_scale = bool(kwargs.get("density_log_scale", True))
@@ -834,15 +1009,16 @@ class EllipsoidGate(Gate):
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_fill = bool(kwargs.get("gate_fill", True))
         gate_fill_color = str(kwargs.get("gate_fill_color", "rgba(255, 0, 0, 0.1)"))
-        title = str(kwargs.get("title", f"EllipsoidGate: {self.gate_name} (Pairwise Projections)"))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"EllipsoidGate: {self.gate_name} (Pairwise Projections)"
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
 
         for idx, (i, j) in enumerate(pairs):
             row = idx // n_cols + 1
             col = idx % n_cols + 1
 
-            x_dim = self.dimensions[i]
-            y_dim = self.dimensions[j]
+            x_dim = plot_dims[i]
+            y_dim = plot_dims[j]
             x_data = np.asarray(events[:, x_dim].X).ravel()
             y_data = np.asarray(events[:, y_dim].X).ravel()
             if downsample_idx is not None:
@@ -863,9 +1039,9 @@ class EllipsoidGate(Gate):
                 row=row, col=col,
             )
 
-            indices = [i, j]
-            center_2d = self.center[indices]
-            cov_2d = self.covariance_matrix[np.ix_(indices, indices)]
+            full_indices = [list(self.dimensions).index(plot_dims[i]), list(self.dimensions).index(plot_dims[j])]
+            center_2d = self.center[full_indices]
+            cov_2d = self.covariance_matrix[np.ix_(full_indices, full_indices)]
 
             fig.add_trace(
                 _create_ellipse_trace(
@@ -887,14 +1063,16 @@ class EllipsoidGate(Gate):
 
         n_plots = len(pairs)
         n_rows = int(np.ceil(n_plots / n_cols))
-        height = int(kwargs.get("height", 400 * n_rows))
-        width = int(kwargs.get("width", 400 * n_cols))
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_height = int(height) if height is not None else 400 * n_rows
+        plot_width = int(width) if width is not None else 400 * n_cols
 
         return _format_gate_plot(
             fig,
-            title=title,
-            width=width,
-            height=height,
+            title=plot_title,
+            width=plot_width,
+            height=plot_height,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1087,7 +1265,34 @@ class QuadrantGate(Gate):
 
         return results
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: Sequence[str] | None = None,
+        *,
+        hist_nbins: int = 100,
+        hist_color: str = "rgba(100, 100, 200, 0.6)",
+        histnorm: str = "probability",
+        density_nbins: int = 50,
+        density_log_scale: bool = True,
+        marker_size: int = 3,
+        colorscale: str = "Viridis",
+        use_gl: bool = True,
+        max_points: int = 50000,
+        downsample_seed: int = 0,
+        gate_line_color: str = "red",
+        gate_line_width: int = 2,
+        gate_line_dash: str = "dash",
+        quadrant_label_font_size: int = 12,
+        quadrant_label_color: str | None = None,
+        quadrant_label_bgcolor: str | None = None,
+        quadrant_label_opacity: float = 0.8,
+        title: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Plot events with quadrant divider lines.
 
         For 2D gates: creates a scatter plot with divider lines creating a grid.
@@ -1112,15 +1317,37 @@ class QuadrantGate(Gate):
         >>> fig = gate.plot(events, {"root": root_mask})
         >>> fig.show()
         """
-        n_dims = len(self.dimensions)
-        if n_dims == 1:
-            return self._plot_1D(events, **kwargs)
-        if n_dims == 2:
-            return self._plot_2D(events, **kwargs)
-        return self._plot_nD(events, **kwargs)
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
+        plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        label_color = gate_line_color if quadrant_label_color is None else quadrant_label_color
+        n_dims = len(plot_dims)
+        plot_kwargs: dict[str, Any] = {
+            "hist_nbins": hist_nbins,
+            "hist_color": hist_color,
+            "histnorm": histnorm,
+            "density_nbins": density_nbins,
+            "density_log_scale": density_log_scale,
+            "marker_size": marker_size,
+            "colorscale": colorscale,
+            "use_gl": use_gl,
+            "max_points": max_points,
+            "downsample_seed": downsample_seed,
+            "gate_line_color": gate_line_color,
+            "gate_line_width": gate_line_width,
+            "gate_line_dash": gate_line_dash,
+            "quadrant_label_font_size": quadrant_label_font_size,
+            "quadrant_label_color": label_color,
+            "quadrant_label_bgcolor": quadrant_label_bgcolor,
+            "quadrant_label_opacity": quadrant_label_opacity,
+            "title": title,
+            "width": width,
+            "height": height,
+        }
+        plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
+        return plot_fn(events, plot_dims, **plot_kwargs)
 
-    def _plot_1D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        dim = self.dimensions[0]
+    def _plot_1D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        dim = plot_dims[0]
         data = np.asarray(events[:, dim].X).ravel()
         nbins = int(kwargs.get("hist_nbins", 100))
         hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
@@ -1128,9 +1355,12 @@ class QuadrantGate(Gate):
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
-        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"QuadrantGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         fig = go.Figure()
         fig.add_trace(go.Histogram(
@@ -1180,10 +1410,10 @@ class QuadrantGate(Gate):
         yaxis_title = histnorm.title() if histnorm else "Count"
         fig.update_xaxes(title=dim)
         fig.update_yaxes(title=yaxis_title)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        x_dim, y_dim = self.dimensions
+    def _plot_2D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        x_dim, y_dim = plot_dims
         x_all = np.asarray(events[:, x_dim].X).ravel()
         y_all = np.asarray(events[:, y_dim].X).ravel()
         x_data = x_all
@@ -1198,9 +1428,12 @@ class QuadrantGate(Gate):
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
-        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name}"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"QuadrantGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
         if downsample_idx is not None:
@@ -1219,31 +1452,25 @@ class QuadrantGate(Gate):
             use_gl=use_gl,
         ))
 
-        if x_dim in self.dividers:
-            for divider_val in self.dividers[x_dim]:
-                fig.add_vline(
-                    x=divider_val,
-                    line_color=gate_line_color,
-                    line_width=gate_line_width,
-                    line_dash=gate_line_dash,
-                )
-
-        if y_dim in self.dividers:
-            for divider_val in self.dividers[y_dim]:
-                fig.add_hline(
-                    y=divider_val,
-                    line_color=gate_line_color,
-                    line_width=gate_line_width,
-                    line_dash=gate_line_dash,
-                )
+        x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
+        y_min, y_max = float(np.min(y_all)), float(np.max(y_all))
+        self._add_quadrant_divider_segments(
+            fig=fig,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            line_color=gate_line_color,
+            line_width=gate_line_width,
+            line_dash=gate_line_dash,
+        )
 
         label_font_size = int(kwargs.get("quadrant_label_font_size", 12))
         label_font_color = str(kwargs.get("quadrant_label_color", gate_line_color))
         label_bg_color = kwargs.get("quadrant_label_bgcolor")
         label_opacity = float(kwargs.get("quadrant_label_opacity", 0.8))
-        x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
-        y_min, y_max = float(np.min(y_all)), float(np.max(y_all))
-
         for quad_id, quad_def in self.quadrants.items():
             x_lower, x_upper = quad_def[x_dim]
             y_lower, y_upper = quad_def[y_dim]
@@ -1272,10 +1499,10 @@ class QuadrantGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_nD(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
-        fig, pairs = _create_subplot_grid(len(self.dimensions))
+    def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(plot_dims))
         n_cols = int(np.ceil(np.sqrt(len(pairs))))
         density_nbins = int(kwargs.get("density_nbins", 50))
         density_log_scale = bool(kwargs.get("density_log_scale", True))
@@ -1291,15 +1518,16 @@ class QuadrantGate(Gate):
         label_font_color = str(kwargs.get("quadrant_label_color", gate_line_color))
         label_bg_color = kwargs.get("quadrant_label_bgcolor")
         label_opacity = float(kwargs.get("quadrant_label_opacity", 0.8))
-        title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name} (Pairwise Projections)"))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"QuadrantGate: {self.gate_name} (Pairwise Projections)"
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
 
         for idx, (i, j) in enumerate(pairs):
             row = idx // n_cols + 1
             col = idx % n_cols + 1
 
-            x_dim = self.dimensions[i]
-            y_dim = self.dimensions[j]
+            x_dim = plot_dims[i]
+            y_dim = plot_dims[j]
             x_all = np.asarray(events[:, x_dim].X).ravel()
             y_all = np.asarray(events[:, y_dim].X).ravel()
             x_data = x_all
@@ -1322,28 +1550,23 @@ class QuadrantGate(Gate):
                 row=row, col=col,
             )
 
-            if x_dim in self.dividers:
-                for divider_val in self.dividers[x_dim]:
-                    fig.add_vline(
-                        x=divider_val,
-                        line_color=gate_line_color,
-                        line_width=gate_line_width,
-                        line_dash=gate_line_dash,
-                        row=row, col=col,  # type: ignore
-                    )
-
-            if y_dim in self.dividers:
-                for divider_val in self.dividers[y_dim]:
-                    fig.add_hline(
-                        y=divider_val,
-                        line_color=gate_line_color,
-                        line_width=gate_line_width,
-                        line_dash=gate_line_dash,
-                        row=row, col=col,  # type: ignore
-                    )
-
             x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
             y_min, y_max = float(np.min(y_all)), float(np.max(y_all))
+            self._add_quadrant_divider_segments(
+                fig=fig,
+                x_dim=x_dim,
+                y_dim=y_dim,
+                x_min=x_min,
+                x_max=x_max,
+                y_min=y_min,
+                y_max=y_max,
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                row=row,
+                col=col,
+            )
+
             for quad_id, quad_def in self.quadrants.items():
                 x_lower, x_upper = quad_def[x_dim]
                 y_lower, y_upper = quad_def[y_dim]
@@ -1377,15 +1600,159 @@ class QuadrantGate(Gate):
 
         n_plots = len(pairs)
         n_rows = int(np.ceil(n_plots / n_cols))
-        height = int(kwargs.get("height", 400 * n_rows))
-        width = int(kwargs.get("width", 400 * n_cols))
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_height = int(height) if height is not None else 400 * n_rows
+        plot_width = int(width) if width is not None else 400 * n_cols
 
         return _format_gate_plot(
             fig,
-            title=title,
-            width=width,
-            height=height,
+            title=plot_title,
+            width=plot_width,
+            height=plot_height,
         )
+
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[float, float]], tol: float = 1e-9) -> list[tuple[float, float]]:
+        if not intervals:
+            return []
+
+        sorted_intervals = sorted(intervals, key=lambda v: (v[0], v[1]))
+        merged: list[tuple[float, float]] = [sorted_intervals[0]]
+        for start, end in sorted_intervals[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end + tol:
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _intersect_intervals(
+        left_intervals: list[tuple[float, float]],
+        right_intervals: list[tuple[float, float]],
+        tol: float = 1e-9,
+    ) -> list[tuple[float, float]]:
+        intersections: list[tuple[float, float]] = []
+        for left_start, left_end in left_intervals:
+            for right_start, right_end in right_intervals:
+                start = max(left_start, right_start)
+                end = min(left_end, right_end)
+                if end - start > tol:
+                    intersections.append((start, end))
+        if not intersections:
+            return []
+
+        sorted_intervals = sorted(intersections, key=lambda v: (v[0], v[1]))
+        merged: list[tuple[float, float]] = [sorted_intervals[0]]
+        for start, end in sorted_intervals[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end + tol:
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def _add_quadrant_divider_segments(
+        self,
+        fig: go.Figure,
+        x_dim: str,
+        y_dim: str,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        line_color: str,
+        line_width: int,
+        line_dash: str,
+        row: int | None = None,
+        col: int | None = None,
+    ) -> None:
+        tol = 1e-9
+
+        def _x_bounds(quad_def: dict[str, tuple[float | None, float | None]]) -> tuple[float, float]:
+            x_lower, x_upper = quad_def[x_dim]
+            return (
+                x_min if x_lower is None else float(x_lower),
+                x_max if x_upper is None else float(x_upper),
+            )
+
+        def _y_bounds(quad_def: dict[str, tuple[float | None, float | None]]) -> tuple[float, float]:
+            y_lower, y_upper = quad_def[y_dim]
+            return (
+                y_min if y_lower is None else float(y_lower),
+                y_max if y_upper is None else float(y_upper),
+            )
+
+        for divider_val in self.dividers.get(x_dim, []):
+            boundary = float(divider_val)
+            left_intervals: list[tuple[float, float]] = []
+            right_intervals: list[tuple[float, float]] = []
+
+            for quad_def in self.quadrants.values():
+                x_start, x_end = _x_bounds(quad_def)
+                y_start, y_end = _y_bounds(quad_def)
+                if abs(x_end - boundary) <= tol:
+                    left_intervals.append((y_start, y_end))
+                if abs(x_start - boundary) <= tol:
+                    right_intervals.append((y_start, y_end))
+
+            for y_start, y_end in self._intersect_intervals(left_intervals, right_intervals, tol=tol):
+                if row is None or col is None:
+                    fig.add_shape(
+                        type="line",
+                        x0=boundary,
+                        x1=boundary,
+                        y0=y_start,
+                        y1=y_end,
+                        line=dict(color=line_color, width=line_width, dash=line_dash),
+                    )
+                else:
+                    fig.add_shape(
+                        type="line",
+                        x0=boundary,
+                        x1=boundary,
+                        y0=y_start,
+                        y1=y_end,
+                        line=dict(color=line_color, width=line_width, dash=line_dash),
+                        row=row,
+                        col=col,
+                    )
+
+        for divider_val in self.dividers.get(y_dim, []):
+            boundary = float(divider_val)
+            lower_intervals: list[tuple[float, float]] = []
+            upper_intervals: list[tuple[float, float]] = []
+
+            for quad_def in self.quadrants.values():
+                x_start, x_end = _x_bounds(quad_def)
+                y_start, y_end = _y_bounds(quad_def)
+                if abs(y_end - boundary) <= tol:
+                    lower_intervals.append((x_start, x_end))
+                if abs(y_start - boundary) <= tol:
+                    upper_intervals.append((x_start, x_end))
+
+            for x_start, x_end in self._intersect_intervals(lower_intervals, upper_intervals, tol=tol):
+                if row is None or col is None:
+                    fig.add_shape(
+                        type="line",
+                        x0=x_start,
+                        x1=x_end,
+                        y0=boundary,
+                        y1=boundary,
+                        line=dict(color=line_color, width=line_width, dash=line_dash),
+                    )
+                else:
+                    fig.add_shape(
+                        type="line",
+                        x0=x_start,
+                        x1=x_end,
+                        y0=boundary,
+                        y1=boundary,
+                        line=dict(color=line_color, width=line_width, dash=line_dash),
+                        row=row,
+                        col=col,
+                    )
 
 @GateRegistry.register("Boolean")
 class BooleanGate(Gate):
@@ -1544,38 +1911,66 @@ class BooleanGate(Gate):
     def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         raise NotImplementedError("BooleanGate uses apply() override instead of _apply_gate")
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], dimensions: list[str] | None = None, **kwargs: Any) -> go.Figure:
+    def plot(
+        self,
+        events: ad.AnnData,
+        mask: dict[str, BooleanArray],
+        dimensions: list[str] | None = None,
+        *,
+        hist_nbins: int = 100,
+        histnorm: str = "probability",
+        marker_size: int = 3,
+        use_gl: bool = True,
+        max_points: int = 50000,
+        downsample_seed: int = 0,
+        fail_color: str = "rgba(255, 0, 0, 0.3)",
+        pass_color: str = "rgba(0, 255, 0, 0.5)",
+        title: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
         """Plot events colored by boolean gate result.
 
         For 1D gates: creates a pass/fail overlaid histogram.
         For 2D gates: creates a pass/fail scatter plot.
         For N-D gates: creates pairwise projection grid.
         """
-        plot_dims = list(dimensions) if dimensions is not None else list(self.dimensions)
-        if not plot_dims:
-            if events.n_vars == 0:
-                raise ValueError("BooleanGate plot requires at least one dimension")
-            fallback_dims = [str(events.var_names[0])]
-            if events.n_vars > 1:
-                fallback_dims.append(str(events.var_names[1]))
-            plot_dims = fallback_dims
+        _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
+        if self.dimensions:
+            plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        else:
+            event_dims = [str(name) for name in events.var_names]
+            if dimensions is not None:
+                plot_dims = _resolve_plot_dimensions(dimensions, event_dims, gate_cls_name=self.__class__.__name__)
+            else:
+                if events.n_vars == 0:
+                    raise ValueError("BooleanGate plot requires at least one dimension")
+                # Keep the previous fallback behavior when no plotting dims are configured.
+                plot_dims = [str(events.var_names[0])]
+                if events.n_vars > 1:
+                    plot_dims.append(str(events.var_names[1]))
 
         gate_result = np.asarray(self.apply(events, mask)[self.gate_name], dtype=bool)
 
         n_dims = len(plot_dims)
-        if n_dims == 1:
-            return self._plot_1D(events, plot_dims, gate_result, **kwargs)
-        if n_dims == 2:
-            return self._plot_2D(events, plot_dims, gate_result, **kwargs)
-        return self._plot_nD(events, plot_dims, gate_result, **kwargs)
+        plot_kwargs: dict[str, Any] = {
+            "hist_nbins": hist_nbins,
+            "histnorm": histnorm,
+            "marker_size": marker_size,
+            "use_gl": use_gl,
+            "max_points": max_points,
+            "downsample_seed": downsample_seed,
+            "fail_color": fail_color,
+            "pass_color": pass_color,
+            "title": title,
+            "width": width,
+            "height": height,
+        }
+        plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
+        return plot_fn(events, plot_dims, gate_result, **plot_kwargs)
 
-    def _plot_1D(
-        self,
-        events: ad.AnnData,
-        dimensions: list[str],
-        gate_result: np.ndarray,
-        **kwargs: Any,
-    ) -> go.Figure:
+    def _plot_1D(self, events: ad.AnnData, dimensions: list[str], gate_result: np.ndarray, **kwargs: Any) -> go.Figure:
         dim = dimensions[0]
         data = np.asarray(events[:, dim].X).ravel()
         pass_mask = gate_result.astype(bool)
@@ -1593,9 +1988,12 @@ class BooleanGate(Gate):
         histnorm = str(kwargs.get("histnorm", "probability"))
         fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.35)"))
         pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.45)"))
-        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression})"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"BooleanGate: {self.gate_name} ({self.expression})"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         fig = go.Figure()
         if fail_mask.any():
@@ -1620,15 +2018,9 @@ class BooleanGate(Gate):
         fig.update_layout(barmode="overlay")
         fig.update_xaxes(title=dim)
         fig.update_yaxes(title=histnorm.title() if histnorm else "Count")
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_2D(
-        self,
-        events: ad.AnnData,
-        dimensions: list[str],
-        gate_result: np.ndarray,
-        **kwargs: Any,
-    ) -> go.Figure:
+    def _plot_2D(self, events: ad.AnnData, dimensions: list[str], gate_result: np.ndarray, **kwargs: Any) -> go.Figure:
         x_dim, y_dim = dimensions
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
@@ -1641,9 +2033,12 @@ class BooleanGate(Gate):
         downsample_seed = int(kwargs.get("downsample_seed", 0))
         fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.3)"))
         pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.5)"))
-        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression})"))
-        width = int(kwargs.get("width", 800))
-        height = int(kwargs.get("height", 600))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"BooleanGate: {self.gate_name} ({self.expression})"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 800 if width is None else int(width)
+        plot_height = 600 if height is None else int(height)
 
         downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
         if downsample_idx is not None:
@@ -1677,15 +2072,9 @@ class BooleanGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
-        return _format_gate_plot(fig, title=title, width=width, height=height)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
-    def _plot_nD(
-        self,
-        events: ad.AnnData,
-        dimensions: list[str],
-        gate_result: np.ndarray,
-        **kwargs: Any,
-    ) -> go.Figure:
+    def _plot_nD(self, events: ad.AnnData, dimensions: list[str], gate_result: np.ndarray, **kwargs: Any) -> go.Figure:
         fig, pairs = _create_subplot_grid(len(dimensions))
         n_cols = int(np.ceil(np.sqrt(len(pairs))))
 
@@ -1695,7 +2084,8 @@ class BooleanGate(Gate):
         downsample_seed = int(kwargs.get("downsample_seed", 0))
         fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.25)"))
         pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.4)"))
-        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression}) (Pairwise Projections)"))
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"BooleanGate: {self.gate_name} ({self.expression}) (Pairwise Projections)"
 
         pass_mask = gate_result.astype(bool)
         fail_mask = ~pass_mask
@@ -1749,14 +2139,16 @@ class BooleanGate(Gate):
 
         n_plots = len(pairs)
         n_rows = int(np.ceil(n_plots / n_cols))
-        height = int(kwargs.get("height", 400 * n_rows))
-        width = int(kwargs.get("width", 400 * n_cols))
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_height = int(height) if height is not None else 400 * n_rows
+        plot_width = int(width) if width is not None else 400 * n_cols
 
         return _format_gate_plot(
             fig,
-            title=title,
-            width=width,
-            height=height,
+            title=plot_title,
+            width=plot_width,
+            height=plot_height,
         )
 
     def to_dict(self) -> dict[str, Any]:
