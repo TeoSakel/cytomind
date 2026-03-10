@@ -1,5 +1,4 @@
 from __future__ import annotations
-from ast import TypeVar
 from typing import Any, Callable, Iterable, Sequence, Mapping, Literal, TypeVar, TYPE_CHECKING
 from pathlib import Path
 import warnings
