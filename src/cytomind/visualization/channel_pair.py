@@ -232,6 +232,8 @@ def build_scatter2d_density(
         col=1,
     )
 
+    histnorm = kwargs.get("histnorm", "probability")
+
     # Top marginal histogram (X-axis)
     fig.add_trace(
         go.Histogram(
@@ -240,7 +242,8 @@ def build_scatter2d_density(
             marker=dict(color="steelblue", line=dict(color="black", width=0.5)),
             name="X marginal",
             showlegend=False,
-            hovertemplate="Count: %{y}<extra></extra>",
+            histnorm=histnorm,
+            hovertemplate="Frequency: %{y}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -254,7 +257,8 @@ def build_scatter2d_density(
             marker=dict(color="steelblue", line=dict(color="black", width=0.5)),
             name="Y marginal",
             showlegend=False,
-            hovertemplate="Count: %{x}<extra></extra>",
+            histnorm=histnorm,
+            hovertemplate="Frequency: %{x}<extra></extra>",
         ),
         row=2,
         col=2,

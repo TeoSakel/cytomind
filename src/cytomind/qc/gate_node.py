@@ -156,70 +156,173 @@ class GateMaskRatioTest(QCTester):
 
     def plot(
         self,
-        adata: ad.AnnData,
         test: QCTestRecord,
+        *,
         output_path: PathLike | None = None,
         **kwargs
     ) -> go.Figure:
         """Generate diagnostic plot for gate mask event counts.
 
-        Creates a simple figure showing event counts and ratios.
+        Creates two normalized stacked bars (height 1.0):
+        1. Total view: shows gate/parent/other proportions relative to total events
+        2. Parent view: shows gate/non-gate proportions relative to parent events
+
+        Both bars overlay their corresponding ratio thresholds.
         """
         gate_id = test.targets.get("gate_id", "Unknown")
-        parent_id = test.targets.get("parent_id")
+        parent_id = test.metadata.get("parent_id", "Unknown")
 
-        n_passing = test.metadata.get("n_events_passing", 0)
         n_total = test.metadata.get("n_events_total", 0)
-        n_not_passing = n_total - n_passing
+        n_parent = test.metadata.get("n_events_parent", 0)
+        n_passing = test.metadata.get("n_events_passing", 0)
 
         ratio_total = test.metrics.get("ratio_total", 0.0)
-        ratio_parent = test.metrics.get("ratio_parent", np.nan)
+        ratio_parent = test.metrics.get("ratio_parent", 0.0)
 
-        # Create title with parent info if available
-        if parent_id:
-            title = f"Gate: {gate_id} (parent: {parent_id})"
+        # Calculate event counts for stacked bars
+        # For parent view: need events in gate AND parent
+        if not np.isnan(ratio_parent) and n_parent > 0:
+            n_passing_in_parent = int(ratio_parent * n_parent)
         else:
-            title = f"Gate: {gate_id}"
+            n_passing_in_parent = 0
 
-        # Create bar chart with event counts
+        # Normalized proportions for first bar (Total view)
+        if n_total > 0:
+            prop_gate_total = n_passing_in_parent / n_total
+            prop_parent_not_gate_total = (n_parent - n_passing_in_parent) / n_total
+            prop_not_parent_total = (n_total - n_parent) / n_total
+        else:
+            prop_gate_total = prop_parent_not_gate_total = prop_not_parent_total = 0
+
+        # Normalized proportions for second bar (Parent view)
+        if n_parent > 0:
+            prop_gate_parent = ratio_parent
+            prop_parent_not_gate_parent = 1.0 - ratio_parent
+        else:
+            prop_gate_parent = prop_parent_not_gate_parent = 0
+
+        # Create figure
         fig = go.Figure()
 
+        # First bar: Total view (3 parts)
         fig.add_trace(go.Bar(
-            name="Passing Gate",
-            x=[gate_id],
-            y=[n_passing],
-            text=[f"{n_passing:,}<br>({ratio_total:.1%})"],
-            textposition="outside",
-            marker=dict(color="rgba(0, 128, 0, 0.7)"),
+            name="Not in parent",
+            x=["Total View"],
+            y=[prop_not_parent_total],
+            marker=dict(color="rgba(211, 211, 211, 0.7)"),
+            text=f"Other<br>{prop_not_parent_total:.1%}",
+            textposition="inside",
+            hovertemplate="<b>Not in parent</b><br>Proportion: %{y:.2%}<extra></extra>",
         ))
 
         fig.add_trace(go.Bar(
-            name="Not Passing Gate",
-            x=[gate_id],
-            y=[n_not_passing],
-            text=[f"{n_not_passing:,}"],
-            textposition="outside",
-            marker=dict(color="rgba(192, 192, 192, 0.7)"),
+            name="Parent (not gate)",
+            x=["Total View"],
+            y=[prop_parent_not_gate_total],
+            marker=dict(color="rgba(100, 149, 237, 0.7)"),
+            text=f"Parent<br>{prop_parent_not_gate_total:.1%}",
+            textposition="inside",
+            hovertemplate="<b>In parent, not in gate</b><br>Proportion: %{y:.2%}<extra></extra>",
         ))
+
+        fig.add_trace(go.Bar(
+            name="Gate",
+            x=["Total View"],
+            y=[prop_gate_total],
+            marker=dict(color="rgba(60, 179, 113, 0.7)"),
+            text=f"Gate<br>{prop_gate_total:.1%}",
+            textposition="inside",
+            hovertemplate="<b>In gate</b><br>Proportion: %{y:.2%}<extra></extra>",
+        ))
+
+        # Second bar: Parent view (2 parts)
+        fig.add_trace(go.Bar(
+            name="Parent (not gate)",
+            x=["Parent View"],
+            y=[prop_parent_not_gate_parent],
+            marker=dict(color="rgba(100, 149, 237, 0.7)"),
+            text=f"Parent<br>{prop_parent_not_gate_parent:.1%}",
+            textposition="inside",
+            showlegend=False,
+            hovertemplate="<b>In parent, not in gate</b><br>Proportion: %{y:.2%}<extra></extra>",
+        ))
+
+        fig.add_trace(go.Bar(
+            name="Gate",
+            x=["Parent View"],
+            y=[prop_gate_parent],
+            marker=dict(color="rgba(60, 179, 113, 0.7)"),
+            text=f"Gate<br>{prop_gate_parent:.1%}",
+            textposition="inside",
+            showlegend=False,
+            hovertemplate="<b>In gate</b><br>Proportion: %{y:.2%}<extra></extra>",
+        ))
+
+        # Add threshold lines
+        thresholds = test.thresholds or {}
+
+        # Total ratio threshold (on first bar)
+        if "ratio_total" in thresholds and "warn" in thresholds["ratio_total"]:
+            warn_range = thresholds["ratio_total"]["warn"]
+            if warn_range and len(warn_range) == 2 and warn_range[0] is not None:
+                fig.add_shape(
+                    type="line",
+                    x0=-0.4, x1=0.4,  # First bar position
+                    y0=warn_range[0], y1=warn_range[0],
+                    line=dict(color="orange", width=3, dash="dash"),
+                    xref="x", yref="y",
+                )
+            if warn_range and len(warn_range) == 2 and warn_range[1] is not None and warn_range[1] < 1.0:
+                fig.add_shape(
+                    type="line",
+                    x0=-0.4, x1=0.4,  # First bar position
+                    y0=warn_range[1], y1=warn_range[1],
+                    line=dict(color="orange", width=3, dash="dash"),
+                    xref="x", yref="y",
+                )
+
+        # Parent ratio threshold (on second bar)
+        if "ratio_parent" in thresholds and "warn" in thresholds["ratio_parent"]:
+            warn_range = thresholds["ratio_parent"]["warn"]
+            if warn_range and len(warn_range) == 2 and warn_range[0] is not None:
+                fig.add_shape(
+                    type="line",
+                    x0=0.6, x1=1.4,  # Second bar position
+                    y0=warn_range[0], y1=warn_range[0],
+                    line=dict(color="red", width=3, dash="dash"),
+                    xref="x", yref="y",
+                )
+            if warn_range and len(warn_range) == 2 and warn_range[1] is not None and warn_range[1] < 1.0:
+                fig.add_shape(
+                    type="line",
+                    x0=0.6, x1=1.4,  # Second bar position
+                    y0=warn_range[1], y1=warn_range[1],
+                    line=dict(color="red", width=3, dash="dash"),
+                    xref="x", yref="y",
+                )
+
+        # Update layout
+        title = f"Gate: {gate_id} (parent: {parent_id})<br>" \
+                f"<sub>Total events: {n_total:,} | Parent events: {n_parent:,} | " \
+                f"Gate events: {n_passing_in_parent:,}</sub>"
 
         fig.update_layout(
             title=title,
-            xaxis_title="Gate",
-            yaxis_title="Event Count",
+            xaxis_title="",
+            yaxis_title="Proportion",
+            yaxis=dict(range=[0, 1.05], tickformat=".0%"),
             barmode="stack",
             hovermode="closest",
-            height=400,
-        )
-
-        # Add threshold annotation if available
-        if not np.isnan(ratio_parent) and not test.metadata.get("is_boolean", False):
-            fig.add_annotation(
-                text=f"Ratio to parent: {ratio_parent:.2%}",
-                xref="paper", yref="paper",
-                x=0.5, y=-0.2,
-                showarrow=False,
-                font=dict(size=12),
+            height=500,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.2,
+                xanchor="center",
+                x=0.5
             )
+        )
 
         if output_path:
             output_path = Path(output_path)
@@ -505,6 +608,325 @@ class MetricOutlierTest(QCTester):
                     status="PENDING",
                 )
 
+    def plot(
+        self,
+        test: QCTestRecord,
+        **kwargs
+    ) -> go.Figure:
+        """Generate diagnostic plot for metric outlier test.
+
+        Creates a combined histogram and marginal boxplot showing the distribution
+        of metric values across samples with threshold lines for warn/severe levels.
+
+        Parameters
+        ----------
+        test : QCTestRecord
+            A test record to extract metadata (metric_name, thresholds)
+        **kwargs
+            Must include 'sample_metrics': dict[str, dict[str, Any]]
+                Nested dict: sample_id → {metric_name: value}
+            Optional 'output_path': PathLike | None
+                Path to save the figure as HTML
+
+        Returns
+        -------
+        go.Figure
+            Plotly figure with histogram and marginal boxplot
+        """
+        sample_metrics = kwargs.get("sample_metrics", {})
+        output_path = kwargs.get("output_path")
+
+        metric_name = test.metadata.get("metric_name", "Unknown")
+        gate_id = test.targets.get("gate_id", "Unknown")
+        strategy_id = test.targets.get("strategy_id", "Unknown")
+
+        # Extract metric values from sample_metrics
+        sample_ids = []
+        values = []
+        for sample_id, metrics in sample_metrics.items():
+            if metric_name in metrics:
+                value = metrics[metric_name]
+                try:
+                    values.append(float(value))
+                    sample_ids.append(sample_id)
+                except (TypeError, ValueError):
+                    continue
+
+        if not values:
+            # Create empty figure with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"No valid values for metric: {metric_name}",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5,
+                showarrow=False,
+                font=dict(size=16),
+            )
+            return fig
+
+        values_array = np.array(values)
+
+        # Create figure with secondary y-axis for boxplot
+        from plotly.subplots import make_subplots
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.15, 0.85],
+            vertical_spacing=0.05,
+            shared_xaxes=True,
+            subplot_titles=("", f"Distribution of {metric_name}")
+        )
+
+        # Add boxplot on top
+        fig.add_trace(
+            go.Box(
+                x=values_array,
+                name="",
+                orientation='h',
+                marker=dict(color='rgba(100, 149, 237, 0.6)'),
+                boxmean='sd',
+                showlegend=False,
+                hovertemplate="<b>Boxplot</b><br>Value: %{x:.4f}<extra></extra>",
+            ),
+            row=1, col=1
+        )
+
+        # Add histogram on bottom
+        fig.add_trace(
+            go.Histogram(
+                x=values_array,
+                name=metric_name,
+                marker=dict(
+                    color='rgba(100, 149, 237, 0.7)',
+                    line=dict(color='rgba(100, 149, 237, 1)', width=1)
+                ),
+                showlegend=False,
+                hovertemplate="<b>Bin</b><br>Range: %{x}<br>Count: %{y}<extra></extra>",
+            ),
+            row=2, col=1
+        )
+
+        # Extract thresholds
+        thresholds = test.thresholds or {}
+        outlier_thresholds = thresholds.get("outlier_score", {})
+
+        # Get the method to understand if we're looking at scores or raw values
+        method = test.metadata.get("outlier_method", "iqr")
+
+        # Calculate statistics for reference
+        q1 = np.percentile(values_array, 25)
+        q3 = np.percentile(values_array, 75)
+        iqr = q3 - q1
+        median = np.median(values_array)
+        mean = np.mean(values_array)
+        std = np.std(values_array)
+
+        # Calculate MAD if using robust z-score
+        use_mad = test.metadata.get("use_mad", True)
+        if use_mad:
+            mad = np.median(np.abs(values_array - median))
+            scale = mad if mad > 0 else std
+        else:
+            scale = std
+
+        # Convert outlier score thresholds to raw metric values
+        warn_range = outlier_thresholds.get("warn", (None, None))
+        severe_range = outlier_thresholds.get("severe", (None, None))
+
+        # Compute threshold boundaries in raw metric space
+        threshold_lines = []
+        if method == "iqr":
+            # IQR method: score = (value - Q2) / IQR
+            # So: value = Q2 + score * IQR
+            if warn_range[0] is not None and iqr > 0:
+                warn_lower = median + warn_range[0] * iqr
+                threshold_lines.append(("warn_lower", warn_lower, "orange", "dash"))
+            if warn_range[1] is not None and iqr > 0:
+                warn_upper = median + warn_range[1] * iqr
+                threshold_lines.append(("warn_upper", warn_upper, "orange", "dash"))
+            if severe_range[0] is not None and iqr > 0:
+                severe_lower = median + severe_range[0] * iqr
+                threshold_lines.append(("severe_lower", severe_lower, "red", "dashdot"))
+            if severe_range[1] is not None and iqr > 0:
+                severe_upper = median + severe_range[1] * iqr
+                threshold_lines.append(("severe_upper", severe_upper, "red", "dashdot"))
+
+        elif method == "zscore":
+            # Z-score method: score = (value - center) / scale
+            # So: value = center + score * scale
+            center = median if use_mad else mean
+            if warn_range[0] is not None and scale > 0:
+                warn_lower = center + warn_range[0] * scale
+                threshold_lines.append(("warn_lower", warn_lower, "orange", "dash"))
+            if warn_range[1] is not None and scale > 0:
+                warn_upper = center + warn_range[1] * scale
+                threshold_lines.append(("warn_upper", warn_upper, "orange", "dash"))
+            if severe_range[0] is not None and scale > 0:
+                severe_lower = center + severe_range[0] * scale
+                threshold_lines.append(("severe_lower", severe_lower, "red", "dashdot"))
+            if severe_range[1] is not None and scale > 0:
+                severe_upper = center + severe_range[1] * scale
+                threshold_lines.append(("severe_upper", severe_upper, "red", "dashdot"))
+
+        # Add statistical reference lines
+        colors = {
+            'median': 'green',
+            'mean': 'blue',
+            'q1': 'orange',
+            'q3': 'orange',
+        }
+
+        # Add vertical lines using shapes for subplot compatibility
+        # Boxplot (row 1)
+        fig.add_shape(
+            type="line",
+            x0=median, x1=median,
+            y0=0, y1=1,
+            line=dict(color=colors['median'], width=2, dash='dash'),
+            xref="x", yref="y domain",
+            row=1, col=1
+        )
+
+        fig.add_shape(
+            type="line",
+            x0=mean, x1=mean,
+            y0=0, y1=1,
+            line=dict(color=colors['mean'], width=2, dash='dot'),
+            xref="x", yref="y domain",
+            row=1, col=1
+        )
+
+        # Add threshold lines to boxplot
+        for label, value, color, dash in threshold_lines:
+            fig.add_shape(
+                type="line",
+                x0=value, x1=value,
+                y0=0, y1=1,
+                line=dict(color=color, width=2, dash=dash),
+                xref="x", yref="y domain",
+                row=1, col=1
+            )
+
+        # Histogram (row 2) - with annotations
+        fig.add_shape(
+            type="line",
+            x0=median, x1=median,
+            y0=0, y1=1,
+            line=dict(color=colors['median'], width=2, dash='dash'),
+            xref="x2", yref="y2 domain",
+            row=2, col=1
+        )
+
+        fig.add_annotation(
+            x=median, y=1.05,
+            text=f"Median: {median:.4f}",
+            showarrow=False,
+            xref="x2", yref="y2 domain",
+            font=dict(size=10, color=colors['median']),
+            row=2, col=1
+        )
+
+        fig.add_shape(
+            type="line",
+            x0=mean, x1=mean,
+            y0=0, y1=1,
+            line=dict(color=colors['mean'], width=2, dash='dot'),
+            xref="x2", yref="y2 domain",
+            row=2, col=1
+        )
+
+        fig.add_annotation(
+            x=mean, y=0.95,
+            text=f"Mean: {mean:.4f}",
+            showarrow=False,
+            xref="x2", yref="y2 domain",
+            font=dict(size=10, color=colors['mean']),
+            row=2, col=1
+        )
+
+        # Add threshold lines to histogram
+        for label, value, color, dash in threshold_lines:
+            fig.add_shape(
+                type="line",
+                x0=value, x1=value,
+                y0=0, y1=1,
+                line=dict(color=color, width=2, dash=dash),
+                xref="x2", yref="y2 domain",
+                row=2, col=1
+            )
+            # Add annotation for threshold
+            if "lower" in label:
+                y_pos = 0.85 if "severe" in label else 0.75
+            else:
+                y_pos = 0.65 if "severe" in label else 0.55
+
+            fig.add_annotation(
+                x=value, y=y_pos,
+                text=f"{label.replace('_', ' ').title()}: {value:.4f}",
+                showarrow=False,
+                xref="x2", yref="y2 domain",
+                font=dict(size=9, color=color),
+                textangle=-90,
+                row=2, col=1
+            )
+
+        # Update layout
+        title = (
+            f"<b>Gate: {gate_id}</b> | Metric: {metric_name}<br>"
+            f"<sub>Strategy: {strategy_id} | Samples: {len(values)} | "
+            f"Method: {method.upper()} | "
+            f"μ={mean:.4f}, σ={std:.4f}, Q1={q1:.4f}, Q3={q3:.4f}</sub>"
+        )
+
+        fig.update_layout(
+            title=title,
+            height=600,
+            hovermode="closest",
+            showlegend=False,
+        )
+
+        # Update axes
+        fig.update_xaxes(title_text=metric_name, row=2, col=1)
+        fig.update_xaxes(showticklabels=False, row=1, col=1)
+        fig.update_yaxes(title_text="", showticklabels=False, row=1, col=1)
+        fig.update_yaxes(title_text="Count", row=2, col=1)
+
+        # Add threshold information as annotation
+        warn_range = outlier_thresholds.get("warn", (None, None))
+        severe_range = outlier_thresholds.get("severe", (None, None))
+        threshold_text = (
+            f"<b>Outlier Thresholds ({method.upper()})</b><br>"
+            f"Warn score: [{warn_range[0]}, {warn_range[1]}]<br>"
+            f"Severe score: [{severe_range[0]}, {severe_range[1]}]<br>"
+        )
+
+        # Add converted thresholds if applicable
+        if threshold_lines:
+            threshold_text += "<br><b>In metric space:</b><br>"
+            for label, value, color, dash in threshold_lines:
+                threshold_text += f"{label.replace('_', ' ').title()}: {value:.4f}<br>"
+
+        fig.add_annotation(
+            text=threshold_text,
+            xref="paper", yref="paper",
+            x=1.02, y=0.5,
+            xanchor="left", yanchor="middle",
+            showarrow=False,
+            font=dict(size=9),
+            bgcolor="rgba(255, 255, 255, 0.9)",
+            bordercolor="black",
+            borderwidth=1,
+            align="left",
+        )
+
+        if output_path:
+            output_path = Path(output_path)
+            if output_path.suffix != ".html":
+                raise ValueError("Output path must have .html extension for Plotly figure.")
+            fig.write_html(output_path)
+
+        return fig
+
 class GLMGateOutlierTest(QCTester):
     """Outlier test for full gate geometry grouped by `glm_type`.
 
@@ -603,7 +1025,7 @@ class GLMGateOutlierTest(QCTester):
             else:
                 msg = "GLM gate outlier test is not applicable due to insufficient samples"
             for sample_id in sample_ids:
-                meta = {**self.metadata, "sample_id": sample_id}
+                meta = {**metadata, "sample_id": sample_id}
                 yield QCTestRecord(
                     id=self.make_key(targets, meta),
                     test_type=self.test_type,
@@ -1046,6 +1468,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         gate_space_thresholds = self._normalize_outlier_thresholds(
             config.get("gate_space_thresholds", config.get("outlier_thresholds", config.get("thresholds")))
         )
+
         space_tester = GLMGateOutlierTest(
             config={
                 "min_samples": config["gate_space_min_samples"],
@@ -1184,8 +1607,14 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         event_tester = GateMaskRatioTest(
             config={},
             thresholds={
-                "ratio_total": (config["ratio_total_min"], config["ratio_total_max"]),
-                "ratio_parent": (config["ratio_parent_min"], config["ratio_parent_max"]),
+                "ratio_total": {
+                    "warn": (config["ratio_total_min"], config["ratio_total_max"]),
+                    "severe": (None, None),
+                },
+                "ratio_parent": {
+                    "warn": (config["ratio_parent_min"], config["ratio_parent_max"]),
+                    "severe": (None, None),
+                },
             }
         )
 
@@ -1207,9 +1636,9 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         # Run gate fitting quality test
         fitting_tester = GateFitDiagnosticTest(
             thresholds={
-                "r_squared": config["r_squared"],
-                "residual_std": config["residual_std"],
-                "n_outliers": config["n_outliers"],
+                "r_squared": {"warn": (config["r_squared"], None), "severe": (None, None)},
+                "residual_std": {"warn": (None, config["residual_std"]), "severe": (None, None)},
+                "n_outliers": {"warn": (None, config["n_outliers"]), "severe": (None, None)},
             }
         )
 

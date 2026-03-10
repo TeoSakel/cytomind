@@ -308,7 +308,7 @@ class QCTester(ABC):
             classified_test = self.classify(test, **kwargs)
             yield classified_test
 
-    def plot(self, adata: AnnData, test: QCTestRecord, output_path: PathLike | None = None, **kwargs) -> Figure:
+    def plot(self, test: QCTestRecord, **kwargs) -> Figure:
         """
         Generate diagnostic plot for test.
 
@@ -797,13 +797,12 @@ class EntityQCEvaluator(ABC):
             if not entities:
                 continue
 
-            evaluator = evaluator_class()  # TODO: consider passing entity-specific config if needed
-
             # Preserve caller-provided order within entity type.
             for entity_id, raw_context in entities.items():
                 context = dict(raw_context)
                 sample_ids = context.pop("sample_ids", list(step_run.sample_outputs.keys()))
 
+                evaluator = evaluator_class()  # TODO: consider passing entity-specific config if needed
                 qc_status = evaluator.parse_step(step_run, entity_id)
                 entity = evaluator.load_entity(repo._dataloader, entity_id, context=context)  # Load full entity for evaluation
 
@@ -890,7 +889,7 @@ class EntityQCEvaluator(ABC):
     def generate_table(
         self,
         entity_qc: EntityQCStatus,
-        table_type: str,
+        table_type: str | None = None,
         test_name: str | None = None,
         sample_ids: Iterable[str] | None = None,
         table_path: PathLike | None = None,
@@ -939,16 +938,26 @@ class EntityQCEvaluator(ABC):
 
         # Get key fields from the appropriate test
         if test_name is not None:
-            # If test_name is specified, use that test's fields
-            if test_name in tests:
-                tester_instance = tests[test_name]()
-                id_vars = list(tester_instance.key_fields)
-        else:
+            if test_name not in tests:
+                raise ValueError(
+                    f"Invalid test_name '{test_name}'. Must be one of {sorted(tests.keys())}."
+                )
+            tester_instance = tests[test_name]()
+            id_vars = list(tester_instance.key_fields)
+            table_type = table_type or tester_instance.test_type
+            if table_type != tester_instance.test_type:
+                raise ValueError(
+                    f"test_name '{test_name}' does not match table_type '{table_type}'. "
+                    f"Test '{test_name}' has type '{tester_instance.test_type}'."
+                )
+        elif table_type is not None:
             # Otherwise use the first test of the requested table_type
             for tester_class in tests.values():
                 if tester_class.test_type == table_type:
                     id_vars = list(tester_class().key_fields)
                     break
+        else:
+            raise ValueError("Must specify either table_type or test_name to determine which tests to include in the table.")
 
         if not id_vars:
             raise ValueError(

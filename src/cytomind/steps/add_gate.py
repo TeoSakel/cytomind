@@ -343,6 +343,7 @@ class AddGateStep(BaseStep):
             quadrants = gate_node.params["params"]["quadrants"]
             for qid, loc in gate.locations.items():  # type: ignore[attr-defined]
                 # Create a GateNode for this quadrant
+                quadrant_params = {"boundaries": quadrants[qid]}
                 quadrant_node = GateNode(
                     id=qid,
                     gate_type="Quadrant",
@@ -352,7 +353,7 @@ class AddGateStep(BaseStep):
                     name=qid,
                     parent_ids=[gate_node.id],
                     use_as_complement=False,
-                    params=quadrants[qid],
+                    params={"hyperparams": quadrant_params, "params": quadrant_params},
                     custom_gates={
                         sid: sample_info.get("params", {}).get(qid, {})
                         for sid, sample_info in step_run.sample_outputs.items()

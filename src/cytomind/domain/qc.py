@@ -17,6 +17,7 @@ class QCFlag(str, Enum):
     WARN = "WARN"
     SEVERE = "SEVERE"
     FAIL = "FAIL"
+    SKIP = "SKIP"
 
     @classmethod
     def from_str(cls, value: str) -> "QCFlag":
@@ -29,6 +30,7 @@ class QCFlag(str, Enum):
     def combine(flags: Iterable["QCFlag"]) -> "QCFlag":
         """Combine multiple flags into a single overall flag (FAIL > SEVERE > WARN > PASS)."""
         flags = set(flags)
+        flags.discard(QCFlag.SKIP)
         if not flags:
             return QCFlag.PASS
         if QCFlag.FAIL in flags:
@@ -142,6 +144,16 @@ class QCStepStatus:
             "tests": [test.to_dict() for test in self.tests.values()],
         }
 
+    def merge(self, other: "QCStepStatus") -> None:
+        self.flag = QCFlag.combine([self.flag, other.flag])
+        self.tests.update(other.tests)
+        for code, payload in other.reasons.items():
+            messages = payload["messages"]
+            tests = payload["tests"]
+            if code in self.reasons:
+                self.reasons[code]["messages"].update(messages)
+                self.reasons[code]["tests"].update(tests)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "QCStepStatus":
         reasons = data.get("reasons", {}) or {}
@@ -181,12 +193,16 @@ class QCRunStatus:
             self.steps[step_name] = QCStepStatus()
         return self.steps[step_name]
 
-    def update(self, other: QCRunStatus) -> None:
-        existing = [step_name for step_name in other.steps if step_name in self.steps]
-        if existing:
-            raise ValueError(f"Steps {existing} already exist. Use get_step() to modify existing steps or ensure no overlap when updating.")
+    def update(self, other: QCRunStatus, merge: bool = False) -> None:
+        if not merge:
+            existing = [step_name for step_name in other.steps if step_name in self.steps]
+            if existing:
+                raise ValueError(f"Steps {existing} already exist. Use get_step() to modify existing steps or ensure no overlap when updating.")
         for step_name, step_status in other.steps.items():
-            self.steps[step_name] = step_status
+            if step_name in self.steps:
+                self.steps[step_name].merge(step_status)
+            else:
+                self.steps[step_name] = step_status
 
     def __getitem__(self, key: str) -> QCStepStatus:
         """Access step by name."""
@@ -293,16 +309,16 @@ class EntityQCStatus:
             for test_key, test in step.tests.items():
                 yield step_name, test_key, test
 
-    def update_sample_steps(self, sample_id: str, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]]) -> None:
+    def update_sample_steps(self, sample_id: str, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]], merge: bool = False) -> None:
         sample_steps = self.get_sample_steps(sample_id)
         if not isinstance(steps, QCRunStatus):
             steps = QCRunStatus(OrderedDict(steps))
-        sample_steps.update(steps)
+        sample_steps.update(steps, merge=merge)
 
-    def update_batch_steps(self, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]]) -> None:
+    def update_batch_steps(self, steps: QCRunStatus | Iterable[tuple[str, QCStepStatus]], merge: bool = False) -> None:
         if not isinstance(steps, QCRunStatus):
             steps = QCRunStatus(OrderedDict(steps))
-        self.batch_qc.update(steps)
+        self.batch_qc.update(steps, merge=merge)
 
     @property
     def overall_flag(self) -> QCFlag:

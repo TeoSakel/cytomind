@@ -157,8 +157,9 @@ class NegativeFluorescenceTest(QCTester):
 
     def plot(
         self,
-        adata: AnnData,
         test: QCTestRecord,
+        *,
+        adata: AnnData,
         output_path: PathLike | None = None,
         nbins: int = 128,
         **kwargs
@@ -369,8 +370,9 @@ class VeryNegativeFluorescenceTest(QCTester):
 
     def plot(
         self,
-        adata: AnnData,
         test: QCTestRecord,
+        *,
+        adata: AnnData,
         output_path: PathLike | None = None,
         nbins: int = 128,
         **kwargs
@@ -616,8 +618,9 @@ class NegativeEnrichmentTest(QCTester):
 
     def plot(
         self,
-        adata: AnnData,
         test: QCTestRecord,
+        *,
+        adata: AnnData,
         output_path: PathLike | None = None,
         **kwargs
     ) -> go.Figure:
@@ -1025,8 +1028,9 @@ class HighDonorCorrelationTest(QCTester):
 
     def plot(
         self,
-        adata: AnnData,
         test: QCTestRecord,
+        *,
+        adata: AnnData,
         output_path: PathLike | None = None,
         **kwargs
     ) -> go.Figure:

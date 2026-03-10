@@ -267,9 +267,9 @@ class BaseStep:
 
         # Evaluate and persist product QC
         for qc_status in step_evaluator.evaluate_step_products(self.repo, step_run):
-            step_run.qc.update_batch_steps(qc_status.batch_qc)
+            step_run.qc.update_batch_steps(qc_status.batch_qc, merge=True)
             for sid, qc in qc_status.sample_qc.items():
-                step_run.qc.update_sample_steps(sid, qc)
+                step_run.qc.update_sample_steps(sid, qc, merge=True)
             self.repo.save_qc_entity_status(qc_status)
 
         # Evaluate step's own QC

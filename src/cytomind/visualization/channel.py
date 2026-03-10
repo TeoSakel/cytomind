@@ -15,6 +15,7 @@ def build_histogram1d(
     title: str | None = None,
     xaxis_title: str | None = None,
     yaxis_title: str | None = "Frequency",
+    histnorm: str | None = "probability",
     width: int = 700,
     height: int = 500,
 ) -> go.Figure:
@@ -30,6 +31,9 @@ def build_histogram1d(
         Bar color.
     title, xaxis_title, yaxis_title : str | None
         Layout labels.
+    histnorm : str | None
+        Histogram normalization mode. Default is "probability" for frequency display.
+        Use None for absolute counts.
 
     Returns
     -------
@@ -44,13 +48,6 @@ def build_histogram1d(
 
     if yaxis_title is None:
         yaxis_title = "Frequency"
-
-    histnorm = None
-    yaxis_title_lower = yaxis_title.lower()
-    if "count" in yaxis_title_lower:
-        histnorm = None
-    elif "frequency" in yaxis_title_lower:
-        histnorm = "probability"
 
     trace = go.Histogram(x=data, nbinsx=nbins, histnorm=histnorm)
     if color:

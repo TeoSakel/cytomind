@@ -246,6 +246,7 @@ class RectangleGate(Gate):
         data = np.asarray(events[:, dim].X).ravel()
         nbins = int(kwargs.get("hist_nbins", 100))
         hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
+        histnorm = str(kwargs.get("histnorm", "probability"))
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
@@ -259,6 +260,7 @@ class RectangleGate(Gate):
             nbinsx=nbins,
             name="Events",
             marker=dict(color=hist_color),
+            histnorm=histnorm,
         ))
 
         if dim in self.min_vals:
@@ -278,8 +280,9 @@ class RectangleGate(Gate):
                 annotation_text="max",
             )
 
+        yaxis_title = histnorm.title() if histnorm else "Count"
         fig.update_xaxes(title=dim)
-        fig.update_yaxes(title="Count")
+        fig.update_yaxes(title=yaxis_title)
         return _format_gate_plot(fig, title=title, width=width, height=height)
 
     def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
@@ -1063,7 +1066,9 @@ class QuadrantGate(Gate):
             Dictionary mapping quadrant_id to boolean mask for that quadrant.
             Each mask indicates which events fall within the quadrant's bounds.
         """
-        results: dict[str, BooleanArray] = {}
+        results: dict[str, BooleanArray] = {
+            self.gate_name: np.ones(len(events_slice), dtype=np.bool_)
+        }
 
         for quad_id, quad_def in self.quadrants.items():
             # Start with all events True for this quadrant
@@ -1119,6 +1124,7 @@ class QuadrantGate(Gate):
         data = np.asarray(events[:, dim].X).ravel()
         nbins = int(kwargs.get("hist_nbins", 100))
         hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
+        histnorm = str(kwargs.get("histnorm", "probability"))
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
@@ -1132,6 +1138,7 @@ class QuadrantGate(Gate):
             nbinsx=nbins,
             name="Events",
             marker=dict(color=hist_color),
+            histnorm=histnorm,
         ))
 
         for divider_val in self.dividers[dim]:
@@ -1142,14 +1149,45 @@ class QuadrantGate(Gate):
                 line_dash=gate_line_dash,
             )
 
+        label_font_size = int(kwargs.get("quadrant_label_font_size", 12))
+        label_font_color = str(kwargs.get("quadrant_label_color", gate_line_color))
+        label_bg_color = kwargs.get("quadrant_label_bgcolor")
+        label_opacity = float(kwargs.get("quadrant_label_opacity", 0.8))
+        dim_min, dim_max = float(np.min(data)), float(np.max(data))
+
+        for quad_id, quad_def in self.quadrants.items():
+            dim_lower, dim_upper = quad_def[dim]
+
+            # Convert open-ended quadrant bounds into finite plot-space bounds.
+            dim_start = dim_min if dim_lower is None else float(dim_lower)
+            dim_end = dim_max if dim_upper is None else float(dim_upper)
+            dim_center = (dim_start + dim_end) / 2.0
+
+            annotation_kwargs: dict[str, Any] = {
+                "x": dim_center,
+                "y": 0.5,
+                "yref": "paper",
+                "text": quad_id,
+                "showarrow": False,
+                "font": {"size": label_font_size, "color": label_font_color},
+                "opacity": label_opacity,
+            }
+            if label_bg_color is not None:
+                annotation_kwargs["bgcolor"] = label_bg_color
+
+            fig.add_annotation(**annotation_kwargs)
+
+        yaxis_title = histnorm.title() if histnorm else "Count"
         fig.update_xaxes(title=dim)
-        fig.update_yaxes(title="Count")
+        fig.update_yaxes(title=yaxis_title)
         return _format_gate_plot(fig, title=title, width=width, height=height)
 
     def _plot_2D(self, events: ad.AnnData, **kwargs: Any) -> go.Figure:
         x_dim, y_dim = self.dimensions
-        x_data = np.asarray(events[:, x_dim].X).ravel()
-        y_data = np.asarray(events[:, y_dim].X).ravel()
+        x_all = np.asarray(events[:, x_dim].X).ravel()
+        y_all = np.asarray(events[:, y_dim].X).ravel()
+        x_data = x_all
+        y_data = y_all
         density_nbins = int(kwargs.get("density_nbins", 50))
         density_log_scale = bool(kwargs.get("density_log_scale", True))
         marker_size = int(kwargs.get("marker_size", 3))
@@ -1199,6 +1237,39 @@ class QuadrantGate(Gate):
                     line_dash=gate_line_dash,
                 )
 
+        label_font_size = int(kwargs.get("quadrant_label_font_size", 12))
+        label_font_color = str(kwargs.get("quadrant_label_color", gate_line_color))
+        label_bg_color = kwargs.get("quadrant_label_bgcolor")
+        label_opacity = float(kwargs.get("quadrant_label_opacity", 0.8))
+        x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
+        y_min, y_max = float(np.min(y_all)), float(np.max(y_all))
+
+        for quad_id, quad_def in self.quadrants.items():
+            x_lower, x_upper = quad_def[x_dim]
+            y_lower, y_upper = quad_def[y_dim]
+
+            # Convert open-ended quadrant bounds into finite plot-space bounds.
+            x_start = x_min if x_lower is None else float(x_lower)
+            x_end = x_max if x_upper is None else float(x_upper)
+            y_start = y_min if y_lower is None else float(y_lower)
+            y_end = y_max if y_upper is None else float(y_upper)
+
+            x_center = (x_start + x_end) / 2.0
+            y_center = (y_start + y_end) / 2.0
+
+            annotation_kwargs: dict[str, Any] = {
+                "x": x_center,
+                "y": y_center,
+                "text": quad_id,
+                "showarrow": False,
+                "font": {"size": label_font_size, "color": label_font_color},
+                "opacity": label_opacity,
+            }
+            if label_bg_color is not None:
+                annotation_kwargs["bgcolor"] = label_bg_color
+
+            fig.add_annotation(**annotation_kwargs)
+
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
         return _format_gate_plot(fig, title=title, width=width, height=height)
@@ -1216,6 +1287,10 @@ class QuadrantGate(Gate):
         gate_line_color = str(kwargs.get("gate_line_color", "red"))
         gate_line_width = int(kwargs.get("gate_line_width", 2))
         gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        label_font_size = int(kwargs.get("quadrant_label_font_size", 12))
+        label_font_color = str(kwargs.get("quadrant_label_color", gate_line_color))
+        label_bg_color = kwargs.get("quadrant_label_bgcolor")
+        label_opacity = float(kwargs.get("quadrant_label_opacity", 0.8))
         title = str(kwargs.get("title", f"QuadrantGate: {self.gate_name} (Pairwise Projections)"))
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
 
@@ -1225,8 +1300,10 @@ class QuadrantGate(Gate):
 
             x_dim = self.dimensions[i]
             y_dim = self.dimensions[j]
-            x_data = np.asarray(events[:, x_dim].X).ravel()
-            y_data = np.asarray(events[:, y_dim].X).ravel()
+            x_all = np.asarray(events[:, x_dim].X).ravel()
+            y_all = np.asarray(events[:, y_dim].X).ravel()
+            x_data = x_all
+            y_data = y_all
             if downsample_idx is not None:
                 x_data = x_data[downsample_idx]
                 y_data = y_data[downsample_idx]
@@ -1264,6 +1341,36 @@ class QuadrantGate(Gate):
                         line_dash=gate_line_dash,
                         row=row, col=col,  # type: ignore
                     )
+
+            x_min, x_max = float(np.min(x_all)), float(np.max(x_all))
+            y_min, y_max = float(np.min(y_all)), float(np.max(y_all))
+            for quad_id, quad_def in self.quadrants.items():
+                x_lower, x_upper = quad_def[x_dim]
+                y_lower, y_upper = quad_def[y_dim]
+
+                # Convert open-ended quadrant bounds into finite plot-space bounds.
+                x_start = x_min if x_lower is None else float(x_lower)
+                x_end = x_max if x_upper is None else float(x_upper)
+                y_start = y_min if y_lower is None else float(y_lower)
+                y_end = y_max if y_upper is None else float(y_upper)
+
+                x_center = (x_start + x_end) / 2.0
+                y_center = (y_start + y_end) / 2.0
+
+                annotation_kwargs: dict[str, Any] = {
+                    "x": x_center,
+                    "y": y_center,
+                    "text": quad_id,
+                    "showarrow": False,
+                    "font": {"size": label_font_size, "color": label_font_color},
+                    "opacity": label_opacity,
+                    "row": row,
+                    "col": col,
+                }
+                if label_bg_color is not None:
+                    annotation_kwargs["bgcolor"] = label_bg_color
+
+                fig.add_annotation(**annotation_kwargs)
 
             fig.update_xaxes(title=x_dim, row=row, col=col)
             fig.update_yaxes(title=y_dim, row=row, col=col)
@@ -1309,6 +1416,7 @@ class BooleanGate(Gate):
         self,
         gate_name: str,
         expression: str,
+        dimensions: list[str] = [],
         use_as_complement: bool = False,
         **kwargs: Any,
     ):
@@ -1322,10 +1430,12 @@ class BooleanGate(Gate):
             Variables are mask names (e.g., 'CD4_gate_pos').
             Operators: & (AND), | (OR), ~ (NOT)
             Example: "(CD4_gate_pos & CD8_gate_pos) | ~CD3_neg"
+        dimensions : list[str]
+            List of dimensions for plotting. Should be the union of dimensions from parent gates used in the expression.
         use_as_complement : bool
             If True, returns complement (negative) of the gate result
         """
-        super().__init__(gate_name, [], {"expression": expression}, use_as_complement)
+        super().__init__(gate_name, dimensions, {"expression": expression}, use_as_complement)
         self._parse_expression()
 
     @staticmethod
@@ -1434,50 +1544,97 @@ class BooleanGate(Gate):
     def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         raise NotImplementedError("BooleanGate uses apply() override instead of _apply_gate")
 
-    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> go.Figure:
+    def plot(self, events: ad.AnnData, mask: dict[str, BooleanArray], dimensions: list[str] | None = None, **kwargs: Any) -> go.Figure:
         """Plot events colored by boolean gate result.
 
-        Since BooleanGate has no geometric boundaries (defined by expression over parent masks),
-        this creates a simple scatter plot of the first two available dimensions,
-        with points colored by whether they pass the gate.
-
-        Parameters
-        ----------
-        events : ad.AnnData
-            Event data (pre-filtered by parent mask)
-        mask : dict[str, BooleanArray]
-            Parent gate masks (used to evaluate the boolean expression)
-
-        Returns
-        -------
-        go.Figure
-            Plotly figure with events colored by gate result
-
-        Examples
-        --------
-        >>> gate = BooleanGate("double_pos", "CD4_pos & CD8_pos")
-        >>> fig = gate.plot(events, {"CD4_pos": cd4_mask, "CD8_pos": cd8_mask})
-        >>> fig.show()
-
-        Notes
-        -----
-        BooleanGate visualization is limited because it has no geometric boundaries.
-        For complete understanding, view the parent gate plots separately.
+        For 1D gates: creates a pass/fail overlaid histogram.
+        For 2D gates: creates a pass/fail scatter plot.
+        For N-D gates: creates pairwise projection grid.
         """
-        # Apply the boolean gate to get result
-        result_mask = self.apply(events, mask)
-        gate_result = result_mask[self.gate_name]
+        plot_dims = list(dimensions) if dimensions is not None else list(self.dimensions)
+        if not plot_dims:
+            if events.n_vars == 0:
+                raise ValueError("BooleanGate plot requires at least one dimension")
+            fallback_dims = [str(events.var_names[0])]
+            if events.n_vars > 1:
+                fallback_dims.append(str(events.var_names[1]))
+            plot_dims = fallback_dims
 
-        # Get first two dimensions from event data for visualization
-        if events.n_vars < 2:
-            raise ValueError(
-                f"BooleanGate plot requires at least 2 dimensions in events, got {events.n_vars}"
-            )
+        gate_result = np.asarray(self.apply(events, mask)[self.gate_name], dtype=bool)
 
-        x_dim = events.var_names[0]
-        y_dim = events.var_names[1]
+        n_dims = len(plot_dims)
+        if n_dims == 1:
+            return self._plot_1D(events, plot_dims, gate_result, **kwargs)
+        if n_dims == 2:
+            return self._plot_2D(events, plot_dims, gate_result, **kwargs)
+        return self._plot_nD(events, plot_dims, gate_result, **kwargs)
+
+    def _plot_1D(
+        self,
+        events: ad.AnnData,
+        dimensions: list[str],
+        gate_result: np.ndarray,
+        **kwargs: Any,
+    ) -> go.Figure:
+        dim = dimensions[0]
+        data = np.asarray(events[:, dim].X).ravel()
+        pass_mask = gate_result.astype(bool)
+        fail_mask = ~pass_mask
+
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        downsample_idx = _downsample_indices(data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            data = data[downsample_idx]
+            pass_mask = pass_mask[downsample_idx]
+            fail_mask = fail_mask[downsample_idx]
+
+        nbins = int(kwargs.get("hist_nbins", 100))
+        histnorm = str(kwargs.get("histnorm", "probability"))
+        fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.35)"))
+        pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.45)"))
+        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression})"))
+        width = int(kwargs.get("width", 800))
+        height = int(kwargs.get("height", 600))
+
+        fig = go.Figure()
+        if fail_mask.any():
+            fig.add_trace(go.Histogram(
+                x=data[fail_mask],
+                nbinsx=nbins,
+                name="Fail",
+                marker=dict(color=fail_color),
+                opacity=0.7,
+                histnorm=histnorm,
+            ))
+        if pass_mask.any():
+            fig.add_trace(go.Histogram(
+                x=data[pass_mask],
+                nbinsx=nbins,
+                name="Pass",
+                marker=dict(color=pass_color),
+                opacity=0.8,
+                histnorm=histnorm,
+            ))
+
+        fig.update_layout(barmode="overlay")
+        fig.update_xaxes(title=dim)
+        fig.update_yaxes(title=histnorm.title() if histnorm else "Count")
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_2D(
+        self,
+        events: ad.AnnData,
+        dimensions: list[str],
+        gate_result: np.ndarray,
+        **kwargs: Any,
+    ) -> go.Figure:
+        x_dim, y_dim = dimensions
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
+        pass_mask = gate_result.astype(bool)
+        fail_mask = ~pass_mask
+
         marker_size = int(kwargs.get("marker_size", 3))
         use_gl = bool(kwargs.get("use_gl", True))
         max_points = int(kwargs.get("max_points", 50000))
@@ -1488,11 +1645,6 @@ class BooleanGate(Gate):
         width = int(kwargs.get("width", 800))
         height = int(kwargs.get("height", 600))
 
-        fig = go.Figure()
-
-        pass_mask = gate_result.astype(bool)
-        fail_mask = ~pass_mask
-
         downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
         if downsample_idx is not None:
             x_data = x_data[downsample_idx]
@@ -1500,9 +1652,10 @@ class BooleanGate(Gate):
             pass_mask = pass_mask[downsample_idx]
             fail_mask = fail_mask[downsample_idx]
 
-        # Add fail events (red)
+        fig = go.Figure()
+        trace_cls = go.Scattergl if use_gl else go.Scatter
+
         if fail_mask.any():
-            trace_cls = go.Scattergl if use_gl else go.Scatter
             fig.add_trace(trace_cls(
                 x=x_data[fail_mask],
                 y=y_data[fail_mask],
@@ -1512,9 +1665,7 @@ class BooleanGate(Gate):
                 hoverinfo="x+y",
             ))
 
-        # Add pass events (green)
         if pass_mask.any():
-            trace_cls = go.Scattergl if use_gl else go.Scatter
             fig.add_trace(trace_cls(
                 x=x_data[pass_mask],
                 y=y_data[pass_mask],
@@ -1526,6 +1677,80 @@ class BooleanGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=title, width=width, height=height)
+
+    def _plot_nD(
+        self,
+        events: ad.AnnData,
+        dimensions: list[str],
+        gate_result: np.ndarray,
+        **kwargs: Any,
+    ) -> go.Figure:
+        fig, pairs = _create_subplot_grid(len(dimensions))
+        n_cols = int(np.ceil(np.sqrt(len(pairs))))
+
+        marker_size = int(kwargs.get("marker_size", 3))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        fail_color = str(kwargs.get("fail_color", "rgba(255, 0, 0, 0.25)"))
+        pass_color = str(kwargs.get("pass_color", "rgba(0, 255, 0, 0.4)"))
+        title = str(kwargs.get("title", f"BooleanGate: {self.gate_name} ({self.expression}) (Pairwise Projections)"))
+
+        pass_mask = gate_result.astype(bool)
+        fail_mask = ~pass_mask
+        downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
+        if downsample_idx is not None:
+            pass_mask = pass_mask[downsample_idx]
+            fail_mask = fail_mask[downsample_idx]
+
+        trace_cls = go.Scattergl if use_gl else go.Scatter
+        for idx, (i, j) in enumerate(pairs):
+            row = idx // n_cols + 1
+            col = idx % n_cols + 1
+
+            x_dim = dimensions[i]
+            y_dim = dimensions[j]
+            x_data = np.asarray(events[:, x_dim].X).ravel()
+            y_data = np.asarray(events[:, y_dim].X).ravel()
+            if downsample_idx is not None:
+                x_data = x_data[downsample_idx]
+                y_data = y_data[downsample_idx]
+
+            if fail_mask.any():
+                fig.add_trace(
+                    trace_cls(
+                        x=x_data[fail_mask],
+                        y=y_data[fail_mask],
+                        mode="markers",
+                        marker=dict(size=marker_size, color=fail_color, line=dict(width=0)),
+                        name="Fail",
+                        hoverinfo="x+y",
+                        showlegend=idx == 0,
+                    ),
+                    row=row, col=col,
+                )
+            if pass_mask.any():
+                fig.add_trace(
+                    trace_cls(
+                        x=x_data[pass_mask],
+                        y=y_data[pass_mask],
+                        mode="markers",
+                        marker=dict(size=marker_size, color=pass_color, line=dict(width=0)),
+                        name="Pass",
+                        hoverinfo="x+y",
+                        showlegend=idx == 0,
+                    ),
+                    row=row, col=col,
+                )
+
+            fig.update_xaxes(title=x_dim, row=row, col=col)
+            fig.update_yaxes(title=y_dim, row=row, col=col)
+
+        n_plots = len(pairs)
+        n_rows = int(np.ceil(n_plots / n_cols))
+        height = int(kwargs.get("height", 400 * n_rows))
+        width = int(kwargs.get("width", 400 * n_cols))
 
         return _format_gate_plot(
             fig,

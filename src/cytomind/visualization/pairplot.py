@@ -82,6 +82,7 @@ def build_pairplot(
             # Diagonal: histograms
             if i == j:
                 channel_data = data_transformed[:, i]
+                histnorm = kwargs.get("histnorm", "probability")
 
                 fig.add_trace(
                     go.Histogram(
@@ -90,15 +91,17 @@ def build_pairplot(
                         name=channel_names[i],
                         marker=dict(color="steelblue", line=dict(color="black", width=0.5)),
                         showlegend=False,
-                        hovertemplate=f"{channel_names[i]}: %{{x:.3g}}<br>Count: %{{y}}<extra></extra>",
+                        histnorm=histnorm,
+                        hovertemplate=f"{channel_names[i]}: %{{x:.3g}}<br>Frequency: %{{y}}<extra></extra>",
                     ),
                     row=row,
                     col=col,
                 )
 
                 # Add axis labels only for diagonal
+                yaxis_title = histnorm.title() if histnorm else "Count"
                 fig.update_xaxes(title_text=channel_names[i], row=row, col=col)
-                fig.update_yaxes(title_text="Count", row=row, col=col)
+                fig.update_yaxes(title_text=yaxis_title, row=row, col=col)
 
             # Lower triangle: scatter plots with density coloring
             elif i > j:
