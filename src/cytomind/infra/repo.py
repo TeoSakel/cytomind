@@ -277,9 +277,9 @@ class ProjectRepository:
             project.samples.pop(sample_id, None)
 
         # Remove samples from batches
-        for batch in project.batches.values():
+        for bid, batch in project.batches.items():
             if set(batch.sample_ids).intersection(sample_ids_set):
-                batch.drop_samples(sample_ids_set)
+                project.batches[bid] = batch.drop_samples(sample_ids_set)
 
         return project
 
