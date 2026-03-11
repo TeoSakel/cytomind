@@ -185,7 +185,12 @@ class GatingStrategyRef:
             Deserialized GatingStrategyRef instance
         """
         graph_data = data.get("graph")
-        graph = json_graph.node_link_graph(graph_data) if graph_data else None
+        if graph_data:
+            # Accept both legacy ("links") and forward-compatible ("edges") payloads.
+            edge_key = "links" if "links" in graph_data else "edges"
+            graph = json_graph.node_link_graph(graph_data, edges=edge_key)
+        else:
+            graph = None
 
         ref = GatingStrategyRef(
             glm_version=data.get("glm_version", GML_VERSION),
@@ -205,7 +210,7 @@ class GatingStrategyRef:
         """
         return {
             "glm_version": self.glm_version,
-            "graph": json_graph.node_link_data(self._graph) if self._graph else None,
+            "graph": json_graph.node_link_data(self._graph, edges="edges") if self._graph else None,
         }
 
     @property

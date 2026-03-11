@@ -676,6 +676,36 @@ class UnifiedDataLoader:
         ad.AnnData
             Loaded AnnData (in-memory or backed)
         """
+        def _is_full_slice(indexer: Any) -> bool:
+            return isinstance(indexer, slice) and indexer.start is None and indexer.stop is None and indexer.step is None
+
+        def _is_fancy_indexer(indexer: Any) -> bool:
+            if _is_full_slice(indexer) or isinstance(indexer, slice):
+                return False
+            return isinstance(indexer, (list, tuple, np.ndarray))
+
+        def _is_dual_fancy_index_error(exc: Exception) -> bool:
+            msg = str(exc)
+            return "Only one indexing vector or array is currently allowed for fancy indexing" in msg
+
+        def _is_repeated_backed_index_error(exc: Exception) -> bool:
+            msg = str(exc)
+            return "cannot index repeatedly into a backed AnnData" in msg
+
+        def _subset_col_first_to_memory(adata_backed: ad.AnnData) -> ad.AnnData:
+            # Column selection is cheap on backed data (few vars); apply it first to narrow
+            # what gets materialised, then apply the expensive row mask in memory.
+            if not _is_full_slice(select):
+                col_subset = adata_backed[:, select].to_memory(copy=True)
+                if not _is_full_slice(mask):
+                    return col_subset[mask, :].copy()
+                return col_subset
+
+            dense = adata_backed.to_memory(copy=True)
+            if _is_full_slice(mask):
+                return dense
+            return dense[mask, :].copy()
+
         # Normalize backed parameter
         if backed is True:
             backed_mode = "r"
@@ -684,29 +714,48 @@ class UnifiedDataLoader:
         else:
             backed_mode = backed
 
-        # If not backed, use existing logic (load with temporary backing, then to memory)
-        if not backed_mode:
-            adata = ad.read_h5ad(path, backed="r")
-            try:
-                result = adata[mask, select].to_memory(copy=True)
-            finally:
-                # Ensure file is always closed, even if to_memory() fails
-                if hasattr(adata, 'file') and adata.file is not None:
+        if backed_mode:
+            adata = ad.read_h5ad(path, backed=backed_mode)
+
+            if not _is_full_slice(mask) or not _is_full_slice(select):
+                warnings.warn(
+                    "Ignoring mask/select for backed AnnData load. Slice the returned backed object explicitly.",
+                    RuntimeWarning,
+                )
+            return adata
+
+        def _close(a: ad.AnnData) -> None:
+            if hasattr(a, "file") and a.file is not None:
+                for _ in range(5):
                     try:
-                        adata.file.close()
-                    except Exception as e:
-                        # Log but don't fail - data was already loaded
-                        warnings.warn(f"Failed to close h5ad file {path}: {e}")
-                del adata
+                        a.file.close()
+                        break
+                    except Exception:
+                        pass
 
-            return result
+        adata = ad.read_h5ad(path, backed="r")
 
-        # If backed, return backed instance (possibly with selection)
-        adata = ad.read_h5ad(path, backed=backed_mode)
-        if mask is not slice(None) or select is not slice(None):
-            adata = adata[mask, select]
+        if not _is_full_slice(mask) and isinstance(mask, (list, tuple, np.ndarray)):
+            mask_array = np.asarray(mask)
+            if mask_array.ndim == 1 and len(mask_array) == adata.n_obs:
+                if np.issubdtype(mask_array.dtype, np.bool_) and mask_array.all():
+                    mask = slice(None)
+                elif np.issubdtype(mask_array.dtype, np.integer) and np.array_equal(mask_array, np.arange(adata.n_obs)):
+                    mask = slice(None)
 
-        return adata
+        if not _is_full_slice(select) and list(select) == list(adata.var_names): # pyright: ignore[reportArgumentType]
+            select = slice(None)
+
+        try:
+            # Prefer single-step slicing while file is backed.
+            return adata[mask, select].to_memory(copy=True)
+        except (TypeError, ValueError) as e:
+            if not _is_dual_fancy_index_error(e) and not _is_repeated_backed_index_error(e):
+                raise
+            return _subset_col_first_to_memory(adata)
+        finally:
+            _close(adata)
+            del adata
 
     @staticmethod
     def _save_h5ad(adata: ad.AnnData, path: PathLike, overwrite: bool = False, **kwargs) -> None:

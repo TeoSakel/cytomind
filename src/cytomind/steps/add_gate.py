@@ -190,13 +190,14 @@ class AddGateStep(BaseStep):
         should_fit = gate_batch.tunable and should_fit
 
         # Load Parent Masks
+        parent_ids = [pid for pid in gate_node.parent_ids if pid != "root"]
         parent_dict, _ = self.run_step(
             qc,
             "LoadParentMasks",
             self.repo.load_gating_masks,
             reason_code_fail="PARENT_MASK_ERROR",
             sample=sample,
-            mask_ids=gate_node.parent_ids
+            mask_ids=parent_ids
         )
         if parent_dict is None:
             return {}, qc
@@ -204,9 +205,9 @@ class AddGateStep(BaseStep):
         if gate_node.gate_type == "Boolean":
             adata = ad.AnnData(np.empty((0, 0), dtype=np.float32))
         else:
-            if not parent_dict:
+            if len(parent_dict) == 0:
                 parent_dict = {"root": np.ones(sample.n_events, dtype=bool)}
-            if len(parent_dict) != 1:
+            elif len(parent_dict) > 1:
                 step = qc.get_step("ValidateParentMasks")
                 step.flag = QCFlag.FAIL
                 step.add_reason(
