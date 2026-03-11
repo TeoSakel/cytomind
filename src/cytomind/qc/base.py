@@ -10,7 +10,6 @@ import math
 import warnings
 
 import pandas as pd
-from anndata import AnnData
 
 from cytomind.domain.qc import EntityQCStatus, QCTestRecord
 from cytomind.utils import now_iso
@@ -439,6 +438,226 @@ class QCTester(ABC):
         cls._validate_thresholds_format(test.thresholds)
 
 
+# ---------------------------------------------------------------------------
+# Generic scalar outlier tester
+# ---------------------------------------------------------------------------
+
+class _ScalarOutlierTester(QCTester):
+    """
+    Concrete QCTester produced by `make_scalar_outlier_tester`.
+
+    Scores per-sample scalar values for outliers using either IQR or Z-score.
+    Keys: (entity_id, metric_type, sample_id, metric_name)
+    Metadata additionally carries `metric_value` (not a key).
+    """
+    # Class attributes overwritten per-instance by make_scalar_outlier_tester.
+    test_type: str = "outlier_scalar"
+    test_name: str = "scalar_outlier"
+    target_keys: tuple = ("entity_id", "metric_type")
+    meta_keys: tuple = ("sample_id", "metric_name")
+    metric_fields = [("outlier_score", "Outlier score (IQR or Z-score)")]
+    meta_fields = [
+        ("metric_name",   "Metric being tested"),
+        ("metric_value",  "Raw metric value for this sample"),
+        ("sample_id",     "Sample ID"),
+        ("outlier_method","Method used (iqr or zscore)"),
+    ]
+    default_config = {
+        "min_samples":    6,
+        "outlier_method": "iqr",
+        "use_mad":        True,
+    }
+    default_thresholds = {
+        "outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)},
+    }
+    plot_type = "box"
+    plot_description = "Box plot of scalar metric outlier scores per sample"
+
+    # Set at factory time
+    _extra_static_meta: dict
+
+    def fit(
+        self,
+        targets: dict,
+        sample_values: dict[str, float],
+        metric_name: str,
+        *,
+        sample_meta: dict[str, dict] | None = None,
+        **kwargs,
+    ) -> Iterable[QCTestRecord]:
+        """
+        Parameters
+        ----------
+        targets       : must contain the target_keys (entity_id, metric_type)
+        sample_values : sample_id → scalar value
+        metric_name   : name of the metric being scored
+        sample_meta   : optional per-sample extra metadata to embed in the record
+        """
+        from cytomind.qc.utils import dict_iqr_score, dict_zscore  # local import avoids circular
+
+        use_mad = bool(self.metadata["use_mad"])
+        method  = str(self.metadata["outlier_method"])
+        min_n   = int(self.metadata["min_samples"])
+        thresholds = {"outlier_score": self.thresholds["outlier_score"]}
+        targets = dict(targets)
+        sample_meta = sample_meta or {}
+
+        base_meta = {**self._extra_static_meta, "metric_name": metric_name}
+
+        if len(sample_values) < min_n:
+            for sid, val in sample_values.items():
+                try:
+                    safe_val = float(val)
+                except (TypeError, ValueError):
+                    safe_val = float("nan")
+                meta = {**base_meta, "sample_id": sid,
+                        "metric_value": safe_val, "outlier_method": method,
+                        **sample_meta.get(sid, {})}
+                yield QCTestRecord(
+                    id=self.make_key(targets, meta),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=meta,
+                    metrics={"outlier_score": float("nan")},
+                    thresholds=thresholds,
+                    status="SKIP",
+                    message="Not enough samples for outlier detection",
+                )
+            return
+
+        score_fn = dict_iqr_score if method == "iqr" else dict_zscore
+        # Filter to only scalar-convertible values (some metric dicts may hold
+        # nested structures like bounding-box dicts that cannot be scored).
+        clean_values: dict[str, float] = {}
+        for k, v in sample_values.items():
+            try:
+                clean_values[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        try:
+            scores, score_stats = score_fn(clean_values, use_mad=use_mad)
+        except ValueError as exc:
+            for sid, val in sample_values.items():
+                try:
+                    mv = float(val)
+                except (TypeError, ValueError):
+                    mv = float("nan")
+                meta = {**base_meta, "sample_id": sid,
+                        "metric_value": mv,
+                        "outlier_method": method,
+                        **sample_meta.get(sid, {})}
+                yield QCTestRecord(
+                    id=self.make_key(targets, meta),
+                    test_type=self.test_type,
+                    test_name=self.test_name,
+                    targets=targets,
+                    metadata=meta,
+                    metrics={"outlier_score": float("nan")},
+                    thresholds=thresholds,
+                    status="SKIP",
+                    message=str(exc),
+                )
+            return
+
+        for sid, score in scores.items():
+            raw_val = sample_values.get(sid)
+            if raw_val is None:
+                metric_value = float("nan")
+            else:
+                try:
+                    metric_value = float(raw_val)
+                except (TypeError, ValueError):
+                    metric_value = float("nan")
+            meta = {
+                **base_meta,
+                "sample_id": sid,
+                "metric_value": metric_value,
+                "outlier_method": method,
+                **score_stats,
+                **sample_meta.get(sid, {}),
+            }
+            yield QCTestRecord(
+                id=self.make_key(targets, meta),
+                test_type=self.test_type,
+                test_name=self.test_name,
+                targets=targets,
+                metadata=meta,
+                metrics={"outlier_score": score},
+                thresholds=thresholds,
+                status="PENDING",
+            )
+
+
+def make_scalar_outlier_tester(
+    entity: Any,
+    *,
+    test_name: str,
+    test_type: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    thresholds: Mapping[str, Any] | None = None,
+    extra_meta_fields: list[tuple[str, str]] | None = None,
+    extra_static_meta: dict[str, Any] | None = None,
+    plot_description: str = "",
+) -> "_ScalarOutlierTester":
+    """
+    Factory that returns a configured `_ScalarOutlierTester`.
+
+    Parameters
+    ----------
+    entity           : domain entity being scored (e.g. GateNode).  Used to
+                       derive `test_type` and `entity_id`.
+    test_name        : short snake_case identifier for this test.
+        test_type        : explicit test_type string; defaults to
+                           ``f"outlier_scalar_{type(entity).__name__}"``.
+    config           : overrides for default_config (min_samples, outlier_method, use_mad).
+    thresholds       : overrides for default_thresholds (outlier_score warn/severe).
+    extra_meta_fields: additional (name, description) metadata field declarations.
+    extra_static_meta: values embedded verbatim into every record's metadata.
+    plot_description : human-readable description for the frontend.
+    """
+    entity_type = type(entity).__name__
+    entity_id   = getattr(entity, "id", str(entity))
+
+    # --- build config -------------------------------------------------
+    base_cfg = dict(_ScalarOutlierTester.default_config)
+    if config:
+        base_cfg.update(config)
+
+    # --- build thresholds ---------------------------------------------
+    method = base_cfg.get("outlier_method", "iqr")
+    if method == "iqr":
+        base_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
+    elif method == "zscore":
+        base_thresholds = {"outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)}}
+    else:
+        raise ValueError(f"outlier_method must be 'iqr' or 'zscore', got '{method}'")
+    if thresholds:
+        for k, v in thresholds.items():
+            existing = base_thresholds.get(k, {})
+            merged = {**existing, **{lv: tv for lv, tv in v.items()}} if isinstance(v, dict) else v
+            base_thresholds[k] = merged
+
+    # --- instantiate --------------------------------------------------
+    # Set instance-level overrides BEFORE __init__ so validation and
+    # self.metadata / self.thresholds are built from the factory-provided values.
+    tester = _ScalarOutlierTester.__new__(_ScalarOutlierTester)
+
+    tester.test_type       = test_type or f"outlier_scalar_{entity_type}"
+    tester.test_name       = test_name
+    tester.default_config     = base_cfg
+    tester.default_thresholds = base_thresholds
+    tester._extra_static_meta = dict(extra_static_meta) if extra_static_meta else {}
+    tester.meta_fields = list(_ScalarOutlierTester.meta_fields) + (extra_meta_fields or [])
+    tester.plot_description = (
+        plot_description or f"Scalar outlier scores for {test_name} on {entity_type}"
+    )
+    # Run through __init__ so _validate_thresholds_format is exercised and
+    # self.metadata / self.thresholds are set via the standard path.
+    _ScalarOutlierTester.__init__(tester)
+    return tester
+
+
 class EntityQCEvaluator(ABC):
     """
     Unified QC evaluation for any entity type (compensation, gating_strategy, step, etc.).
@@ -492,6 +711,67 @@ class EntityQCEvaluator(ABC):
         if config:
             cfg.update(config)
         self.config = cfg
+
+    def prepare_artifacts(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        *,
+        context: dict[str, Any] = {},
+    ) -> None:
+        """Optional hook for artifact invalidation or precomputation before QC updates."""
+        return
+
+    def artifact_root_dir(
+        self,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+    ) -> Path:
+        """Return the artifact root directory for an entity QC status."""
+        pattern = dataloader.path_scheme.get("qc_entity_artifacts_dir", "qc/{entity_type}/{entity_id}/artifacts")
+        return dataloader.root_dir / pattern.format(
+            entity_type=entity_qc.entity_type,
+            entity_id=entity_qc.entity_id,
+        )
+
+    def artifact_dir(
+        self,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        artifact_key: str,
+    ) -> Path:
+        """Return a specific artifact directory for an entity QC status."""
+        return self.artifact_root_dir(entity_qc, dataloader) / Path(artifact_key)
+
+    def get_artifact_metadata(
+        self,
+        entity_qc: EntityQCStatus,
+        artifact_key: str,
+    ) -> dict[str, Any] | None:
+        """Return artifact metadata stored on the QC status, if present."""
+        metadata = entity_qc.artifacts.get(artifact_key)
+        if isinstance(metadata, dict):
+            return metadata
+        return None
+
+    def set_artifact_metadata(
+        self,
+        entity_qc: EntityQCStatus,
+        artifact_key: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Persist lightweight artifact metadata on the QC status."""
+        entity_qc.artifacts[artifact_key] = dict(metadata)
+
+    def invalidate_artifact(
+        self,
+        entity_qc: EntityQCStatus,
+        artifact_key: str,
+    ) -> None:
+        """Remove lightweight artifact metadata from the QC status."""
+        entity_qc.artifacts.pop(artifact_key, None)
 
     @property
     def test_types(self) -> set[str]:
@@ -623,6 +903,7 @@ class EntityQCEvaluator(ABC):
                 entity_type=self.entity_type,
                 generated_at=now_iso()
             )
+        self.prepare_artifacts(entity, entity_qc, dataloader, dataloader_context, context=context)
         self.update_sample_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
         self.update_batch_qc(entity, entity_qc, dataloader, dataloader_context, context=context)
         entity_qc.summary.update(self.basic_summary(entity_qc))

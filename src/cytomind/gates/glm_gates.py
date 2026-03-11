@@ -216,9 +216,14 @@ class RectangleGate(Gate):
                     f"min_val {min_vals[dim]} for dimension '{dim}' exceeds max_val {max_vals[dim]}"
                 )
 
-        # Set params
-        self.params["min_vals"] = min_vals
-        self.params["max_vals"] = max_vals
+        # Store boundaries in the unified params format expected by QC collectors:
+        #   boundaries = [[min_per_dim], [max_per_dim]]
+        # Missing boundaries are represented as None.
+        # NOTE: for testing workflows, we may later replace None with explicit
+        # max/min allowed values to force fully bounded ranges.
+        boundaries_min = [min_vals.get(dim, None) for dim in self.dimensions]
+        boundaries_max = [max_vals.get(dim, None) for dim in self.dimensions]
+        self.params["boundaries"] = [boundaries_min, boundaries_max]
 
     def _check_thresholds(self, thresholds: Mapping[str, float]) -> None:
         """Validate threshold dictionary."""
@@ -229,21 +234,21 @@ class RectangleGate(Gate):
             if not isinstance(val, (int, float)):
                 raise ValueError(f"Threshold value for dimension '{dim}' must be numeric")
 
-    @property
-    def min_vals(self) -> dict[str, float]:
-        """Access min_vals hyperparameter or fitted params."""
+    def _boundaries(self) -> tuple[list[float | None], list[float | None]]:
+        """Return validated [mins, maxs] boundary lists aligned to dimensions."""
         try:
-            return self.params["min_vals"]
+            boundaries = self.params["boundaries"]
         except KeyError:
-            raise ValueError("RectangleGate min_vals have not been set. Please fit the gate first.")
-
-    @property
-    def max_vals(self) -> dict[str, float]:
-        """Access max_vals hyperparameter or fitted params."""
-        try:
-            return self.params["max_vals"]
-        except KeyError:
-            raise ValueError("RectangleGate max_vals have not been set. Please fit the gate first.")
+            raise ValueError("RectangleGate boundaries have not been set. Please fit the gate first.")
+        if not isinstance(boundaries, list) or len(boundaries) != 2:
+            raise ValueError("RectangleGate boundaries must be a [mins, maxs] list")
+        mins = boundaries[0]
+        maxs = boundaries[1]
+        if not isinstance(mins, list) or len(mins) != len(self.dimensions):
+            raise ValueError("RectangleGate boundaries[0] must match gate dimensions")
+        if not isinstance(maxs, list) or len(maxs) != len(self.dimensions):
+            raise ValueError("RectangleGate boundaries[1] must match gate dimensions")
+        return mins, maxs
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For RectangleGate, fit just copies hyperparams to params."""
@@ -252,13 +257,16 @@ class RectangleGate(Gate):
     def _apply_gate(self, events_slice: pd.DataFrame) -> dict[str, BooleanArray]:
         """Apply rectangular bounds to events."""
         mask = np.ones(len(events_slice), dtype=np.bool_)
+        mins, maxs = self._boundaries()
 
-        for dim in self.dimensions:
+        for idx, dim in enumerate(self.dimensions):
             col_vals = np.asarray(events_slice[dim].values)
-            if dim in self.min_vals:
-                mask &= col_vals >= self.min_vals[dim]
-            if dim in self.max_vals:
-                mask &= col_vals < self.max_vals[dim]
+            min_val = mins[idx]
+            max_val = maxs[idx]
+            if min_val is not None:
+                mask &= col_vals >= float(min_val)
+            if max_val is not None:
+                mask &= col_vals < float(max_val)
 
         # Apply complement if requested
         if self.use_as_complement:
@@ -363,17 +371,22 @@ class RectangleGate(Gate):
             histnorm=histnorm,
         ))
 
-        if dim in self.min_vals:
+        mins, maxs = self._boundaries()
+        dim_idx = list(self.dimensions).index(dim)
+        min_val = mins[dim_idx]
+        max_val = maxs[dim_idx]
+
+        if min_val is not None:
             fig.add_vline(
-                x=self.min_vals[dim],
+                x=float(min_val),
                 line_color=gate_line_color,
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
                 annotation_text="min",
             )
-        if dim in self.max_vals:
+        if max_val is not None:
             fig.add_vline(
-                x=self.max_vals[dim],
+                x=float(max_val),
                 line_color=gate_line_color,
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
@@ -422,10 +435,18 @@ class RectangleGate(Gate):
             use_gl=use_gl,
         ))
 
-        x_min = self.min_vals.get(x_dim)
-        x_max = self.max_vals.get(x_dim)
-        y_min = self.min_vals.get(y_dim)
-        y_max = self.max_vals.get(y_dim)
+        dim_to_idx = {dim: idx for idx, dim in enumerate(self.dimensions)}
+        mins, maxs = self._boundaries()
+        x_idx = dim_to_idx[x_dim]
+        y_idx = dim_to_idx[y_dim]
+        x_min_raw = mins[x_idx]
+        x_max_raw = maxs[x_idx]
+        y_min_raw = mins[y_idx]
+        y_max_raw = maxs[y_idx]
+        x_min = float(x_min_raw) if x_min_raw is not None else None
+        x_max = float(x_max_raw) if x_max_raw is not None else None
+        y_min = float(y_min_raw) if y_min_raw is not None else None
+        y_max = float(y_max_raw) if y_max_raw is not None else None
 
         data_x_range = (x_data.min(), x_data.max())
         data_y_range = (y_data.min(), y_data.max())
@@ -458,6 +479,8 @@ class RectangleGate(Gate):
         title = kwargs.get("title")
         plot_title = title if title is not None else f"RectangleGate: {self.gate_name} (Pairwise Projections)"
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
+        dim_to_idx = {dim: idx for idx, dim in enumerate(self.dimensions)}
+        mins, maxs = self._boundaries()
 
         for idx, (i, j) in enumerate(pairs):
             row = idx // n_cols + 1
@@ -485,10 +508,16 @@ class RectangleGate(Gate):
                 row=row, col=col,
             )
 
-            x_min = self.min_vals.get(x_dim)
-            x_max = self.max_vals.get(x_dim)
-            y_min = self.min_vals.get(y_dim)
-            y_max = self.max_vals.get(y_dim)
+            x_idx = dim_to_idx[x_dim]
+            y_idx = dim_to_idx[y_dim]
+            x_min_raw = mins[x_idx]
+            x_max_raw = maxs[x_idx]
+            y_min_raw = mins[y_idx]
+            y_max_raw = maxs[y_idx]
+            x_min = float(x_min_raw) if x_min_raw is not None else None
+            x_max = float(x_max_raw) if x_max_raw is not None else None
+            y_min = float(y_min_raw) if y_min_raw is not None else None
+            y_max = float(y_max_raw) if y_max_raw is not None else None
 
             data_x_range = (x_data.min(), x_data.max())
             data_y_range = (y_data.min(), y_data.max())

@@ -401,6 +401,7 @@ class EntityQCStatus:
             "batch_qc": self.batch_qc.to_dict(),
             "sample_qc": serialized_per_sample,
             "summary": self.summary,
+            "artifacts": self.artifacts,
             "generated_at": self.generated_at,
             "updated_at": self.updated_at,
         }
@@ -426,6 +427,7 @@ class EntityQCStatus:
             entity_id=data["entity_id"],
             context=data.get("context", {}),
             summary=data.get("summary", {}),
+            artifacts=data.get("artifacts", {}),
             batch_qc=batch_qc,
             sample_qc=per_sample_steps,
             generated_at=data.get("generated_at", ""),

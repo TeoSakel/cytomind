@@ -7,16 +7,20 @@ Evaluates event counts, ratios, fitting quality, and outlier detection for a sin
 from __future__ import annotations
 from typing import Any, Hashable, Iterable, Mapping, Sequence, TYPE_CHECKING
 from pathlib import Path
+import hashlib
+import json
 
 import numpy as np
 import anndata as ad
 import plotly.graph_objects as go
 
 from cytomind.domain.qc import EntityQCStatus, QCTestRecord
+from cytomind.domain.pipeline import NumpyEncoder
 from cytomind.gates import GateRegistry
+from cytomind.utils import now_iso
 
 from . import EntityQCEvaluatorRegistry
-from .base import EntityQCEvaluator, QCTester
+from .base import EntityQCEvaluator, QCTester, make_scalar_outlier_tester
 from .utils import (
     validate_percentage_range,
     dict_iqr_score,
@@ -34,6 +38,163 @@ else:
     GateNode = object
     GatingStrategyRef = object
     UnifiedDataLoader = object
+
+
+_GLM_GATE_SPACE_ARTIFACT_VERSION = 1
+
+
+def _compute_gate_space_bounds(
+    *,
+    gates: Mapping[str, Any],
+    dimensions: Sequence[str],
+    glm_type: str | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    dims = len(dimensions)
+    low = np.full(dims, np.inf, dtype=float)
+    high = np.full(dims, -np.inf, dtype=float)
+
+    for gid, gate in gates.items():
+        if list(gate.dimensions) != list(dimensions):
+            raise ValueError(
+                f"Gate {gid} dimensions must match space dimensions: "
+                f"expected {list(dimensions)}, got {list(gate.dimensions)}"
+            )
+    if glm_type == "RectangleGate":
+        for gate in gates.values():
+            mins, maxs = np.asarray(gate.params["boundaries"], dtype=float)
+            low = np.minimum(low, np.where(np.isfinite(mins), mins, np.inf))
+            high = np.maximum(high, np.where(np.isfinite(maxs), maxs, -np.inf))
+    elif glm_type == "PolygonGate":
+        for gate in gates.values():
+            verts = np.asarray(gate.vertices, dtype=float)
+            low = np.minimum(low, np.min(verts, axis=0))
+            high = np.maximum(high, np.max(verts, axis=0))
+    elif glm_type == "EllipsoidGate":
+        for gate in gates.values():
+            center = np.asarray(gate.center, dtype=float)
+            cov = np.asarray(gate.covariance_matrix, dtype=float)
+            radius = np.sqrt(max(float(gate.distance_square), 0.0))
+            extent = np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=np.inf)) * radius
+            low = np.minimum(low, center - extent)
+            high = np.maximum(high, center + extent)
+    else:
+        low = np.full(dims, 0.0, dtype=float)
+        high = np.full(dims, 1.0, dtype=float)
+
+    finite = np.isfinite(low) & np.isfinite(high)
+    if not np.any(finite):
+        return None
+
+    low = np.where(np.isfinite(low), low, 0.0)
+    high = np.where(np.isfinite(high), high, 1.0)
+    span = np.maximum(high - low, 1e-9)
+    return low - 0.05 * span, high + 0.05 * span
+
+
+def _make_gate_space_eval_points(
+    *,
+    dimensions: Sequence[str],
+    low: np.ndarray,
+    high: np.ndarray,
+    n_points: int,
+    seed: int,
+) -> ad.AnnData:
+    dims = len(dimensions)
+    if dims == 1:
+        X = np.linspace(low[0], high[0], max(n_points, 64)).reshape(-1, 1)
+    elif dims == 2:
+        side = int(max(8, np.ceil(np.sqrt(n_points))))
+        x = np.linspace(low[0], high[0], side)
+        y = np.linspace(low[1], high[1], side)
+        gx, gy = np.meshgrid(x, y, indexing="xy")
+        X = np.column_stack((gx.ravel(), gy.ravel()))
+    else:
+        rng = np.random.default_rng(seed)
+        X = rng.uniform(low=low, high=high, size=(n_points, dims))
+
+    adata = ad.AnnData(X=X)
+    adata.var_names = list(dimensions)
+    return adata
+
+
+def _compute_gate_space_masks(
+    *,
+    gates: Mapping[str, Any],
+    eval_points: ad.AnnData,
+    gate_id: str,
+) -> dict[str, np.ndarray]:
+    root_mask = np.ones(eval_points.n_obs, dtype=bool)
+    masks: dict[str, np.ndarray] = {}
+    for sample_id, gate in gates.items():
+        gate_masks = gate.apply(eval_points, {"root": root_mask})
+        if len(gate_masks) > 1:
+            raise ValueError(
+                f"Expected a single mask for gate {gate_id} in sample {sample_id}, "
+                f"but got {len(gate_masks)} masks from apply()"
+            )
+        masks[sample_id] = np.asarray(next(iter(gate_masks.values())), dtype=bool)
+    return masks
+
+
+def _compute_jaccard_distance_matrix(mask_matrix: np.ndarray) -> np.ndarray:
+    if mask_matrix.shape[0] == 0:
+        return np.zeros((0, 0), dtype=float)
+    mask_matrix_u16 = mask_matrix.astype(np.uint16)
+    intersections = mask_matrix_u16 @ mask_matrix_u16.T
+    support = np.sum(mask_matrix, axis=1, dtype=float)
+    unions = support[:, None] + support[None, :] - intersections
+    distance = 1.0 - np.divide(
+        intersections,
+        unions,
+        out=np.ones_like(intersections, dtype=float),
+        where=unions > 0,
+    )
+    np.fill_diagonal(distance, 0.0)
+    return distance
+
+
+def _compute_jaccard_distance_between(mask_matrix_a: np.ndarray, mask_matrix_b: np.ndarray) -> np.ndarray:
+    if mask_matrix_a.shape[0] == 0 or mask_matrix_b.shape[0] == 0:
+        return np.zeros((mask_matrix_a.shape[0], mask_matrix_b.shape[0]), dtype=float)
+    mask_matrix_a_u16 = mask_matrix_a.astype(np.uint16)
+    mask_matrix_b_u16 = mask_matrix_b.astype(np.uint16)
+    intersections = mask_matrix_a_u16 @ mask_matrix_b_u16.T
+    support_a = np.sum(mask_matrix_a, axis=1, dtype=float)
+    support_b = np.sum(mask_matrix_b, axis=1, dtype=float)
+    unions = support_a[:, None] + support_b[None, :] - intersections
+    return 1.0 - np.divide(
+        intersections,
+        unions,
+        out=np.ones_like(intersections, dtype=float),
+        where=unions > 0,
+    )
+
+
+def _compute_gate_space_centrality(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute per-sample centrality as mean deviation from the group.
+
+    Centrality = mean pairwise Jaccard distance to all other samples.
+    - Low centrality (→ 0): Sample has gate coverage similar to the group → typical
+    - High centrality (→ 1): Sample has gate coverage dissimilar from group → outlier
+    """
+    n_samples = distance_matrix.shape[0]
+    if n_samples <= 1:
+        return np.zeros(n_samples, dtype=float)
+    return np.sum(distance_matrix, axis=1) / (n_samples - 1)
+
+
+def _pack_mask_matrix(mask_matrix: np.ndarray) -> np.ndarray:
+    return np.packbits(mask_matrix.astype(np.uint8), axis=1)
+
+
+def _unpack_mask_matrix(packed_masks: np.ndarray, n_eval_points: int) -> np.ndarray:
+    return np.unpackbits(packed_masks, axis=1, count=n_eval_points).astype(bool)
+
+
+def _hash_payload(payload: Any) -> str:
+    serialized = json.dumps(payload, sort_keys=True, cls=NumpyEncoder)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 # ============================================================================
@@ -448,758 +609,48 @@ class GateFitDiagnosticTest(QCTester):
                 status="PENDING",
             )
 
-class MetricOutlierTest(QCTester):
-    """Outlier test for scalar metrics computed per sample.
 
-    This tester is intended for simple scalar metrics, such as masked event
-    ratios from GateMaskRatioTest, scalar diagnostics, or other numeric metrics.
-    """
+# ---------------------------------------------------------------------------
+# Read-only proxy stubs for gate outlier tests (used by generate_table)
+# ---------------------------------------------------------------------------
 
+class _GateMetricOutlierProxy(QCTester):
+    """Table-generation proxy for gate_metric_outlier tests (no fit())."""
     test_type = "gate_batch"
     test_name = "gate_metric_outlier"
-    target_keys = ("strategy_id", "gate_id", "metric_type")
+    target_keys = ("entity_id", "metric_type")
     meta_keys = ("sample_id", "metric_name")
-    default_config = {
-        "min_samples": 6,        # Minimum samples required for outlier detection
-        "outlier_method": "iqr", # "iqr" or "zscore"
-        "use_mad": True,         # Use MAD for robust z-score
-    }
+    metric_fields = [("outlier_score", "Outlier score")]
     meta_fields = [
-           ("metric_name", "Name of the gate metric being tested"),
-           ("sample_id", "Sample ID"),
-           ("outlier_method", "Method used for outlier detection (iqr or zscore)"),
-           ("q1", "First quartile (IQR method only)"),
-           ("q3", "Third quartile (IQR method only)"),
-           ("iqr", "Interquartile range (IQR method only)"),
-           ("center", "Center value: median (MAD) or mean (zscore method only)"),
-           ("scale", "Scale value: MAD or standard deviation (zscore method only)"),
-       ]
-    metric_fields = [("outlier_score", "Outlier score computed by IQR or Z-score method")]
-    default_thresholds = {
-           "outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)},
-       }
-    plot_type = "box"
-    plot_description = "Box plot showing outlier samples for gate event metrics"
+        ("metric_name",    "Name of the metric"),
+        ("metric_value",   "Raw metric value"),
+        ("sample_id",      "Sample ID"),
+        ("outlier_method", "Outlier detection method"),
+    ]
+    default_config = {"min_samples": 6, "outlier_method": "iqr", "use_mad": True}
+    default_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
 
-    def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
-        # Determine the outlier method to set appropriate default thresholds
-        method = config.get("outlier_method", self.default_config["outlier_method"])
 
-        # Set method-specific default thresholds
-        if method == "iqr":
-            # IQR method: 1.5 for warn, 3.0 for severe
-            method_defaults = {
-                "outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)},
-            }
-        elif method == "zscore":
-            # Z-score method: 3 for warn, 5 for severe (more conservative)
-            method_defaults = {
-                "outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)},
-            }
-        else:
-            raise ValueError(f"Invalid outlier method: {method}. Must be 'iqr' or 'zscore'.")
-
-        # Update class-level defaults with method-specific defaults
-        self.default_thresholds = method_defaults
-
-        # Perform smarter merging of thresholds at warn/severe level
-        merged_thresholds = {}
-        for metric_name, metric_defaults in method_defaults.items():
-            if metric_name in thresholds:
-                # Merge warn/severe levels individually
-                merged_thresholds[metric_name] = {}
-                for level in ["warn", "severe"]:
-                    if level in thresholds[metric_name]:
-                        merged_thresholds[metric_name][level] = thresholds[metric_name][level]
-                    elif level in metric_defaults:
-                        merged_thresholds[metric_name][level] = metric_defaults[level]
-            else:
-                merged_thresholds[metric_name] = metric_defaults
-
-        # Add any user-provided metrics not in defaults
-        for metric_name in thresholds:
-            if metric_name not in merged_thresholds:
-                merged_thresholds[metric_name] = thresholds[metric_name]
-
-        # Now validate and initialize with fully merged thresholds
-        super().__init__(config=config, thresholds=merged_thresholds)
-        min_samples = int(self.metadata["min_samples"])
-        if min_samples <= 2:
-            raise ValueError("MetricOutlierTest requires min_samples > 2.")
-
-    def fit(
-        self,
-        targets: dict[str, Any],
-        sample_metrics: dict[str, dict[str, Any]],
-        **kwargs
-    ) -> Iterable[QCTestRecord]:
-        """Compute per-sample outlier scores for gate metrics.
-
-        Parameters
-        ----------
-        targets : dict[str, Any]
-            Base target identifiers (strategy_id, gate_id, parent_id)
-        **kwargs
-            Additional test-specific parameters:
-            - gate_metrics: dict[str, dict[str, float]] - Nested dict: sample_id → {metric_name: value}
-            - metric_names: list[str] | None - List of metric names to test
-            - entity: GatingStrategyRef - The gating strategy entity
-        """
-
-        use_mad = bool(self.metadata["use_mad"])
-        method = self.metadata.get("outlier_method", "iqr")
-        if method not in ("iqr", "zscore"):
-            raise ValueError(
-                f"Invalid outlier method: {method}. Must be 'iqr' or 'zscore'."
-            )
-
-        metric_names = sorted(set().union(*(set(metrics.keys()) for metrics in sample_metrics.values())))
-        thresholds = {"outlier_score": self.thresholds.get("outlier_score", self.default_thresholds["outlier_score"])}
-        score_fn = dict_iqr_score if method == "iqr" else dict_zscore
-
-        if len(sample_metrics) < self.metadata["min_samples"]:
-            for sample_id in sample_metrics.keys():
-                for metric_name in metric_names:
-                    meta = {**self.metadata, "metric_name": metric_name, "sample_id": sample_id}
-                    yield QCTestRecord(
-                        id=self.make_key(targets, meta),
-                        test_type=self.test_type,
-                        test_name=self.test_name,
-                        targets=targets,
-                        metadata=meta,
-                        metrics={"outlier_score": 0.},
-                        thresholds=thresholds,
-                        status="SKIP",
-                        message=f"Not enough samples for outlier detection",
-                    )
-            return
-
-        # Evaluate each metric across all samples in the current batch.
-        for metric_name in metric_names:
-            values_by_sample: dict[str, float] = {}
-            for sample_id, metrics in sample_metrics.items():
-                value = metrics.get(metric_name, np.nan)
-                try:
-                    values_by_sample[sample_id] = float(value)
-                except (TypeError, ValueError):
-                    continue
-
-            try:
-                scores, meta = score_fn(values_by_sample, use_mad=use_mad)
-            except ValueError:
-                # Skip metrics that do not have enough valid values for scoring.
-                continue
-
-            base_metadata = self.metadata.copy()
-            base_metadata["metric_name"] = metric_name
-            base_metadata["outlier_method"] = method
-            base_metadata.update(meta)  # Add scoring metadata (e.g., center, scale for z-score)
-
-            for sample_id, score in scores.items():
-                base_metadata["sample_id"] = sample_id
-                yield QCTestRecord(
-                    id=self.make_key(targets, base_metadata),
-                    test_type=self.test_type,
-                    test_name=self.test_name,
-                    targets=targets,
-                    metadata=base_metadata.copy(),
-                    metrics={"outlier_score": score},
-                    thresholds=thresholds.copy(),
-                    status="PENDING",
-                )
-
-    def plot(
-        self,
-        test: QCTestRecord,
-        **kwargs
-    ) -> go.Figure:
-        """Generate diagnostic plot for metric outlier test.
-
-        Creates a combined histogram and marginal boxplot showing the distribution
-        of metric values across samples with threshold lines for warn/severe levels.
-
-        Parameters
-        ----------
-        test : QCTestRecord
-            A test record to extract metadata (metric_name, thresholds)
-        **kwargs
-            Must include 'sample_metrics': dict[str, dict[str, Any]]
-                Nested dict: sample_id → {metric_name: value}
-            Optional 'output_path': PathLike | None
-                Path to save the figure as HTML
-
-        Returns
-        -------
-        go.Figure
-            Plotly figure with histogram and marginal boxplot
-        """
-        sample_metrics = kwargs.get("sample_metrics", {})
-        output_path = kwargs.get("output_path")
-
-        metric_name = test.metadata.get("metric_name", "Unknown")
-        gate_id = test.targets.get("gate_id", "Unknown")
-        strategy_id = test.targets.get("strategy_id", "Unknown")
-
-        # Extract metric values from sample_metrics
-        sample_ids = []
-        values = []
-        for sample_id, metrics in sample_metrics.items():
-            if metric_name in metrics:
-                value = metrics[metric_name]
-                try:
-                    values.append(float(value))
-                    sample_ids.append(sample_id)
-                except (TypeError, ValueError):
-                    continue
-
-        if not values:
-            # Create empty figure with message
-            fig = go.Figure()
-            fig.add_annotation(
-                text=f"No valid values for metric: {metric_name}",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5,
-                showarrow=False,
-                font=dict(size=16),
-            )
-            return fig
-
-        values_array = np.array(values)
-
-        # Create figure with secondary y-axis for boxplot
-        from plotly.subplots import make_subplots
-
-        fig = make_subplots(
-            rows=2, cols=1,
-            row_heights=[0.15, 0.85],
-            vertical_spacing=0.05,
-            shared_xaxes=True,
-            subplot_titles=("", f"Distribution of {metric_name}")
-        )
-
-        # Add boxplot on top
-        fig.add_trace(
-            go.Box(
-                x=values_array,
-                name="",
-                orientation='h',
-                marker=dict(color='rgba(100, 149, 237, 0.6)'),
-                boxmean='sd',
-                showlegend=False,
-                hovertemplate="<b>Boxplot</b><br>Value: %{x:.4f}<extra></extra>",
-            ),
-            row=1, col=1
-        )
-
-        # Add histogram on bottom
-        fig.add_trace(
-            go.Histogram(
-                x=values_array,
-                name=metric_name,
-                marker=dict(
-                    color='rgba(100, 149, 237, 0.7)',
-                    line=dict(color='rgba(100, 149, 237, 1)', width=1)
-                ),
-                showlegend=False,
-                hovertemplate="<b>Bin</b><br>Range: %{x}<br>Count: %{y}<extra></extra>",
-            ),
-            row=2, col=1
-        )
-
-        # Extract thresholds
-        thresholds = test.thresholds or {}
-        outlier_thresholds = thresholds.get("outlier_score", {})
-
-        # Get the method to understand if we're looking at scores or raw values
-        method = test.metadata.get("outlier_method", "iqr")
-
-        # Calculate statistics for reference
-        q1 = np.percentile(values_array, 25)
-        q3 = np.percentile(values_array, 75)
-        iqr = q3 - q1
-        median = np.median(values_array)
-        mean = np.mean(values_array)
-        std = np.std(values_array)
-
-        # Calculate MAD if using robust z-score
-        use_mad = test.metadata.get("use_mad", True)
-        if use_mad:
-            mad = np.median(np.abs(values_array - median))
-            scale = mad if mad > 0 else std
-        else:
-            scale = std
-
-        # Convert outlier score thresholds to raw metric values
-        warn_range = outlier_thresholds.get("warn", (None, None))
-        severe_range = outlier_thresholds.get("severe", (None, None))
-
-        # Compute threshold boundaries in raw metric space
-        threshold_lines = []
-        if method == "iqr":
-            # IQR method: score = (value - Q2) / IQR
-            # So: value = Q2 + score * IQR
-            if warn_range[0] is not None and iqr > 0:
-                warn_lower = median + warn_range[0] * iqr
-                threshold_lines.append(("warn_lower", warn_lower, "orange", "dash"))
-            if warn_range[1] is not None and iqr > 0:
-                warn_upper = median + warn_range[1] * iqr
-                threshold_lines.append(("warn_upper", warn_upper, "orange", "dash"))
-            if severe_range[0] is not None and iqr > 0:
-                severe_lower = median + severe_range[0] * iqr
-                threshold_lines.append(("severe_lower", severe_lower, "red", "dashdot"))
-            if severe_range[1] is not None and iqr > 0:
-                severe_upper = median + severe_range[1] * iqr
-                threshold_lines.append(("severe_upper", severe_upper, "red", "dashdot"))
-
-        elif method == "zscore":
-            # Z-score method: score = (value - center) / scale
-            # So: value = center + score * scale
-            center = median if use_mad else mean
-            if warn_range[0] is not None and scale > 0:
-                warn_lower = center + warn_range[0] * scale
-                threshold_lines.append(("warn_lower", warn_lower, "orange", "dash"))
-            if warn_range[1] is not None and scale > 0:
-                warn_upper = center + warn_range[1] * scale
-                threshold_lines.append(("warn_upper", warn_upper, "orange", "dash"))
-            if severe_range[0] is not None and scale > 0:
-                severe_lower = center + severe_range[0] * scale
-                threshold_lines.append(("severe_lower", severe_lower, "red", "dashdot"))
-            if severe_range[1] is not None and scale > 0:
-                severe_upper = center + severe_range[1] * scale
-                threshold_lines.append(("severe_upper", severe_upper, "red", "dashdot"))
-
-        # Add statistical reference lines
-        colors = {
-            'median': 'green',
-            'mean': 'blue',
-            'q1': 'orange',
-            'q3': 'orange',
-        }
-
-        # Add vertical lines using shapes for subplot compatibility
-        # Boxplot (row 1)
-        fig.add_shape(
-            type="line",
-            x0=median, x1=median,
-            y0=0, y1=1,
-            line=dict(color=colors['median'], width=2, dash='dash'),
-            xref="x", yref="y domain",
-            row=1, col=1
-        )
-
-        fig.add_shape(
-            type="line",
-            x0=mean, x1=mean,
-            y0=0, y1=1,
-            line=dict(color=colors['mean'], width=2, dash='dot'),
-            xref="x", yref="y domain",
-            row=1, col=1
-        )
-
-        # Add threshold lines to boxplot
-        for label, value, color, dash in threshold_lines:
-            fig.add_shape(
-                type="line",
-                x0=value, x1=value,
-                y0=0, y1=1,
-                line=dict(color=color, width=2, dash=dash),
-                xref="x", yref="y domain",
-                row=1, col=1
-            )
-
-        # Histogram (row 2) - with annotations
-        fig.add_shape(
-            type="line",
-            x0=median, x1=median,
-            y0=0, y1=1,
-            line=dict(color=colors['median'], width=2, dash='dash'),
-            xref="x2", yref="y2 domain",
-            row=2, col=1
-        )
-
-        fig.add_annotation(
-            x=median, y=1.05,
-            text=f"Median: {median:.4f}",
-            showarrow=False,
-            xref="x2", yref="y2 domain",
-            font=dict(size=10, color=colors['median']),
-            row=2, col=1
-        )
-
-        fig.add_shape(
-            type="line",
-            x0=mean, x1=mean,
-            y0=0, y1=1,
-            line=dict(color=colors['mean'], width=2, dash='dot'),
-            xref="x2", yref="y2 domain",
-            row=2, col=1
-        )
-
-        fig.add_annotation(
-            x=mean, y=0.95,
-            text=f"Mean: {mean:.4f}",
-            showarrow=False,
-            xref="x2", yref="y2 domain",
-            font=dict(size=10, color=colors['mean']),
-            row=2, col=1
-        )
-
-        # Add threshold lines to histogram
-        for label, value, color, dash in threshold_lines:
-            fig.add_shape(
-                type="line",
-                x0=value, x1=value,
-                y0=0, y1=1,
-                line=dict(color=color, width=2, dash=dash),
-                xref="x2", yref="y2 domain",
-                row=2, col=1
-            )
-            # Add annotation for threshold
-            if "lower" in label:
-                y_pos = 0.85 if "severe" in label else 0.75
-            else:
-                y_pos = 0.65 if "severe" in label else 0.55
-
-            fig.add_annotation(
-                x=value, y=y_pos,
-                text=f"{label.replace('_', ' ').title()}: {value:.4f}",
-                showarrow=False,
-                xref="x2", yref="y2 domain",
-                font=dict(size=9, color=color),
-                textangle=-90,
-                row=2, col=1
-            )
-
-        # Update layout
-        title = (
-            f"<b>Gate: {gate_id}</b> | Metric: {metric_name}<br>"
-            f"<sub>Strategy: {strategy_id} | Samples: {len(values)} | "
-            f"Method: {method.upper()} | "
-            f"μ={mean:.4f}, σ={std:.4f}, Q1={q1:.4f}, Q3={q3:.4f}</sub>"
-        )
-
-        fig.update_layout(
-            title=title,
-            height=600,
-            hovermode="closest",
-            showlegend=False,
-        )
-
-        # Update axes
-        fig.update_xaxes(title_text=metric_name, row=2, col=1)
-        fig.update_xaxes(showticklabels=False, row=1, col=1)
-        fig.update_yaxes(title_text="", showticklabels=False, row=1, col=1)
-        fig.update_yaxes(title_text="Count", row=2, col=1)
-
-        # Add threshold information as annotation
-        warn_range = outlier_thresholds.get("warn", (None, None))
-        severe_range = outlier_thresholds.get("severe", (None, None))
-        threshold_text = (
-            f"<b>Outlier Thresholds ({method.upper()})</b><br>"
-            f"Warn score: [{warn_range[0]}, {warn_range[1]}]<br>"
-            f"Severe score: [{severe_range[0]}, {severe_range[1]}]<br>"
-        )
-
-        # Add converted thresholds if applicable
-        if threshold_lines:
-            threshold_text += "<br><b>In metric space:</b><br>"
-            for label, value, color, dash in threshold_lines:
-                threshold_text += f"{label.replace('_', ' ').title()}: {value:.4f}<br>"
-
-        fig.add_annotation(
-            text=threshold_text,
-            xref="paper", yref="paper",
-            x=1.02, y=0.5,
-            xanchor="left", yanchor="middle",
-            showarrow=False,
-            font=dict(size=9),
-            bgcolor="rgba(255, 255, 255, 0.9)",
-            bordercolor="black",
-            borderwidth=1,
-            align="left",
-        )
-
-        if output_path:
-            output_path = Path(output_path)
-            if output_path.suffix != ".html":
-                raise ValueError("Output path must have .html extension for Plotly figure.")
-            fig.write_html(output_path)
-
-        return fig
-
-class GLMGateOutlierTest(QCTester):
-    """Outlier test for full gate geometry grouped by `glm_type`.
-
-    Computes pairwise Jaccard distance between sample gate masks, derives a
-    per-sample centrality score from mean pairwise similarity, and then computes
-    an outlier z-score over centrality values.
-    """
-
+class _GateCoverageOutlierProxy(QCTester):
+    """Table-generation proxy for gate_coverage_outlier tests (no fit())."""
     test_type = "gate_batch"
     test_name = "gate_coverage_outlier"
-    target_keys = ("strategy_id", "gate_id", "metric_type")
+    target_keys = ("entity_id", "metric_type")
     meta_keys = ("sample_id", "metric_name")
-    default_config = {
-        "min_samples": 6,
-        "outlier_method": "zscore",
-        "use_mad": True,
-        "n_points": 2048,
-        "seed": 42,
-    }
+    metric_fields = [("outlier_score", "Outlier score")]
     meta_fields = [
-        ("glm_type", "Type of GLM gate"),
-        ("metric_name", "Name of centrality metric"),
-        ("sample_id", "Sample ID"),
-        ("centrality_score", "Computed centrality score"),
-        ("n_eval_points", "Number of evaluation points"),
+        ("metric_name",    "Name of the metric"),
+        ("metric_value",   "Raw centrality value"),
+        ("sample_id",      "Sample ID"),
+        ("glm_type",       "GLM gate type"),
+        ("n_eval_points",  "Evaluation points used"),
     ]
-    metric_fields = [("outlier_score", "Outlier score computed by IQR or Z-score method")]
-    default_thresholds = {
-        "outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)},
-    }
-    plot_type = "scatter"
-    plot_description = "Sample gate-space centrality outlier score"
-
-    def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
-        method = config.get("outlier_method", self.default_config["outlier_method"])
-
-        if method == "iqr":
-            method_defaults = {
-                "outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)},
-            }
-        elif method == "zscore":
-            method_defaults = {
-                "outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)},
-            }
-        else:
-            raise ValueError(
-                f"Invalid outlier method: {method}. Must be 'iqr' or 'zscore'."
-            )
-
-        self.default_thresholds = method_defaults
-
-        # Merge user thresholds at warn/severe level so partial overrides are valid.
-        merged_thresholds: dict[str, Any] = {}
-        for metric_name, metric_defaults in method_defaults.items():
-            if metric_name in thresholds:
-                merged_thresholds[metric_name] = {}
-                user_spec = thresholds[metric_name]
-                for level in ("warn", "severe"):
-                    if isinstance(user_spec, Mapping) and level in user_spec:
-                        merged_thresholds[metric_name][level] = user_spec[level]
-                    else:
-                        merged_thresholds[metric_name][level] = metric_defaults[level]
-            else:
-                merged_thresholds[metric_name] = metric_defaults
-
-        for metric_name, user_spec in thresholds.items():
-            if metric_name not in merged_thresholds:
-                merged_thresholds[metric_name] = user_spec
-
-        super().__init__(config=config, thresholds=merged_thresholds)
-        min_samples = int(self.metadata["min_samples"])
-        if min_samples <= 2:
-            raise ValueError("GLMGateOutlierTest requires min_samples > 2.")
-
-    def fit(
-        self,
-        targets: dict[str, Any],
-        entity: GateNode,
-        sample_ids: Iterable[str],
-        **kwargs,
-    ) -> Iterable[QCTestRecord]:
-        sample_ids = list(sample_ids)
-
-        metadata = self.metadata.copy()
-        metadata["glm_type"] = entity.glm_type
-        metadata["metric_name"] = "centrality_score"
-        method = self.metadata["outlier_method"]
-        thresholds = {"outlier_score": self.thresholds.get("outlier_score", self.default_thresholds["outlier_score"])}
-
-        # Check if enough samples are available.
-        min_samples = int(self.metadata["min_samples"])
-        targets = targets.copy()
-        if entity.gate_type in {"Boolean", "Quadrant"} or len(sample_ids) < min_samples:
-            if entity.gate_type in {"Boolean", "Quadrant"}:
-                msg = f"GLM gate outlier test is not applicable for gate_type '{entity.gate_type}'"
-            else:
-                msg = "GLM gate outlier test is not applicable due to insufficient samples"
-            for sample_id in sample_ids:
-                meta = {**metadata, "sample_id": sample_id}
-                yield QCTestRecord(
-                    id=self.make_key(targets, meta),
-                    test_type=self.test_type,
-                    test_name=self.test_name,
-                    targets=targets,
-                    metadata=meta,
-                    metrics={"outlier_score": float('nan')},
-                    thresholds=thresholds.copy(),
-                    status="SKIP",
-                    message=msg,
-                )
-            return
-
-        masks = self._compute_gate_coverage(entity=entity, sample_ids=sample_ids, metadata=metadata)
-        if not masks:
-            msg = "No evaluation points could be generated for GLM gate outlier test, cannot compute gate-space similarity."
-            for sample_id in sample_ids:
-                meta = {
-                    **metadata,
-                    "sample_id": sample_id,
-                    metadata["metric_name"]: float('nan')
-                }
-                yield QCTestRecord(
-                    id=self.make_key(targets, meta),
-                    test_type=self.test_type,
-                    test_name=self.test_name,
-                    targets=targets,
-                    metadata=meta,
-                    metrics={"outlier_score": float('nan')},
-                    thresholds=thresholds.copy(),
-                    status="SKIP",
-                    message=msg,
-                )
-            return
-
-        centrality = self._compute_gate_centralities(masks)
-
-        use_mad = bool(self.metadata["use_mad"])
-        if method == "iqr":
-            scores, score_meta = dict_iqr_score(centrality, use_mad=use_mad)
-        else:
-            scores, score_meta = dict_zscore(centrality, use_mad=use_mad)
-        metadata.update(score_meta)
-
-        for sample_id, z_score in scores.items():
-            meta = {
-                **metadata,
-                "sample_id": sample_id,
-                "centrality_score": centrality[sample_id],
-            }
-            yield QCTestRecord(
-                id=self.make_key(targets, meta),
-                test_type=self.test_type,
-                test_name=self.test_name,
-                targets=targets,
-                metadata=meta,
-                metrics={"outlier_score": z_score},
-                thresholds=thresholds.copy(),
-                status="PENDING",
-            )
-
-    def _make_eval_points(
-        self,
-        *,
-        gates: Mapping[str, Any],
-        dimensions: Sequence[str],
-        glm_type: str | None,
-    ) -> ad.AnnData:
-        dims = len(dimensions)
-        n_points = int(self.metadata.get("n_points", 2048))
-        seed = int(self.metadata.get("seed", 0))
-
-        low = np.full(dims, np.inf, dtype=float)
-        high = np.full(dims, -np.inf, dtype=float)
-
-        if glm_type == "RectangleGate":
-            for gate in gates.values():
-                mins = np.array([float(gate.min_vals.get(d, -np.inf)) for d in dimensions], dtype=float)
-                maxs = np.array([float(gate.max_vals.get(d, np.inf)) for d in dimensions], dtype=float)
-                low = np.minimum(low, np.where(np.isfinite(mins), mins, np.inf))
-                high = np.maximum(high, np.where(np.isfinite(maxs), maxs, -np.inf))
-        elif glm_type == "PolygonGate":
-            for gate in gates.values():
-                verts = np.asarray(gate.vertices, dtype=float)
-                low = np.minimum(low, np.min(verts, axis=0))
-                high = np.maximum(high, np.max(verts, axis=0))
-        elif glm_type == "EllipsoidGate":
-            for gate in gates.values():
-                center = np.asarray(gate.center, dtype=float)
-                cov = np.asarray(gate.covariance_matrix, dtype=float)
-                radius = np.sqrt(max(float(gate.distance_square), 0.0))
-                extent = np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=np.inf)) * radius
-                low = np.minimum(low, center - extent)
-                high = np.maximum(high, center + extent)
-        else:
-            # For other gate types, use a stable reference domain.
-            low = np.full(dims, 0., dtype=float)
-            high = np.full(dims, 1.0, dtype=float)
-
-        finite = np.isfinite(low) & np.isfinite(high)
-        if not np.any(finite):
-            return ad.AnnData()  # No valid bounds to sample from
-
-        low: FloatArray = np.where(np.isfinite(low), low, 0.0)
-        high: FloatArray = np.where(np.isfinite(high), high, 1.0)
-        span: FloatArray = np.maximum(high - low, 1e-9)
-        low = low - 0.05 * span
-        high = high + 0.05 * span
-
-        if dims == 1:
-            X = np.linspace(low[0], high[0], max(n_points, 64)).reshape(-1, 1)
-        elif dims == 2:
-            side = int(max(8, np.ceil(np.sqrt(n_points))))
-            x = np.linspace(low[0], high[0], side)
-            y = np.linspace(low[1], high[1], side)
-            gx, gy = np.meshgrid(x, y, indexing="xy")
-            X = np.column_stack((gx.ravel(), gy.ravel()))
-        else:
-            rng = np.random.default_rng(seed)
-            X = rng.uniform(low=low, high=high, size=(n_points, dims))
-
-        adata = ad.AnnData(X=X)
-        adata.var_names = dimensions
-        return adata
-
-    def _compute_gate_coverage(
-        self,
-        entity: GateNode,
-        sample_ids: Iterable[str],
-        metadata: dict[str, Any]
-    ) -> dict[str, BooleanArray]:
-
-        gate_cls = GateRegistry.get(entity.gate_type)
-        gates = {sample_id: gate_cls.from_node(entity, sample_id=sample_id) for sample_id in sample_ids}
-        adata = self._make_eval_points(gates=gates, dimensions=entity.dimensions, glm_type=entity.glm_type)
-        metadata["n_eval_points"] = adata.n_obs
-        if adata.X is None or adata.n_obs == 0:
-            return {}
-
-        # Compute space-coverage for each sample
-        root_mask = np.ones(adata.n_obs, dtype=bool)
-        masks: dict[str, BooleanArray] = {}
-        for sample_id, gate in gates.items():
-            gate_masks = gate.apply(adata, {"root": root_mask})
-            if len(gate_masks) > 1:
-                raise ValueError(
-                    f"Expected a single mask for gate {entity.id} in sample {sample_id}, "
-                    f"but got {len(gate_masks)} masks from apply()"
-                )
-            masks[sample_id] = next(iter(gate_masks.values()))
-        return masks
-
-    def _compute_gate_centralities(self, masks: dict[str, BooleanArray]) -> dict[str, float]:
-        n_samples = len(masks)
-        mask_matrix = np.vstack(list(masks.values()))
-        mask_matrix_u16 = mask_matrix.astype(np.uint16)
-
-        # Pairwise Jaccard distance matrix using mask vectors over evaluation points.
-        intersections = mask_matrix_u16 @ mask_matrix_u16.T
-        support = np.sum(mask_matrix, axis=1, dtype=float)
-        unions = support[:, None] + support[None, :] - intersections
-        jaccard_distance = 1. - np.divide(
-            intersections,
-            unions,
-            out=np.ones_like(intersections, dtype=float),
-            where=unions > 0,
-        )
-        np.fill_diagonal(jaccard_distance, 0.0)
-
-        centrality: FloatArray = 1.0 - np.sum(jaccard_distance, axis=1) / (n_samples - 1)
-        return dict(zip(masks.keys(), centrality.tolist()))
+    default_config = {"min_samples": 6, "outlier_method": "zscore", "use_mad": True}
+    default_thresholds = {"outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)}}
 
 
 @EntityQCEvaluatorRegistry.register("gate_node")
+
 class GateNodeQCEvaluator(EntityQCEvaluator):
     """QC evaluator for individual gate nodes within a gating strategy.
 
@@ -1223,6 +674,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         },
     }
     _supported_figures = {}  # Test plots are auto-discovered from registered tests
+    _glm_gate_space_artifact_name = "glm_gate_space"
 
     default_config = {
         "ratio_total_min": 0.0,
@@ -1249,6 +701,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             "severe": (-5.0, 5.0),
         },
         "gate_space_seed": 0,
+        "gate_space_update_policy": "incremental",
     }
 
     @staticmethod
@@ -1295,8 +748,8 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         qc_testers: list[type[QCTester]] = [
             GateMaskRatioTest,
             GateFitDiagnosticTest,
-            MetricOutlierTest,
-            GLMGateOutlierTest,
+            _GateMetricOutlierProxy,
+            _GateCoverageOutlierProxy,
         ]
         return {tester.test_name: tester for tester in qc_testers}
 
@@ -1425,125 +878,632 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
 
         # Get batch QC step
         batch_step = entity_qc.batch_qc.get_step("GATE_NODE_BATCH_QC")
-        sample_metrics = self._collect_sample_params(entity_qc, gate_node=entity)
-        sample_metrics["mask"] = self._collect_sample_metrics(entity_qc, gate_id=entity.id)
+        param_metrics = self._collect_sample_params(entity_qc, gate_node=entity)
+        sample_ids = param_metrics["sample_ids"]
+
+        has_custom_gates = bool(entity.custom_gates)
+        # Without per-sample custom gates, params and gate-space centrality are
+        # deterministic across samples and not informative for outlier detection.
+        skip_param_and_centrality = not has_custom_gates
+
+        mask_metrics = self._collect_sample_metrics(
+            entity_qc,
+            gate_id=entity.id,
+            sample_ids=sample_ids,
+        )
+
+        sample_metrics: dict[str, dict[str, list[float]]] = {
+            "diagnostics": param_metrics["diagnostics"],
+            "mask": mask_metrics,
+        }
+        if not skip_param_and_centrality:
+            sample_metrics["params"] = param_metrics["params"]
 
         # Run outlier detection for this gate
         method = config["outlier_method"]
         outlier_thresholds = self._normalize_outlier_thresholds(
             config.get("outlier_thresholds", config.get("thresholds"))
         )
-        outlier_tester = MetricOutlierTest(
-            config={
-                "min_samples": config["min_samples"],
-                "outlier_method": method,
-                "use_mad": config["use_mad"],
-            },
-            thresholds=outlier_thresholds,
-        )
-        for metric_type, metrics in sample_metrics.items():
+        outlier_config = {
+            "min_samples": config["min_samples"],
+            "outlier_method": method,
+            "use_mad": config["use_mad"],
+        }
+        for metric_type, metrics_by_name in sample_metrics.items():
             outlier_targets = {
-                "strategy_id": strategy_id,
-                "gate_id": entity.id,
+                "entity_id": entity.id,
                 "metric_type": metric_type,
             }
-
-            # Run outlier detection (tests ratio_total and ratio_parent)
-            for classified_test in outlier_tester.fit_classify(
-                targets=outlier_targets,
-                sample_metrics=metrics,
-            ):
-                # Add to batch step
-                if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
-                    batch_step.add_reason(
-                        code=f"GATE_OUTLIER_{classified_test.status}",
-                        message=classified_test.message,
-                        tests=[classified_test],
-                    )
-                else:
-                    batch_step.add_test(classified_test)
+            for metric_name, metric_series in metrics_by_name.items():
+                outlier_tester = make_scalar_outlier_tester(
+                    entity,
+                    test_name="gate_metric_outlier",
+                    test_type="gate_batch",
+                    config=outlier_config,
+                    thresholds=outlier_thresholds,
+                )
+                sample_values = {sid: metric_series[idx] for idx, sid in enumerate(sample_ids)}
+                # Run outlier detection per metric
+                for classified_test in outlier_tester.fit_classify(
+                    targets=outlier_targets,
+                    sample_values=sample_values,
+                    metric_name=metric_name,
+                ):
+                    # Add to batch step
+                    if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
+                        batch_step.add_reason(
+                            code=f"GATE_OUTLIER_{classified_test.status}",
+                            message=classified_test.message,
+                            tests=[classified_test],
+                        )
+                    else:
+                        batch_step.add_test(classified_test)
 
         # Compare full gate spaces across samples using glm_type-specific geometry.
-        gate_space_sample_ids = sorted(entity_qc.sample_qc.keys())
-        gate_space_thresholds = self._normalize_outlier_thresholds(
-            config.get("gate_space_thresholds", config.get("outlier_thresholds", config.get("thresholds")))
+        # Skip this when gate parameters are deterministic across samples.
+        if not skip_param_and_centrality:
+            gate_space_sample_ids = list(entity_qc.sample_qc.keys())
+            gate_space_thresholds = self._normalize_outlier_thresholds(
+                config.get("gate_space_thresholds", config.get("outlier_thresholds", config.get("thresholds")))
+            )
+            gate_space_state = None
+            if dataloader is not None:
+                gate_space_state = self._get_or_build_glm_gate_space_state(
+                    entity=entity,
+                    entity_qc=entity_qc,
+                    dataloader=dataloader,
+                    strategy_id=strategy_id,
+                    sample_ids=gate_space_sample_ids,
+                    config=config,
+                )
+
+            gate_space_targets = {"entity_id": entity.id, "metric_type": "params"}
+            gate_space_min_samples = int(config["gate_space_min_samples"])
+            gate_space_config = {
+                "min_samples": gate_space_min_samples,
+                "outlier_method": "zscore",
+                "use_mad": config["use_mad"],
+            }
+
+            # Determine if scoring is possible before building the tester.
+            skip_msg: str | None = None
+            if entity.gate_type in {"Boolean", "Quadrant"}:
+                skip_msg = f"GLM gate outlier test is not applicable for gate_type '{entity.gate_type}'"
+            elif len(gate_space_sample_ids) < gate_space_min_samples:
+                skip_msg = "GLM gate outlier test is not applicable due to insufficient samples"
+            elif gate_space_state is None:
+                skip_msg = (
+                    "gate_space_state must be provided by GateNodeQCEvaluator"
+                    " via _get_or_build_glm_gate_space_state()"
+                )
+
+            n_eval_points = 0
+            centrality: dict[str, float] = {}
+            if skip_msg is None:
+                assert gate_space_state is not None
+                n_eval_points = int(gate_space_state.get("n_eval_points", 0))
+                centrality = {
+                    sid: float(gate_space_state.get("centrality", {}).get(sid, float("nan")))
+                    for sid in gate_space_sample_ids
+                }
+                if not n_eval_points or not any(np.isfinite(v) for v in centrality.values()):
+                    skip_msg = (
+                        "No evaluation points could be generated for GLM gate outlier test,"
+                        " cannot compute gate-space similarity."
+                    )
+
+            space_tester = make_scalar_outlier_tester(
+                entity,
+                test_name="gate_coverage_outlier",
+                test_type="gate_batch",
+                config=gate_space_config,
+                thresholds=gate_space_thresholds,
+                extra_meta_fields=[
+                    ("glm_type",      "Type of GLM gate"),
+                    ("n_eval_points", "Number of evaluation points used"),
+                ],
+                extra_static_meta={
+                    "glm_type":      entity.glm_type or "",
+                    "n_eval_points": n_eval_points,
+                },
+                plot_description="Gate-space centrality outlier score per sample",
+            )
+
+            if skip_msg is not None:
+                thresholds_rec = {"outlier_score": space_tester.thresholds["outlier_score"]}
+                for sid in gate_space_sample_ids:
+                    meta = {
+                        "metric_name":  "centrality_score",
+                        "metric_value": float("nan"),
+                        "sample_id":    sid,
+                        "glm_type":     entity.glm_type or "",
+                        "n_eval_points": n_eval_points,
+                    }
+                    classified_test = QCTestRecord(
+                        id=space_tester.make_key(gate_space_targets, meta),
+                        test_type=space_tester.test_type,
+                        test_name=space_tester.test_name,
+                        targets=gate_space_targets,
+                        metadata=meta,
+                        metrics={"outlier_score": float("nan")},
+                        thresholds=thresholds_rec,
+                        status="SKIP",
+                        message=skip_msg,
+                    )
+                    batch_step.add_test(classified_test)
+            else:
+                for classified_test in space_tester.fit_classify(
+                    targets=gate_space_targets,
+                    sample_values=centrality,
+                    metric_name="centrality_score",
+                ):
+                    if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
+                        batch_step.add_reason(
+                            code=f"GATE_GLM_SPACE_OUTLIER_{classified_test.status}",
+                            message=classified_test.message,
+                            tests=[classified_test],
+                        )
+                    else:
+                        batch_step.add_test(classified_test)
+
+    def _gate_space_artifact_key(self, strategy_id: str) -> str:
+        return f"{self._glm_gate_space_artifact_name}:{strategy_id}"
+
+    def _gate_space_artifact_dir(
+        self,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+    ) -> Path:
+        return self.artifact_dir(
+            entity_qc,
+            dataloader,
+            f"{self._glm_gate_space_artifact_name}/{strategy_id}",
         )
 
-        space_tester = GLMGateOutlierTest(
-            config={
-                "min_samples": config["gate_space_min_samples"],
-                "outlier_method": method,
-                "use_mad": config["use_mad"],
-                "n_points": config["gate_space_n_points"],
-                "seed": config["gate_space_seed"],
-            },
-            thresholds=gate_space_thresholds,
+    def _gate_space_artifact_paths(
+        self,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+    ) -> dict[str, Path]:
+        artifact_dir = self._gate_space_artifact_dir(entity_qc, dataloader, strategy_id)
+        return {
+            "dir": artifact_dir,
+            "basis": artifact_dir / "basis.json",
+            "sample_index": artifact_dir / "sample_index.json",
+            "eval_points": artifact_dir / "eval_points.npz",
+            "coverage_masks": artifact_dir / "coverage_masks.npz",
+            "distance_state": artifact_dir / "distance_state.npz",
+        }
+
+    def _gate_space_config_payload(
+        self,
+        entity: GateNode,
+        strategy_id: str,
+        config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
+            "strategy_id": strategy_id,
+            "gate_id": entity.id,
+            "gate_type": entity.gate_type,
+            "glm_type": entity.glm_type,
+            "dimensions": list(entity.dimensions),
+            "n_points": int(config["gate_space_n_points"]),
+            "seed": int(config["gate_space_seed"]),
+        }
+
+    def _sample_gate_signature(self, entity: GateNode, sample_id: str) -> str:
+        return _hash_payload(entity.get_params_for_sample(sample_id))
+
+    def _load_glm_gate_space_state(
+        self,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+    ) -> dict[str, Any] | None:
+        artifact_key = self._gate_space_artifact_key(strategy_id)
+        metadata = self.get_artifact_metadata(entity_qc, artifact_key)
+        if not metadata:
+            return None
+
+        paths = self._gate_space_artifact_paths(entity_qc, dataloader, strategy_id)
+        if not all(path.exists() for name, path in paths.items() if name != "dir"):
+            self.invalidate_artifact(entity_qc, artifact_key)
+            return None
+
+        basis = json.loads(paths["basis"].read_text())
+        sample_index = json.loads(paths["sample_index"].read_text())
+        eval_points = np.load(paths["eval_points"], allow_pickle=False)
+        coverage_masks = np.load(paths["coverage_masks"], allow_pickle=False)
+        distance_state = np.load(paths["distance_state"], allow_pickle=False)
+
+        n_eval_points = int(basis.get("n_eval_points", 0))
+        sample_ids = list(sample_index.get("sample_ids", []))
+        packed_masks = np.asarray(coverage_masks["packed_masks"])
+        mask_matrix = _unpack_mask_matrix(packed_masks, n_eval_points) if n_eval_points else np.zeros((0, 0), dtype=bool)
+        centrality_values = np.asarray(distance_state["centrality"], dtype=float)
+
+        return {
+            "metadata": metadata,
+            "basis": basis,
+            "sample_index": sample_index,
+            "eval_points": np.asarray(eval_points["X"], dtype=float),
+            "mask_matrix": mask_matrix,
+            "distance_matrix": np.asarray(distance_state["distance_matrix"], dtype=float),
+            "centrality_vector": centrality_values,
+            "sample_ids": sample_ids,
+            "sample_hashes": dict(sample_index.get("sample_hashes", {})),
+            "n_eval_points": n_eval_points,
+            "centrality": dict(zip(sample_ids, centrality_values.tolist())),
+        }
+
+    def _save_glm_gate_space_state(
+        self,
+        *,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+        config: Mapping[str, Any],
+        sample_ids: list[str],
+        sample_hashes: dict[str, str],
+        low: np.ndarray,
+        high: np.ndarray,
+        eval_points: np.ndarray,
+        mask_matrix: np.ndarray,
+        distance_matrix: np.ndarray,
+        centrality_vector: np.ndarray,
+    ) -> dict[str, Any]:
+        paths = self._gate_space_artifact_paths(entity_qc, dataloader, strategy_id)
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+
+        basis = {
+            **self._gate_space_config_payload(entity, strategy_id, config),
+            "low": low.tolist(),
+            "high": high.tolist(),
+            "n_eval_points": int(eval_points.shape[0]),
+        }
+        sample_index = {
+            "sample_ids": sample_ids,
+            "sample_hashes": sample_hashes,
+        }
+
+        paths["basis"].write_text(json.dumps(basis, indent=2, cls=NumpyEncoder))
+        paths["sample_index"].write_text(json.dumps(sample_index, indent=2, cls=NumpyEncoder))
+        np.savez_compressed(paths["eval_points"], X=eval_points)
+        np.savez_compressed(paths["coverage_masks"], packed_masks=_pack_mask_matrix(mask_matrix))
+        np.savez_compressed(
+            paths["distance_state"],
+            distance_matrix=distance_matrix.astype(np.float32),
+            centrality=centrality_vector.astype(np.float32),
         )
-        for classified_test in space_tester.fit_classify(
-            targets={
-                "strategy_id": strategy_id,
-                "gate_id": entity.id,
-                "metric_type": "params",
-            },
+
+        relative_dir = paths["dir"].relative_to(dataloader.root_dir).as_posix()
+        artifact_key = self._gate_space_artifact_key(strategy_id)
+        artifact_metadata = {
+            "artifact_type": self._glm_gate_space_artifact_name,
+            "strategy_id": strategy_id,
+            "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
+            "relative_dir": relative_dir,
+            "config_fingerprint": _hash_payload(self._gate_space_config_payload(entity, strategy_id, config)),
+            "sample_count": len(sample_ids),
+            "n_eval_points": int(eval_points.shape[0]),
+            "updated_at": now_iso(),
+        }
+        self.set_artifact_metadata(entity_qc, artifact_key, artifact_metadata)
+
+        return {
+            "metadata": artifact_metadata,
+            "basis": basis,
+            "sample_index": sample_index,
+            "eval_points": eval_points,
+            "mask_matrix": mask_matrix,
+            "distance_matrix": distance_matrix,
+            "centrality_vector": centrality_vector,
+            "sample_ids": sample_ids,
+            "sample_hashes": sample_hashes,
+            "n_eval_points": int(eval_points.shape[0]),
+            "centrality": dict(zip(sample_ids, centrality_vector.tolist())),
+        }
+
+    def _rebuild_glm_gate_space_state(
+        self,
+        *,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+        sample_ids: list[str],
+        config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        gate_cls = GateRegistry.get(entity.gate_type)
+        gates = {sample_id: gate_cls.from_node(entity, sample_id=sample_id) for sample_id in sample_ids}
+        bounds = _compute_gate_space_bounds(
+            gates=gates,
+            dimensions=entity.dimensions,
+            glm_type=entity.glm_type,
+        )
+        if bounds is None:
+            self.invalidate_artifact(entity_qc, self._gate_space_artifact_key(strategy_id))
+            return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
+
+        low, high = bounds
+        eval_points_adata = _make_gate_space_eval_points(
+            dimensions=entity.dimensions,
+            low=low,
+            high=high,
+            n_points=int(config["gate_space_n_points"]),
+            seed=int(config["gate_space_seed"]),
+        )
+        eval_points = np.asarray(eval_points_adata.X, dtype=float)
+        masks = _compute_gate_space_masks(
+            gates=gates,
+            eval_points=eval_points_adata,
+            gate_id=entity.id,
+        )
+        mask_matrix = np.vstack([masks[sample_id] for sample_id in sample_ids]) if sample_ids else np.zeros((0, eval_points.shape[0]), dtype=bool)
+        distance_matrix = _compute_jaccard_distance_matrix(mask_matrix)
+        centrality_vector = _compute_gate_space_centrality(distance_matrix)
+        sample_hashes = {sample_id: self._sample_gate_signature(entity, sample_id) for sample_id in sample_ids}
+        return self._save_glm_gate_space_state(
             entity=entity,
-            sample_ids=gate_space_sample_ids,
-        ):
-            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
-                batch_step.add_reason(
-                    code=f"GATE_GLM_SPACE_OUTLIER_{classified_test.status}",
-                    message=classified_test.message,
-                    tests=[classified_test],
-                )
-            else:
-                batch_step.add_test(classified_test)
+            entity_qc=entity_qc,
+            dataloader=dataloader,
+            strategy_id=strategy_id,
+            config=config,
+            sample_ids=sample_ids,
+            sample_hashes=sample_hashes,
+            low=low,
+            high=high,
+            eval_points=eval_points,
+            mask_matrix=mask_matrix,
+            distance_matrix=distance_matrix,
+            centrality_vector=centrality_vector,
+        )
+
+    def _maybe_incremental_glm_gate_space_state(
+        self,
+        *,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+        sample_ids: list[str],
+        config: Mapping[str, Any],
+        existing_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        existing_sample_ids = list(existing_state["sample_ids"])
+        if sample_ids[:len(existing_sample_ids)] != existing_sample_ids:
+            return None
+
+        sample_hashes = {sample_id: self._sample_gate_signature(entity, sample_id) for sample_id in sample_ids}
+        for sample_id in existing_sample_ids:
+            if sample_hashes[sample_id] != existing_state["sample_hashes"].get(sample_id):
+                return None
+
+        new_sample_ids = sample_ids[len(existing_sample_ids):]
+        if not new_sample_ids:
+            centrality_vector = _compute_gate_space_centrality(existing_state["distance_matrix"])
+            existing_state["centrality_vector"] = centrality_vector
+            existing_state["centrality"] = dict(zip(existing_sample_ids, centrality_vector.tolist()))
+            return existing_state
+
+        basis = existing_state["basis"]
+        gate_cls = GateRegistry.get(entity.gate_type)
+        new_gates = {sample_id: gate_cls.from_node(entity, sample_id=sample_id) for sample_id in new_sample_ids}
+        new_bounds = _compute_gate_space_bounds(
+            gates=new_gates,
+            dimensions=entity.dimensions,
+            glm_type=entity.glm_type,
+        )
+        if new_bounds is None:
+            return None
+
+        low = np.asarray(basis["low"], dtype=float)
+        high = np.asarray(basis["high"], dtype=float)
+        new_low, new_high = new_bounds
+        if np.any(new_low < low) or np.any(new_high > high):
+            return None
+
+        eval_points_adata = ad.AnnData(X=existing_state["eval_points"])
+        eval_points_adata.var_names = entity.dimensions
+        new_masks = _compute_gate_space_masks(
+            gates=new_gates,
+            eval_points=eval_points_adata,
+            gate_id=entity.id,
+        )
+        new_mask_matrix = np.vstack([new_masks[sample_id] for sample_id in new_sample_ids])
+
+        old_mask_matrix = existing_state["mask_matrix"]
+        new_to_old = _compute_jaccard_distance_between(new_mask_matrix, old_mask_matrix)
+        new_to_new = _compute_jaccard_distance_matrix(new_mask_matrix)
+        upper = np.hstack([existing_state["distance_matrix"], new_to_old.T])
+        lower = np.hstack([new_to_old, new_to_new])
+        distance_matrix = np.vstack([upper, lower])
+        mask_matrix = np.vstack([old_mask_matrix, new_mask_matrix])
+        centrality_vector = _compute_gate_space_centrality(distance_matrix)
+
+        return self._save_glm_gate_space_state(
+            entity=entity,
+            entity_qc=entity_qc,
+            dataloader=dataloader,
+            strategy_id=strategy_id,
+            config=config,
+            sample_ids=sample_ids,
+            sample_hashes=sample_hashes,
+            low=low,
+            high=high,
+            eval_points=existing_state["eval_points"],
+            mask_matrix=mask_matrix,
+            distance_matrix=distance_matrix,
+            centrality_vector=centrality_vector,
+        )
+
+    def _get_or_build_glm_gate_space_state(
+        self,
+        *,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        strategy_id: str,
+        sample_ids: list[str],
+        config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if entity.gate_type in {"Boolean", "Quadrant"}:
+            return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
+
+        config_payload = self._gate_space_config_payload(entity, strategy_id, config)
+        config_fingerprint = _hash_payload(config_payload)
+        artifact_key = self._gate_space_artifact_key(strategy_id)
+        artifact_metadata = self.get_artifact_metadata(entity_qc, artifact_key)
+        existing_state = self._load_glm_gate_space_state(entity_qc, dataloader, strategy_id)
+        if artifact_metadata is None or existing_state is None:
+            return self._rebuild_glm_gate_space_state(
+                entity=entity,
+                entity_qc=entity_qc,
+                dataloader=dataloader,
+                strategy_id=strategy_id,
+                sample_ids=sample_ids,
+                config=config,
+            )
+
+        if artifact_metadata.get("schema_version") != _GLM_GATE_SPACE_ARTIFACT_VERSION:
+            return self._rebuild_glm_gate_space_state(
+                entity=entity,
+                entity_qc=entity_qc,
+                dataloader=dataloader,
+                strategy_id=strategy_id,
+                sample_ids=sample_ids,
+                config=config,
+            )
+        if artifact_metadata.get("config_fingerprint") != config_fingerprint:
+            return self._rebuild_glm_gate_space_state(
+                entity=entity,
+                entity_qc=entity_qc,
+                dataloader=dataloader,
+                strategy_id=strategy_id,
+                sample_ids=sample_ids,
+                config=config,
+            )
+
+        update_policy = config.get("gate_space_update_policy", "incremental")
+        if update_policy == "incremental":
+            updated_state = self._maybe_incremental_glm_gate_space_state(
+                entity=entity,
+                entity_qc=entity_qc,
+                dataloader=dataloader,
+                strategy_id=strategy_id,
+                sample_ids=sample_ids,
+                config=config,
+                existing_state=existing_state,
+            )
+            if updated_state is not None:
+                return updated_state
+
+        return self._rebuild_glm_gate_space_state(
+            entity=entity,
+            entity_qc=entity_qc,
+            dataloader=dataloader,
+            strategy_id=strategy_id,
+            sample_ids=sample_ids,
+            config=config,
+        )
 
     def _collect_sample_metrics(
         self,
         entity_qc: EntityQCStatus,
-        gate_id: str
-    ) -> dict[str, dict[str, float]]:
-        """Collect event metrics for a specific gate across all samples.
+        gate_id: str,
+        sample_ids: list[str] | None = None,
+    ) -> dict[str, list[float]]:
+        """Collect scalar mask metrics in metric-centric format.
 
-        Returns a nested dict: sample_id → {metric_name: value}
+        Returns
+        -------
+        dict[str, list[float]]
+            Mapping ``metric_name -> [value_per_sample, ...]`` aligned with
+            ``sample_ids``. Missing values are filled with ``NaN``.
         """
-        sample_metrics: dict[str, dict[str, float]] = {}
+        aligned_sample_ids = sample_ids or list(entity_qc.sample_qc.keys())
+        n_samples = len(aligned_sample_ids)
+        sample_index = {sid: idx for idx, sid in enumerate(aligned_sample_ids)}
+        metrics_by_name: dict[str, list[float]] = {}
 
         for sample_id, sample_qc_run in entity_qc.sample_qc.items():
+            if sample_id not in sample_index:
+                continue
+
             for step in sample_qc_run.steps.values():
                 for test_record in step.tests.values():
                     if (test_record.test_type == "gate" and
                         test_record.test_name == GateMaskRatioTest.test_name and
                         test_record.targets.get("gate_id") == gate_id):
 
-                        if sample_id not in sample_metrics:
-                            sample_metrics[sample_id] = {}
-
-                        # Extract metrics (only float values)
+                        idx = sample_index[sample_id]
+                        # Extract metrics and align them by sample index.
                         for metric_key, metric_value in test_record.metrics.items():
+                            metric_series = metrics_by_name.setdefault(
+                                metric_key,
+                                [float("nan")] * n_samples,
+                            )
                             try:
-                                sample_metrics[sample_id][metric_key] = float(metric_value)
+                                metric_series[idx] = float(metric_value)
                             except (TypeError, ValueError):
                                 continue
 
-        return sample_metrics
+        return metrics_by_name
 
     def _collect_sample_params(
         self,
         entity_qc: EntityQCStatus,
         gate_node: GateNode
-    ) -> dict[str, dict[str, Any]]:
-        """Collect gate parameters for a specific gate across all samples.
+    ) -> dict[str, Any]:
+        """Collect scalar gate metrics across samples in metric-centric format.
 
-        Returns a nested dict: sample_id → {param_name: value}
+        Expected shape (by convention, not enforced by all gates):
+        - node_params["params"]:      {metric_name: scalar | array}
+        - node_params["diagnostics"]: {metric_name: scalar | array}
+
+        Arrays/non-scalars are ignored for now to keep this path strictly 1D.
+
+        Returns
+        -------
+        dict[str, Any]
+            {
+                "sample_ids": [sample_id, ...],
+                "params": {metric_name: [value_per_sample, ...]},
+                "diagnostics": {metric_name: [value_per_sample, ...]},
+            }
+            Metric series are aligned with "sample_ids".
         """
-        sample_params: dict[str, dict[str, float]] = {}
-        sample_diagnostics: dict[str, dict[str, float]] = {}
-        for sample_id in entity_qc.sample_qc:
+        sample_ids = list(entity_qc.sample_qc.keys())
+        n_samples = len(sample_ids)
+
+        sample_params: dict[str, list[float]] = {}
+        sample_diagnostics: dict[str, list[float]] = {}
+
+        for idx, sample_id in enumerate(sample_ids):
             node_params = gate_node.get_params_for_sample(sample_id)
-            sample_params[sample_id] = node_params.get("params", {})
-            sample_diagnostics[sample_id] = node_params.get("diagnostics", {})
+            for section_name, sink in (("params", sample_params), ("diagnostics", sample_diagnostics)):
+                section = node_params.get(section_name, {})
+                if not isinstance(section, Mapping):
+                    continue
+
+                for metric_name, metric_value in section.items():
+                    # Skip array-like values until multi-dimensional tests are implemented.
+                    if isinstance(metric_value, (list, tuple, dict, np.ndarray)):
+                        continue
+
+                    metric_series = sink.setdefault(metric_name, [float("nan")] * n_samples)
+                    try:
+                        metric_series[idx] = float(metric_value)
+                    except (TypeError, ValueError):
+                        # Keep NaN for non-numeric values.
+                        continue
 
         return {
+            "sample_ids": sample_ids,
             "params": sample_params,
             "diagnostics": sample_diagnostics,
         }

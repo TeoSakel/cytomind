@@ -65,6 +65,8 @@ class ProjectRepository:
         # ---- QC I/O ----
         "qc_dir": "qc",
         "qc_entity_dir": "qc/{entity_type}/{entity_id}",
+        "qc_entity_artifacts_dir": "qc/{entity_type}/{entity_id}/artifacts",
+        "qc_entity_artifact_dir": "qc/{entity_type}/{entity_id}/artifacts/{artifact_key}",
         "entity_qc": "qc/{entity_type}/{entity_id}/info.json",
 
         # ---- Revision Workspaces ----
@@ -555,6 +557,16 @@ class ProjectRepository:
     def qc_entity_figures_dir(self, entity_type: str, entity_id: str) -> Path:
         """Path to entity QC figures directory."""
         return self.qc_entity_dir(entity_type, entity_id) / "figures"
+
+    def qc_entity_artifacts_dir(self, entity_type: str, entity_id: str) -> Path:
+        """Path to entity QC artifacts directory."""
+        pattern = self.path_scheme["qc_entity_artifacts_dir"]
+        return self.root / pattern.format(entity_type=entity_type, entity_id=entity_id)
+
+    def qc_entity_artifact_dir(self, entity_type: str, entity_id: str, artifact_key: str) -> Path:
+        """Path to a named artifact directory under an entity QC directory."""
+        pattern = self.path_scheme["qc_entity_artifact_dir"]
+        return self.root / pattern.format(entity_type=entity_type, entity_id=entity_id, artifact_key=artifact_key)
 
     def load_qc_entity_status(self, entity_type: str, entity_id: str) -> EntityQCStatus:
         """Load and return QC status for a specific entity."""
