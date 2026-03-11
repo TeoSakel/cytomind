@@ -8,7 +8,6 @@ import networkx as nx
 from networkx.readwrite import json_graph
 
 from .constants import GML_VERSION
-from cytomind.utils import now_iso
 
 __all__ = ["GatingStrategyRef", "GateNode"]
 
@@ -155,21 +154,20 @@ class GatingStrategyRef:
     - Sample associations
     - GatingML 2.0 specification compliance
 
-    The strategy definition is stored as JSON and can be exported to GatingML XML format.
+    The strategy definition is stored as part of the project JSON and can be exported to GatingML XML format.
     """
-    id: str                              # unique id (initialy same as name)
-    name: str                            # human-readable name (allowed to change)
-    batch_id: str                        # batch id to be analyzed
-    path: str | None                     # path serialized gating strategy file
-    created_at: str | None = None        # ISO timestamp
-    description: str | None = None       # human-readable description
     glm_version: str = field(default=GML_VERSION)  # GatingML version
     _graph: nx.DiGraph | None = field(repr=False, hash=False, default=None)
 
     def __post_init__(self) -> None:
-        # check if id is valid filename
-        if any(c in self.id for c in r'\/:*?"<>|'):
-            raise ValueError(f"GatingStrategyRef id '{self.id}' contains invalid filename characters")
+        """Initialize empty graph if not provided."""
+        if self._graph is None:
+            self.init_graph()
+
+    @property
+    def id(self) -> str:
+        """Stable identifier used for QC/entity references."""
+        return "gating_strategy"
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GatingStrategyRef":
@@ -186,20 +184,10 @@ class GatingStrategyRef:
         GatingStrategyRef
             Deserialized GatingStrategyRef instance
         """
-        for f in ["id", "name", "batch_id"]:
-            if f not in data:
-                raise KeyError(f"Missing required field '{f}' in GatingStrategyRef data")
-
         graph_data = data.get("graph")
         graph = json_graph.node_link_graph(graph_data) if graph_data else None
 
         ref = GatingStrategyRef(
-            id=data["id"],
-            name=data["name"],
-            batch_id=data["batch_id"],
-            path=data.get("path"),
-            created_at=data.get("created_at"),
-            description=data.get("description"),
             glm_version=data.get("glm_version", GML_VERSION),
             _graph=graph,
         )
@@ -216,12 +204,6 @@ class GatingStrategyRef:
             Serialized dictionary representation
         """
         return {
-            "id": self.id,
-            "name": self.name,
-            "batch_id": self.batch_id,
-            "path": self.path,
-            "created_at": self.created_at or now_iso(),
-            "description": self.description,
             "glm_version": self.glm_version,
             "graph": json_graph.node_link_data(self._graph) if self._graph else None,
         }
@@ -247,26 +229,7 @@ class GatingStrategyRef:
         if self._graph is not None:
             raise TypeError("Gating strategy instance is of invalid type.")
 
-        if self.path is None:
-            raise ValueError("Gating strategy path is not set and instance is not set.")
-
-        path = Path(self.path)
-        if not path.exists():
-            raise FileNotFoundError(f"Gating strategy file not found: {self.path} and instance is not set.")
-
-        try:
-            graph_data = json.loads(path.read_text())["graph"]
-        except KeyError:
-            raise ValueError(f"Gating strategy file {self.path} does not contain graph data.")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Error decoding gating strategy file {self.path}: {e}") from e
-
-        try:
-            self._graph = json_graph.node_link_graph(data=graph_data)
-        except Exception as e:
-            raise ValueError(f"Error loading gating strategy graph from file {self.path}: {e}") from e
-
-        return self._graph # pyright: ignore[reportReturnType]
+        raise ValueError("Gating strategy graph is not loaded in memory.")
 
     def init_graph(self) -> None:
         """
@@ -290,7 +253,7 @@ class GatingStrategyRef:
             if node_id == "root":
                 continue
             if node_data:
-                node = GateNode.from_dict(node_data)
+                node = GateNode.from_dict({**node_data, "id": node_id})
                 node.parent_ids = list(self.graph.predecessors(node_id))
                 yield node
 

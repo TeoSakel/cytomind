@@ -180,7 +180,6 @@ class UnifiedDataLoader:
     def load_masks(
         self,
         sample_id: str,
-        strategy_id: str,
         gate_ids: Iterable[str] | None = None,
         parse_func: Callable[[Any], BooleanArray] = rldecode,
         **context: Any,
@@ -189,12 +188,11 @@ class UnifiedDataLoader:
         masks = {}
 
         if gate_ids is None:
-            gate_ids = self._get_all_gate_ids(strategy_id)
+            gate_ids = self._get_all_gate_ids()
 
         for gate_id in gate_ids:
             path = self._resolve_read_path(
                 self._pattern("gating_mask"),
-                strategy_id=strategy_id,
                 mask_id=gate_id,
                 sample_id=sample_id,
             )
@@ -205,18 +203,16 @@ class UnifiedDataLoader:
     def save_masks(
         self,
         sample_id: str,
-        strategy_id: str,
         masks: Mapping[str, BooleanMask],
         serialize_func: Callable[[BooleanMask], Any] = rlencode,
+        overwrite: bool = True,
         **context: Any,
     ) -> None:
         """Save gating masks to resolved location."""
-        overwrite = context.get("overwrite", False)
 
         for gate_id, mask in masks.items():
             path = self._resolve_write_path(
                 self._pattern("gating_mask"),
-                strategy_id=strategy_id,
                 mask_id=gate_id,
                 sample_id=sample_id,
             )
@@ -226,7 +222,6 @@ class UnifiedDataLoader:
 
     def load_gate_node(
         self,
-        strategy_id: str,
         node_id: str,
         parse_func: Callable[[dict], GateNode] = GateNode.from_dict,
         **context: Any,
@@ -236,8 +231,6 @@ class UnifiedDataLoader:
 
         Parameters
         ----------
-        strategy_id : str
-            Gating strategy identifier
         node_id : str
             Gate node identifier
         parse_func : Callable[[dict], GateNode], optional
@@ -253,16 +246,15 @@ class UnifiedDataLoader:
         return self.load_data(
             entity="gate_node",
             parse_func=parse_func,
-            strategy_id=strategy_id,
             node_id=node_id,
             **context
         )
 
     def save_gate_node(
         self,
-        strategy_id: str,
         node: GateNode,
         serialize_func: Callable[[GateNode], dict] = GateNode.to_dict,
+        overwrite: bool = True,
         **context: Any,
     ) -> None:
         """
@@ -270,8 +262,6 @@ class UnifiedDataLoader:
 
         Parameters
         ----------
-        strategy_id : str
-            Gating strategy identifier
         node : GateNode
             Gate node to save (will be serialized if serialize_func provided)
         serialize_func : Callable[[GateNode], dict], optional
@@ -283,15 +273,13 @@ class UnifiedDataLoader:
             pattern="gate_node",
             data=node,
             serialize_func=serialize_func,
-            overwrite=context.get("overwrite", True),
-            strategy_id=strategy_id,
+            overwrite=overwrite,
             node_id=node.id,
             **context
         )
 
     def load_gating_strategy(
         self,
-        strategy_id: str,
         parse_func: Callable[[dict], GatingStrategyRef] = GatingStrategyRef.from_dict,
         **context: Any
     ) -> GatingStrategyRef:
@@ -300,8 +288,6 @@ class UnifiedDataLoader:
 
         Parameters
         ----------
-        strategy_id : str
-            Gating strategy identifier
         parse_func : Callable[[dict], GatingStrategyRef]
             Function to parse the loaded dict to a GatingStrategyRef
         **context : dict
@@ -315,7 +301,6 @@ class UnifiedDataLoader:
         return self.load_data(
             entity="gating_strategy",
             parse_func=parse_func,
-            strategy_id=strategy_id,
             **context
         )
 
@@ -323,6 +308,7 @@ class UnifiedDataLoader:
         self,
         strategy: GatingStrategyRef,
         serialize_func: Callable[[GatingStrategyRef], dict] = GatingStrategyRef.to_dict,
+        overwrite: bool = True,
         **context: Any
     ) -> None:
         """
@@ -341,8 +327,7 @@ class UnifiedDataLoader:
             pattern="gating_strategy",
             data=strategy,
             serialize_func=serialize_func,
-            strategy_id=strategy.id,
-            overwrite=context.get("overwrite", True),
+            overwrite=overwrite,
             **context
         )
 
@@ -770,9 +755,9 @@ class UnifiedDataLoader:
 
     # ========== Helper: Get All Gate IDs ==========
 
-    def _get_all_gate_ids(self, strategy_id: str) -> Iterator[str]:
+    def _get_all_gate_ids(self) -> Iterator[str]:
         """Get all gate IDs for a strategy (checks both root and fallback)."""
-        relative_masks_dir = self._pattern("gating_strategy_masks_dir").format(strategy_id=strategy_id)
+        relative_masks_dir = self._pattern("gating_strategy_masks_dir")
         root_masks_dir = self.root_dir / relative_masks_dir
         if root_masks_dir.exists():
             yield from  (d.name for d in root_masks_dir.iterdir() if d.is_dir())

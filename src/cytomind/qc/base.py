@@ -1445,7 +1445,7 @@ class EntityQCEvaluator(ABC):
             Optional UnifiedDataLoader for loading additional data (AnnData, masks, etc.)
             needed to generate the figure.
         dataloader_context : dict[str, Any] | None
-            Optional context parameters for the dataloader (e.g., strategy_id,
+            Optional context parameters for the dataloader (e.g., sample IDs,
             layer, etc.). Used when loading data for figure generation.
         step_id : str | None
             Optional step ID to narrow scope of search/visualization.
@@ -1496,7 +1496,7 @@ class EntityQCEvaluator(ABC):
         entity_id : str
             Unique identifier of the entity to load.
         context : dict[str, Any] | None
-            Optional context dict with additional metadata (e.g., strategy_id for gate nodes).
+            Optional context dict with additional metadata for entity-specific loading.
 
         Returns
         -------

@@ -29,14 +29,13 @@ from .utils import (
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import BooleanArray, FloatArray, PathLike
-    from cytomind.domain.gates import GateNode, GatingStrategyRef
+    from cytomind.domain.gates import GateNode
     from cytomind.infra.dataloader import UnifiedDataLoader
 else:
     BooleanArray = object
     FloatArray = object
     PathLike = object
     GateNode = object
-    GatingStrategyRef = object
     UnifiedDataLoader = object
 
 
@@ -206,7 +205,7 @@ class GateMaskRatioTest(QCTester):
 
     test_type = "gate"
     test_name = "gate_event_count"
-    target_keys = ("strategy_id", "gate_id", "sample_id")
+    target_keys = ("gate_id", "sample_id")
     meta_keys = ("parent_id", )
     default_config = {}
     meta_fields = [
@@ -243,7 +242,7 @@ class GateMaskRatioTest(QCTester):
         Parameters
         ----------
         targets : dict[str, Any]
-            Base target identifiers (strategy_id, sample_id)
+            Base target identifiers (gate_id, sample_id)
         entity : GateNode
             Gate node entity for the test.
         masks : dict[str, BooleanArray]
@@ -260,9 +259,10 @@ class GateMaskRatioTest(QCTester):
         n_total = int(mask.shape[0])
 
         # Gate Parent Mask. If multiple (Boolean Gate) combine with OR and concatenate parent IDs:
-        if entity.parent_ids:
-            parent_id = "|".join(sorted(entity.parent_ids))
-            parent_mask = np.logical_or.reduce([masks[parent] for parent in entity.parent_ids])
+        parent_ids = [pid for pid in entity.parent_ids if pid != "root"]
+        if parent_ids:
+            parent_id = "|".join(sorted(parent_ids))
+            parent_mask = np.logical_or.reduce([masks[parent] for parent in parent_ids])
             if parent_mask.shape[0] != n_total:
                 raise ValueError(
                     f"Mask length mismatch for gate {targets['gate_id']}: "
@@ -507,7 +507,7 @@ class GateFitDiagnosticTest(QCTester):
 
     test_type = "gate"
     test_name = "gate_fit_quality"
-    target_keys = ("strategy_id", "gate_id", "sample_id")
+    target_keys = ("gate_id", "sample_id")
     meta_keys = ("parent_id", )
     default_config = {}
     meta_fields = [
@@ -573,7 +573,7 @@ class GateFitDiagnosticTest(QCTester):
         Parameters
         ----------
         targets : dict[str, Any]
-            Target identifiers (strategy_id, sample_id, gate_id)
+            Target identifiers (sample_id, gate_id)
         **kwargs
             Additional test-specific parameters (gate_node, sample_id, entity, etc.)
         """
@@ -659,7 +659,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
     - Gate fitting quality diagnostics
     - Sample-level outlier detection
 
-    Requires strategy_id in entity_qc.context to load the gating strategy.
+    Uses the project-level gating strategy implicitly.
     """
 
     entity_type = "gate_node"
@@ -767,26 +767,8 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         context: dict[str, Any] | None = None
     ) -> GateNode:
         """Load a gate node from the dataloader.
-
-        Requires strategy_id in context to load the gate from its strategy.
         """
-        # Gate nodes are loaded from their parent gating strategy
-        gate_id = str(entity_id)
-
-        # Get strategy_id from context
-        context = context or {}
-        strategy_id = context.get("strategy_id")
-
-        if strategy_id is None:
-            raise ValueError(
-                f"Cannot load gate node {gate_id}: strategy_id must be provided in context"
-            )
-
-        # Load the gating strategy and extract the gate node
-        strategy = dataloader.load_gating_strategy(strategy_id=strategy_id)
-        gate_node = strategy.get_node(gate_id)
-
-        return gate_node
+        return dataloader.load_gate_node(node_id=str(entity_id))
 
     def update_sample_qc(
         self,
@@ -799,9 +781,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
     ) -> None:
         """Evaluate gate node QC against sample data.
 
-        Requires strategy_id in entity_qc.context to evaluate the gate
-        within its strategy context.
-
         Parameters
         ----------
         entity : GateNode
@@ -813,7 +792,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         dataloader_context : dict[str, Any] | None
             Optional context with sample_ids, layer, etc.
         context : dict[str, Any]
-            Optional evaluation context (must include strategy_id)
+            Optional evaluation context
 
         Returns
         -------
@@ -826,18 +805,9 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         config.update(context)
         entity_qc.context = config
 
-        # Get strategy_id from context
-        strategy_id = entity_qc.context.get("strategy_id")
-        if strategy_id is None:
-            raise ValueError(
-                "Cannot evaluate gate node QC: strategy_id must be provided in entity_qc.context"
-            )
-
-        # Load the gating strategy
+        # Dataloader is required to load masks for QC evaluation.
         if dataloader is None:
-            raise ValueError("dataloader must be provided to load gating strategy")
-
-        strategy = dataloader.load_gating_strategy(strategy_id=strategy_id)
+            raise ValueError("dataloader must be provided to load gate masks")
 
         # Gate event count QC only needs masks; no need to load AnnData.
         sample_ids = dataloader_context.get("sample_ids") or list(entity_qc.sample_qc.keys())
@@ -846,7 +816,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         for sample_id in sample_ids:
             self._evaluate_gate_node(
                 entity=entity,
-                strategy=strategy,
                 entity_qc=entity_qc,
                 sample_id=sample_id,
                 config=config,
@@ -868,13 +837,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         """
         config = self.config.copy()
         config.update(context)
-
-        # Get strategy_id from context
-        strategy_id = entity_qc.context.get("strategy_id")
-        if strategy_id is None:
-            raise ValueError(
-                "Cannot evaluate gate node batch QC: strategy_id must be provided in entity_qc.context"
-            )
 
         # Get batch QC step
         batch_step = entity_qc.batch_qc.get_step("GATE_NODE_BATCH_QC")
@@ -952,7 +914,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                     entity=entity,
                     entity_qc=entity_qc,
                     dataloader=dataloader,
-                    strategy_id=strategy_id,
                     sample_ids=gate_space_sample_ids,
                     config=config,
                 )
@@ -1046,28 +1007,26 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                     else:
                         batch_step.add_test(classified_test)
 
-    def _gate_space_artifact_key(self, strategy_id: str) -> str:
-        return f"{self._glm_gate_space_artifact_name}:{strategy_id}"
+    def _gate_space_artifact_key(self) -> str:
+        return self._glm_gate_space_artifact_name
 
     def _gate_space_artifact_dir(
         self,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
     ) -> Path:
         return self.artifact_dir(
             entity_qc,
             dataloader,
-            f"{self._glm_gate_space_artifact_name}/{strategy_id}",
+            self._glm_gate_space_artifact_name,
         )
 
     def _gate_space_artifact_paths(
         self,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
     ) -> dict[str, Path]:
-        artifact_dir = self._gate_space_artifact_dir(entity_qc, dataloader, strategy_id)
+        artifact_dir = self._gate_space_artifact_dir(entity_qc, dataloader)
         return {
             "dir": artifact_dir,
             "basis": artifact_dir / "basis.json",
@@ -1080,12 +1039,10 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
     def _gate_space_config_payload(
         self,
         entity: GateNode,
-        strategy_id: str,
         config: Mapping[str, Any],
     ) -> dict[str, Any]:
         return {
             "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
-            "strategy_id": strategy_id,
             "gate_id": entity.id,
             "gate_type": entity.gate_type,
             "glm_type": entity.glm_type,
@@ -1101,14 +1058,13 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         self,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
     ) -> dict[str, Any] | None:
-        artifact_key = self._gate_space_artifact_key(strategy_id)
+        artifact_key = self._gate_space_artifact_key()
         metadata = self.get_artifact_metadata(entity_qc, artifact_key)
         if not metadata:
             return None
 
-        paths = self._gate_space_artifact_paths(entity_qc, dataloader, strategy_id)
+        paths = self._gate_space_artifact_paths(entity_qc, dataloader)
         if not all(path.exists() for name, path in paths.items() if name != "dir"):
             self.invalidate_artifact(entity_qc, artifact_key)
             return None
@@ -1145,7 +1101,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         entity: GateNode,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
         config: Mapping[str, Any],
         sample_ids: list[str],
         sample_hashes: dict[str, str],
@@ -1156,11 +1111,11 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         distance_matrix: np.ndarray,
         centrality_vector: np.ndarray,
     ) -> dict[str, Any]:
-        paths = self._gate_space_artifact_paths(entity_qc, dataloader, strategy_id)
+        paths = self._gate_space_artifact_paths(entity_qc, dataloader)
         paths["dir"].mkdir(parents=True, exist_ok=True)
 
         basis = {
-            **self._gate_space_config_payload(entity, strategy_id, config),
+            **self._gate_space_config_payload(entity, config),
             "low": low.tolist(),
             "high": high.tolist(),
             "n_eval_points": int(eval_points.shape[0]),
@@ -1181,13 +1136,12 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         )
 
         relative_dir = paths["dir"].relative_to(dataloader.root_dir).as_posix()
-        artifact_key = self._gate_space_artifact_key(strategy_id)
+        artifact_key = self._gate_space_artifact_key()
         artifact_metadata = {
             "artifact_type": self._glm_gate_space_artifact_name,
-            "strategy_id": strategy_id,
             "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
             "relative_dir": relative_dir,
-            "config_fingerprint": _hash_payload(self._gate_space_config_payload(entity, strategy_id, config)),
+            "config_fingerprint": _hash_payload(self._gate_space_config_payload(entity, config)),
             "sample_count": len(sample_ids),
             "n_eval_points": int(eval_points.shape[0]),
             "updated_at": now_iso(),
@@ -1214,7 +1168,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         entity: GateNode,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
         sample_ids: list[str],
         config: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -1226,7 +1179,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             glm_type=entity.glm_type,
         )
         if bounds is None:
-            self.invalidate_artifact(entity_qc, self._gate_space_artifact_key(strategy_id))
+            self.invalidate_artifact(entity_qc, self._gate_space_artifact_key())
             return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
 
         low, high = bounds
@@ -1251,7 +1204,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             entity=entity,
             entity_qc=entity_qc,
             dataloader=dataloader,
-            strategy_id=strategy_id,
             config=config,
             sample_ids=sample_ids,
             sample_hashes=sample_hashes,
@@ -1269,7 +1221,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         entity: GateNode,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
         sample_ids: list[str],
         config: Mapping[str, Any],
         existing_state: dict[str, Any],
@@ -1329,7 +1280,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             entity=entity,
             entity_qc=entity_qc,
             dataloader=dataloader,
-            strategy_id=strategy_id,
             config=config,
             sample_ids=sample_ids,
             sample_hashes=sample_hashes,
@@ -1347,24 +1297,22 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         entity: GateNode,
         entity_qc: EntityQCStatus,
         dataloader: UnifiedDataLoader,
-        strategy_id: str,
         sample_ids: list[str],
         config: Mapping[str, Any],
     ) -> dict[str, Any]:
         if entity.gate_type in {"Boolean", "Quadrant"}:
             return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
 
-        config_payload = self._gate_space_config_payload(entity, strategy_id, config)
+        config_payload = self._gate_space_config_payload(entity, config)
         config_fingerprint = _hash_payload(config_payload)
-        artifact_key = self._gate_space_artifact_key(strategy_id)
+        artifact_key = self._gate_space_artifact_key()
         artifact_metadata = self.get_artifact_metadata(entity_qc, artifact_key)
-        existing_state = self._load_glm_gate_space_state(entity_qc, dataloader, strategy_id)
+        existing_state = self._load_glm_gate_space_state(entity_qc, dataloader)
         if artifact_metadata is None or existing_state is None:
             return self._rebuild_glm_gate_space_state(
                 entity=entity,
                 entity_qc=entity_qc,
                 dataloader=dataloader,
-                strategy_id=strategy_id,
                 sample_ids=sample_ids,
                 config=config,
             )
@@ -1374,7 +1322,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                 entity=entity,
                 entity_qc=entity_qc,
                 dataloader=dataloader,
-                strategy_id=strategy_id,
                 sample_ids=sample_ids,
                 config=config,
             )
@@ -1383,7 +1330,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                 entity=entity,
                 entity_qc=entity_qc,
                 dataloader=dataloader,
-                strategy_id=strategy_id,
                 sample_ids=sample_ids,
                 config=config,
             )
@@ -1394,7 +1340,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                 entity=entity,
                 entity_qc=entity_qc,
                 dataloader=dataloader,
-                strategy_id=strategy_id,
                 sample_ids=sample_ids,
                 config=config,
                 existing_state=existing_state,
@@ -1406,7 +1351,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             entity=entity,
             entity_qc=entity_qc,
             dataloader=dataloader,
-            strategy_id=strategy_id,
             sample_ids=sample_ids,
             config=config,
         )
@@ -1511,7 +1455,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
     def _evaluate_gate_node(
         self,
         entity: GateNode,
-        strategy: GatingStrategyRef,
         entity_qc: EntityQCStatus,
         sample_id: str,
         config: Mapping[str, Any],
@@ -1523,8 +1466,6 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         ----------
         entity : GateNode
             The gate node to evaluate
-        strategy : GatingStrategyRef
-            The parent gating strategy
         entity_qc : EntityQCStatus
             QC status to update
         sample_id : str
@@ -1540,25 +1481,23 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         # Load gate masks from dataloader
         gate_id = entity.id
         masks_to_load = [gate_id] + entity.parent_ids
-        # try:
-        #     masks_to_load.remove("root")
-        # except ValueError:
-        #     pass  # No root mask to pop, continue with available masks
+        try:
+            masks_to_load.remove("root")
+        except ValueError:
+            pass  # No root mask to pop, continue with available masks
 
         try:
             masks = dataloader.load_masks(
                 sample_id=sample_id,
-                strategy_id=strategy.id,
                 gate_ids=masks_to_load,
             )
         except FileNotFoundError as e:
             raise ValueError(
-                f"Missing required masks for sample {sample_id}, strategy {strategy.id}: {e}"
+                f"Missing required masks for sample {sample_id}: {e}"
             )
 
 
         gate_targets = {
-            "strategy_id": strategy.id,
             "sample_id": sample_id,
             "gate_id": gate_id,
         }

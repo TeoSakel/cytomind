@@ -11,6 +11,7 @@ import numpy as np
 
 from cytomind.domain.qc import EntityQCStatus, QCTestRecord
 from cytomind.domain.gates import GatingStrategyRef
+from cytomind.domain.pipeline import Project
 
 from . import EntityQCEvaluatorRegistry
 from .base import EntityQCEvaluator, QCTester
@@ -38,7 +39,7 @@ class MultiMetricOutlierTester(QCTester):
 
     test_type = "strategy_batch"
     test_name = "cross_gate_outlier"
-    target_keys = ("strategy_id", "metric_type")
+    target_keys = ("metric_type",)
     meta_keys = ("sample_id", "metric_name")
     default_config = {
         "min_samples": 3,
@@ -74,7 +75,7 @@ class MultiMetricOutlierTester(QCTester):
         Parameters
         ----------
         targets : dict[str, Any]
-            Target identifiers (strategy_id, metric_type)
+            Target identifiers (metric_type)
         feature_data : dict[str, dict[str, dict[str, float]]]
             Nested dict: sample_id → gate_id → {ratio_parent, centrality_score}
         **kwargs
@@ -88,7 +89,6 @@ class MultiMetricOutlierTester(QCTester):
         metadata = self.metadata.copy()
         thresholds = self.thresholds.copy()
 
-        strategy_id = targets["strategy_id"]
         metric_type = targets.get("metric_type", "cross_gate")
 
         min_samples = int(metadata["min_samples"])
@@ -308,7 +308,7 @@ class GatingStrategyQCEvaluator(EntityQCEvaluator):
 
     def load_entity(self, dataloader: UnifiedDataLoader, entity_id: Hashable, context: dict[str, Any] | None = None) -> GatingStrategyRef:
         """Load a gating strategy from the dataloader."""
-        return dataloader.load_gating_strategy(strategy_id=str(entity_id))
+        return dataloader.load_data("project", parse_func=Project.from_dict).gating_strategy
 
     def update_batch_qc(
         self,
@@ -351,7 +351,7 @@ class GatingStrategyQCEvaluator(EntityQCEvaluator):
         )
 
         for test in outlier_tester.fit_classify(
-            targets={"strategy_id": entity.id, "metric_type": "cross_gate"},
+            targets={"metric_type": "cross_gate"},
             feature_data=feature_data,
         ):
             if test.status in {"WARN", "SEVERE", "FAIL"}:

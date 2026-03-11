@@ -335,8 +335,8 @@ class BaseStep:
                 }
             if "transformations" in updates:
                 updates["transformations"] = list(updates["transformations"].keys())
-            if "gating_strategies" in updates:
-                updates["gating_strategies"] = [gs.id for gs in updates["gating_strategies"]]
+            if "gating_strategy" in updates and updates["gating_strategy"] is not None:
+                updates["gating_strategy"] = updates["gating_strategy"].id
 
         return step_run
 

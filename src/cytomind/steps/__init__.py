@@ -17,7 +17,7 @@ def register_step(name: str) -> Callable[[type[BaseStep]], type[BaseStep]]:
     return decorator
 
 # Import concrete steps so their decorators run and populate StepRegistry
-from . import add_samples, compensation, load_fcs, tranform, add_gating_strategy, add_gate
+from . import add_samples, compensation, load_fcs, tranform, add_gate
 
 
 del Callable

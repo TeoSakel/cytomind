@@ -531,7 +531,7 @@ class InteractivePipeline:
             Optional specific test name to filter by. If provided, only data from this test are aggregated
             (takes precedence over table_type).
             - compensation: ["compensation_id", "sample_id", "mask"]
-            - gating_strategy: ["gating_strategy_id", "sample_id", "gate_id"]
+            - gating_strategy: ["sample_id", "gate_id"]
             - step: ["step_id", "sample_id"]
 
         Returns
@@ -604,11 +604,8 @@ class InteractivePipeline:
                     )
                 id_vars = ["sample_id"]
             elif by == "entity":
-                # For gate entities, include strategy_id + gate_id
-                if entity_type in ("gate_node", "gate"):
-                    id_vars = targets[:2] if len(targets) >= 2 else targets
-                else:
-                    id_vars = [targets[0]]  # First target is typically the entity ID
+                # First target is the entity identifier for each evaluator.
+                id_vars = [targets[0]] if targets else []
             else:
                 # Treat as a single column name
                 if by not in targets:
@@ -749,32 +746,33 @@ class InteractivePipeline:
         table_type: str | None = None,
         test_name: str | None = None,
     ) -> list[pd.DataFrame]:
-        """Aggregate QC tables for gating strategies across selected samples."""
+        """Aggregate QC tables for the project gating strategy across selected samples."""
 
         tables: list[pd.DataFrame] = []
-        for gs_id, gs in project.gating_strategies.items():
-            try:
-                qc_status = self.repo.load_qc_entity_status("gating_strategy", gs_id)
-            except FileNotFoundError:
-                raise FileNotFoundError(
-                    f"QC status for gating_strategy {gs_id!r} not found."
-                )
+        gs = project.gating_strategy
 
-            gs_samples = list(project.batches[gs.batch_id].sample_ids.intersection(sample_ids))
-            try:
-                df = qc_evaluator.generate_table(
-                    entity_qc=qc_status,
-                    sample_ids=gs_samples,
-                    table_type=table_type,
-                    test_name=test_name,
-                )
-                if not df.empty:
-                    tables.append(df)
-            except (ValueError, KeyError) as e:
-                warnings.warn(
-                    f"Failed to generate table for samples {gs_samples!r}, "
-                    f"gating_strategy {gs_id!r}: {e}"
-                )
+        try:
+            qc_status = self.repo.load_qc_entity_status("gating_strategy", gs.id)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"QC status for gating_strategy {gs.id!r} not found."
+            )
+
+        gs_samples = list(sample_ids)
+        try:
+            df = qc_evaluator.generate_table(
+                entity_qc=qc_status,
+                sample_ids=gs_samples,
+                table_type=table_type,
+                test_name=test_name,
+            )
+            if not df.empty:
+                tables.append(df)
+        except (ValueError, KeyError) as e:
+            warnings.warn(
+                f"Failed to generate table for samples {gs_samples!r}, "
+                f"gating_strategy {gs.id!r}: {e}"
+            )
         return tables
 
     def _aggregate_qc_metrics_by_entity_ids(
@@ -788,7 +786,7 @@ class InteractivePipeline:
     ) -> list[pd.DataFrame]:
         """Aggregate QC tables for entity types that require explicit entity IDs.
 
-        For gate_node: searches across all gating strategies to locate the gate ID.
+        For gate_node: validates gate IDs against the project gating strategy.
         """
 
         if entity_ids is None:
@@ -799,18 +797,18 @@ class InteractivePipeline:
 
         tables: list[pd.DataFrame] = []
 
-        # For gate_node, search across all strategies to map gate IDs to strategy IDs
+        # For gate_node, validate gate IDs against the project strategy
         if entity_type == "gate_node":
             project = self.repo.load_project()
+            strategy = project.gating_strategy
+            if strategy is None:
+                warnings.warn("No gating strategy found in project, skipping gate_node QC aggregation.")
+                return tables
             for gate_id in entity_ids:
-                for strategy in project.gating_strategies.values():
-                    try:
-                        strategy.get_node(gate_id)
-                        break
-                    except (KeyError, AttributeError):
-                        continue
-                else:
-                    warnings.warn(f"Gate {gate_id!r} not found in any gating strategy, skipping.")
+                try:
+                    strategy.get_node(gate_id)
+                except (KeyError, AttributeError):
+                    warnings.warn(f"Gate {gate_id!r} not found in project gating strategy, skipping.")
 
         for entity_id in entity_ids:
             try:
@@ -950,43 +948,8 @@ class InteractivePipeline:
         )
         return step_comp
 
-    def add_gating_strategy(
-        self,
-        strategy_id: str,
-        batch_id: str = "panel",
-        description: str = ""
-    ) -> StepRun:
-        """
-        Create a new gating strategy for the specified samples.
-
-        Parameters
-        ----------
-        strategy_id : str
-        batch_id : str
-            Batch ID to associate with the strategy.
-        description : str
-            Optional description of the gating strategy.
-
-        Returns
-        -------
-        StepRun
-            The completed add_gating_strategy step run.
-        """
-
-
-        step_gating = self.run_step(
-            step_type="add_gating_strategy",
-            config={
-                "strategy_id": strategy_id,
-                "description": description,
-            },
-            inputs={"batch_ids": [batch_id]}
-        )
-        return step_gating
-
     def add_gate(
         self,
-        strategy_id: str,
         gate_id: str,
         gate_type: str,
         dimensions: Sequence[str] = [],
@@ -1003,8 +966,6 @@ class InteractivePipeline:
 
         Parameters
         ----------
-        strategy_id : str
-            ID of the gating strategy to update.
         gate_id : str
             Unique identifier for the new gate.
         gate_type : str
@@ -1032,9 +993,26 @@ class InteractivePipeline:
         StepRun
             The completed add_gate step run.
         """
-        # Get batch_id from strategy
-        gs_ref = self.repo.load_gating_strategy(strategy_id)
-        batch_id = gs_ref.batch_id
+        project = self.repo.load_project()
+        sample_ids = set(project.samples.keys())
+        if not sample_ids:
+            raise ValueError("Cannot add gate: project has no samples.")
+
+        batch_id = next(
+            (bid for bid, batch in project.batches.items() if batch.sample_ids == sample_ids),
+            "",
+        )
+        if not batch_id:
+            batch_id = "__all__"
+            if batch_id in project.batches and project.batches[batch_id].sample_ids != sample_ids:
+                suffix = 1
+                while f"{batch_id}_{suffix}" in project.batches:
+                    suffix += 1
+                batch_id = f"{batch_id}_{suffix}"
+
+            self.repo.update_project_metadata(
+                batches=[BatchRef(id=batch_id, sample_ids=sample_ids, tags={"all_samples"}, meta={})]
+            )
 
         # Convert parent_id to list
         if isinstance(parent_ids, str):
@@ -1045,7 +1023,7 @@ class InteractivePipeline:
         if gate_type == "Boolean":
             dime_set: set[str] = set()
             for parent in parent_ids:
-                parent_node = self.repo.load_gate_node(strategy=strategy_id, node_id=parent)
+                parent_node = self.repo.load_gate_node(node_id=parent)
                 dime_set.update(parent_node.dimensions)
             dimensions = sorted(dime_set)
 
@@ -1063,7 +1041,6 @@ class InteractivePipeline:
         return self.run_step(
             step_type="add_gate",
             config={
-                "strategy_id": strategy_id,
                 "gate_node": gate_node,
                 "fit_on_batch": fit_on_batch,
                 "custom_fit": list(custom_fit)
@@ -1075,7 +1052,6 @@ class InteractivePipeline:
 
     def plot_gate(
         self,
-        strategy_id: str,
         gate_id: str,
         sample_id: str,
         plot_all_events: bool = False,
@@ -1083,12 +1059,10 @@ class InteractivePipeline:
         select: Sequence[str] | None = None,
         **plot_kwargs: Any,
     ) -> Any:
-        """Plot a gate for a specific strategy/sample context.
+        """Plot a gate for a specific sample context.
 
         Parameters
         ----------
-        strategy_id : str
-            Gating strategy identifier.
         gate_id : str
             Gate node identifier within the strategy.
         sample_id : str
@@ -1115,7 +1089,7 @@ class InteractivePipeline:
             If the gate type is unknown or required gate dimensions are missing
             from ``select``.
         """
-        gate_node = self.repo.load_gate_node(strategy=strategy_id, node_id=gate_id)
+        gate_node = self.repo.load_gate_node(node_id=gate_id)
 
         try:
             gate_class = GateRegistry.get(gate_node.gate_type)
@@ -1146,7 +1120,6 @@ class InteractivePipeline:
             event_mask = slice(None)
         elif parent_ids:
             parent_masks = self.repo.load_gating_masks(
-                strategy=strategy_id,
                 sample=sample_id,
                 mask_ids=parent_ids,
             )
@@ -1173,7 +1146,6 @@ class InteractivePipeline:
                 }
         elif gate.glm_type == "BooleanGate":
             parent_masks = self.repo.load_gating_masks(
-                strategy=strategy_id,
                 sample=sample_id,
                 mask_ids=parent_ids,
             )

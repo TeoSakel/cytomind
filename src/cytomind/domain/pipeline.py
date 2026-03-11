@@ -10,7 +10,7 @@ import json
 import numpy as np
 from pandas import DataFrame
 
-from .flow import *
+from .flow import ChannelRef, DimensionDef, CompensationRef, TransformationRef
 from .gates import GatingStrategyRef
 from .qc import EntityQCStatus
 
@@ -44,7 +44,7 @@ class Project:
     layers: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
     compensations: dict[str, CompensationRef] = field(default_factory=dict)
     transformations: dict[str, TransformationRef] = field(default_factory=dict)
-    gating_strategies: dict[str, GatingStrategyRef] = field(default_factory=dict)
+    gating_strategy: GatingStrategyRef = field(default_factory=GatingStrategyRef)
 
     @property
     def panel(self) -> list[ChannelRef]:
@@ -72,6 +72,8 @@ class Project:
         if not panel_catalog and data.get("panel"):
             panel_catalog = {"panel": [ChannelRef.from_dict(ch) for ch in data.get("panel", [])]}
 
+        gating_strategy_data = data.get("gating_strategy")
+
         return cls(
             id=data["id"],
             samples={k: SampleRef.from_dict(v) for k, v in data.get("samples", {}).items()},
@@ -80,7 +82,7 @@ class Project:
             compensations={k: CompensationRef.from_dict(v) for k, v in data.get("compensations", {}).items()},
             transformations={k: TransformationRef.from_dict(v) for k, v in data.get("transformations", {}).items()},
             batches={k: BatchRef.from_dict(v) for k, v in data.get("batches", {}).items()},
-            gating_strategies={k: GatingStrategyRef.from_dict(v) for k, v in data.get("gating_strategies", {}).items()},
+            gating_strategy=GatingStrategyRef.from_dict(gating_strategy_data) if gating_strategy_data else GatingStrategyRef(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,7 +97,7 @@ class Project:
             "compensations": {k: v.to_dict() for k, v in self.compensations.items()},
             "transformations": {k: v.to_dict() for k, v in self.transformations.items()},
             "batches": {k: v.to_dict() for k, v in self.batches.items()},
-            "gating_strategies": {k: v.to_dict() for k, v in self.gating_strategies.items()},
+            "gating_strategy": self.gating_strategy.to_dict(),
         }
 
 @dataclass

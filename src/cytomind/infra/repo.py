@@ -49,13 +49,11 @@ class ProjectRepository:
         "sample_adata": "samples/{sample_id}/{layer}.h5ad",
 
         # ---- Gating Strategy I/O ----
-        "gating_strategies_dir": "gating_strategies",
-        "gating_strategy_catalog": "gating_strategies/catalog.json",
-        "gating_strategy_dir": "gating_strategies/{strategy_id}",
-        "gating_strategy": "gating_strategies/{strategy_id}/strategy.json",
-        "gate_node": "gating_strategies/{strategy_id}/gates/{node_id}.json",
-        "gating_strategy_masks_dir": "gating_strategies/{strategy_id}/masks",
-        "gating_mask": "gating_strategies/{strategy_id}/masks/{mask_id}/{sample_id}.npy",
+        "gating_strategy_dir": "gating_strategy",
+        "gating_strategy": "gating_strategy/strategy.json",
+        "gate_node": "gating_strategy/gates/{node_id}.json",
+        "gating_strategy_masks_dir": "gating_strategy/masks",
+        "gating_mask": "gating_strategy/masks/{mask_id}/{sample_id}.npy",
 
         # ---- Step/Pipeline I/O ----
         "steps_dir": "steps",
@@ -124,25 +122,6 @@ class ProjectRepository:
         dict
             Mapping of metadata type -> (parse_func, serialize_func).
         """
-        def parse_dict_factory(cls: type[Serializable]) -> Callable[[Mapping[str, dict]], dict[str, Serializable]]:
-            """Factory to create dict parsers for domain objects."""
-            def parse_dict(data: Mapping[str, dict]) -> dict[str, Serializable]:
-                return {k: cls.from_dict(v) for k, v in data.items()}
-            return parse_dict
-
-        # Spacial case for gating strategy catalog to handle graph serialization
-        def serialize_gs_catalog(gs_refs: dict[str, GatingStrategyRef]) -> dict[str, dict[str, Any]]:
-            """Custom serializer for gating strategy catalog to handle graph serialization."""
-            serialized = {}
-            for k, ref in gs_refs.items():
-                ref_dict = ref.to_dict()
-                # Remove graph from catalog to save space
-                if not ref_dict.get("path") or not Path(ref_dict["path"]).exists():
-                    raise ValueError(f"GatingStrategyRef with id '{ref.id}' is missing 'path' attribute required for serialization.")
-                ref_dict.pop("graph", None)
-                serialized[k] = ref_dict
-            return serialized
-
         return  {
             "project":          (          Project.from_dict, None),
             "step_run":         (          StepRun.from_dict, None),
@@ -150,7 +129,6 @@ class ProjectRepository:
             "entity_qc":        (   EntityQCStatus.from_dict, None),
             "revision_session": (  RevisionSession.from_dict, None),
             "gating_strategy":  (GatingStrategyRef.from_dict, None),
-            "gating_strategy_catalog": (parse_dict_factory(GatingStrategyRef), serialize_gs_catalog),
         }
 
     # -------------- Project I/O -------------
@@ -162,7 +140,8 @@ class ProjectRepository:
         return self._dataloader.save_data(entity, data, overwrite=overwrite, **kwargs)
 
     def load_project(self) -> Project:
-        return self.load_project_metadata("project")
+        project: Project = self.load_project_metadata("project")
+        return project
 
     def save_project(self, project: Project) -> None:
         self.save_project_metadata("project", project)
@@ -175,7 +154,7 @@ class ProjectRepository:
         compensations: Iterable[CompensationRef] = [],
         transformations: Iterable[TransformationRef] = [],
         batches: Iterable[BatchRef] = {},
-        gating_strategies: Iterable[GatingStrategyRef] = [],
+        gating_strategy: GatingStrategyRef | None = None,
         drop_samples: Iterable[str] = [],
         drop_batches: Iterable[str] = [],
     ) -> None:
@@ -199,8 +178,8 @@ class ProjectRepository:
             Transformation references to add/update.
         batches : Iterable[BatchRef], optional
             Iterable of BatchRef objects to add/update.
-        gating_strategies : Iterable[GatingStrategyRef], optional
-            Iterable of GatingStrategyRef objects to add/update.
+        gating_strategy : GatingStrategyRef | None, optional
+            GatingStrategyRef object to set/update for the project.
         drop_samples : Iterable[str], optional
             List of sample IDs to remove from the project. This will delete sample
             directories and remove references from batches.
@@ -251,9 +230,16 @@ class ProjectRepository:
             project.transformations.update(iter_to_dict(transformations))
             update_needed = True
 
-        if gating_strategies:
-            cat = self._update_gating_strategy_catalog(gating_strategies)
-            project.gating_strategies.update(cat)
+        if gating_strategy is not None:
+            if not isinstance(gating_strategy, GatingStrategyRef):
+                raise TypeError("gating_strategy must be a GatingStrategyRef instance.")
+
+            # Persist gate-node JSON files via dataloader for compatibility.
+            # TODO: allow partial updates to gating strategy without requiring full resave of all nodes.
+            for node in gating_strategy.iter_nodes():
+                self._dataloader.save_gate_node(node=node, overwrite=True)
+
+            project.gating_strategy = gating_strategy
             update_needed = True
 
         if update_needed:
@@ -293,35 +279,6 @@ class ProjectRepository:
             project.batches.pop(batch_id, None)
 
         return project
-
-    def _update_gating_strategy_catalog(self, strategy_refs: Iterable[GatingStrategyRef]) -> dict[str, GatingStrategyRef]:
-        """
-        Merge and persist gating strategy catalog entries.
-
-        Parameters
-        ----------
-        strategy_refs : Iterable[GatingStrategyRef]
-            New or updated gating strategy references to merge into the catalog.
-
-        Returns
-        -------
-        dict[str, GatingStrategyRef]
-            Updated catalog mapping strategy_id -> GatingStrategyRef.
-        """
-        try:
-            catalog = self.load_project_metadata("gating_strategy_catalog")
-        except FileNotFoundError:
-            catalog = {}
-        new_strategy_refs: dict[str, GatingStrategyRef] = {}
-        for ref in strategy_refs:
-            if not isinstance(ref, GatingStrategyRef):
-                raise TypeError("strategy_refs values must be GatingStrategyRef instances.")
-            ref.path = self.save_project_metadata("gating_strategy", ref, strategy_id=ref.id).as_posix()
-            new_strategy_refs[ref.id] = ref
-
-        catalog.update(new_strategy_refs)
-        self.save_project_metadata("gating_strategy_catalog", catalog)
-        return catalog
 
     # ------------- Dimension I/O -----------------
 
@@ -613,13 +570,12 @@ class ProjectRepository:
 
     # ------------- Gating Strategy Catalog I/O -----------------
 
-    def gate_node_path(self, strategy: str | GatingStrategyRef, node_id: str) -> Path:
+    def gate_node_path(self, node_id: str) -> Path:
         """Get the path to a gating node definition file."""
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
         pattern = self.path_scheme["gate_node"]
-        return self.root / pattern.format(strategy_id=strategy_id, node_id=node_id)
+        return self.root / pattern.format(node_id=node_id)
 
-    def load_gate_node(self, strategy: str | GatingStrategyRef, node_id: str) -> GateNode:
+    def load_gate_node(self, node_id: str) -> GateNode:
         """
         Load a gating node definition by ID from a gating strategy.
 
@@ -627,8 +583,6 @@ class ProjectRepository:
 
         Parameters
         ----------
-        strategy: str | GatingStrategyRef
-            Strategy identifier or reference.
         node_id: str
             Gating node identifier.
 
@@ -642,16 +596,12 @@ class ProjectRepository:
         KeyError
             If the node is not found in the strategy.
         """
-        if  isinstance(strategy, GatingStrategyRef):
-            return strategy.get_node(node_id)
-
         project = self.load_project()
-        if strategy not in project.gating_strategies:
-            raise KeyError(f"Gating strategy '{strategy}' not found in project.")
-        strategy_ref = project.gating_strategies[strategy]
-        return strategy_ref.get_node(node_id)
+        if project.gating_strategy is None:
+            raise KeyError("Gating strategy not found in project.")
+        return project.gating_strategy.get_node(node_id)
 
-    def save_gate_node(self, strategy: str | GatingStrategyRef, node: GateNode, force: bool = False) -> None:
+    def save_gate_node(self, node: GateNode, force: bool = False) -> None:
         """
         Save a gating node definition to disk.
 
@@ -659,31 +609,23 @@ class ProjectRepository:
 
         Parameters
         ----------
-        strategy: str | GatingStrategyRef
-            Strategy identifier or reference.
         node: GateNode
             Gating node definition to save.
         force : bool
             If True, overwrite existing node.
         """
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
-
         return self._dataloader.save_gate_node(
-            strategy_id=strategy_id,
             node=node,
             serialize_func=lambda n: n.to_dict(),
             overwrite=force,  # Map 'force' param to 'overwrite' context
         )
 
-    def load_gating_strategy(self, strategy_id: str) -> GatingStrategyRef:
+    def load_gating_strategy(self) -> GatingStrategyRef:
         """
         Load a gating strategy by ID (with lazy-loaded definition).
 
         Parameters
         ----------
-        strategy_id: str
-            Strategy identifier.
-
         Returns
         -------
         GatingStrategyRef
@@ -692,13 +634,13 @@ class ProjectRepository:
         Raises
         ------
         KeyError
-            If the strategy is not found in the catalog.
+            If the strategy is not found in the project.
         """
-        return self.load_project_metadata("gating_strategy", strategy_id=strategy_id)
+        project = self.load_project()
+        return project.gating_strategy
 
     def save_gating_masks(
         self,
-        strategy: str | GatingStrategyRef,
         sample: str | SampleRef,
         masks: Mapping[str, Sequence[bool] | NDArray[np.bool_]],
         force: bool = False
@@ -708,26 +650,21 @@ class ProjectRepository:
 
         Parameters
         ----------
-        strategy : str | GatingStrategyRef
-            Strategy identifier or reference.
         sample : str | SampleRef
             Sample identifier or reference.
         mask : Mapping[str, Sequence[bool]]
             Gating mask data to save.
         """
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
 
         return self._dataloader.save_masks(
             sample_id=sample_id,
-            strategy_id=strategy_id,
             masks=masks,
             overwrite=force,  # Map 'force' param to 'overwrite' context
         )
 
     def load_gating_masks(
         self,
-        strategy: str | GatingStrategyRef,
         sample: str | SampleRef,
         mask_ids: Iterable[str]
     ) -> dict[str, BooleanArray]:
@@ -738,8 +675,6 @@ class ProjectRepository:
 
         Parameters
         ----------
-        strategy : str | GatingStrategyRef
-            Strategy identifier or reference.
         sample : str | SampleRef
             Sample identifier or reference.
         mask_ids : Iterable[str]
@@ -750,11 +685,9 @@ class ProjectRepository:
             Decoded gating mask array.
         """
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
-        strategy_id = strategy.id if isinstance(strategy, GatingStrategyRef) else strategy
 
         return self._dataloader.load_masks(
             sample_id=sample_id,
-            strategy_id=strategy_id,
             gate_ids=mask_ids,  # Map 'mask_ids' to 'gate_ids' in dataloader
         )
 

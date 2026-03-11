@@ -53,8 +53,6 @@ class AddGateStep(BaseStep):
         if len(batch_ids) != 1:
             raise ValueError("AddGateStep only supports single batch_id per run.")
 
-        if "strategy_id" not in step_run.config:
-            raise ValueError("AddGateStep requires 'strategy_id' in config.")
         if "gate_node" not in step_run.config:
             raise ValueError("AddGateStep requires 'gate_node' in config.")
 
@@ -74,13 +72,11 @@ class AddGateStep(BaseStep):
             step.add_reason("BATCH_NOT_FOUND", f"Batch {batch_id} not found in project.")
             return {}, qc
 
-        strategy_id = step_run.config["strategy_id"]
-        try:
-            strategy = self.project.gating_strategies[strategy_id]
-        except KeyError:
+        strategy = self.project.gating_strategy
+        if strategy is None:
             step = qc.get_step("LoadGatingStrategy")
             step.flag = QCFlag.FAIL
-            step.add_reason("STRATEGY_NOT_FOUND", f"Gating strategy {strategy_id} not found in project.")
+            step.add_reason("STRATEGY_NOT_FOUND", "Gating strategy not found in project.")
             return {}, qc
 
         # Load gate
@@ -131,7 +127,6 @@ class AddGateStep(BaseStep):
             self._build_batch_adata,
             reason_code_fail="BUILD_BATCH_ADATA_ERROR",
             batch=batch_ref,
-            strategy_id=strategy_id,
             gate_node=gate_node,
             step_run=step_run,
         )
@@ -184,7 +179,6 @@ class AddGateStep(BaseStep):
             return {}, qc
 
         # Load Gate
-        strategy_id = step_run.config["strategy_id"]
         batch_id = step_run.inputs["batch_ids"][0]
         gate_node: GateNode = step_run.batch_outputs[batch_id]["gate_node"]
         gate_batch: Gate = step_run.batch_outputs[batch_id]["gate"]
@@ -201,7 +195,6 @@ class AddGateStep(BaseStep):
             "LoadParentMasks",
             self.repo.load_gating_masks,
             reason_code_fail="PARENT_MASK_ERROR",
-            strategy=strategy_id,
             sample=sample,
             mask_ids=gate_node.parent_ids
         )
@@ -270,7 +263,6 @@ class AddGateStep(BaseStep):
             "SaveGatingMasks",
             self.repo.save_gating_masks,
             reason_code_fail="SAVE_MASKS_ERROR",
-            strategy=strategy_id,
             sample=sample,
             masks=mask
         )
@@ -311,8 +303,12 @@ class AddGateStep(BaseStep):
         output_info: dict[str, Any] = step_run.batch_outputs[batch_id]
 
         # Load the gating strategy
-        strategy_id: str = step_run.config["strategy_id"]
-        strategy = self.project.gating_strategies[strategy_id]
+        strategy = self.project.gating_strategy
+        if strategy is None:
+            step = qc.get_step("LoadGatingStrategy")
+            step.flag = QCFlag.FAIL
+            step.add_reason("STRATEGY_NOT_FOUND", "Gating strategy not found in project.")
+            return {}, qc
 
         # Create GateNode from config
         gate_node: GateNode = output_info["gate_node"]
@@ -371,14 +367,13 @@ class AddGateStep(BaseStep):
 
                 gate_ids.append(quadrant_node.id)
 
-        step_run.project_updates.append({"gating_strategies": [strategy]})
+        step_run.project_updates.append({"gating_strategy": strategy})
 
         # Populate evaluable_products: gating strategy is now updated with new gate(s)
         # Include metadata about parent dependencies for QC validation
-        step_run.evaluable_products["gate_node"] = {gid: {"strategy_id": strategy_id} for gid in gate_ids}
+        step_run.evaluable_products["gate_node"] = {gid: {} for gid in gate_ids}
 
         output_info["gate_node"] = gate_node.to_dict()
-        output_info["strategy_id"] = strategy_id
         del output_info["gate"]
 
         return output_info, qc
@@ -447,7 +442,6 @@ class AddGateStep(BaseStep):
     def _build_batch_adata(
         self,
         batch: BatchRef,
-        strategy_id: str,
         gate_node: GateNode,
         seed: int,
         n_events: int,
@@ -460,8 +454,6 @@ class AddGateStep(BaseStep):
         ----------
         batch : BatchRef
             Batch whose sample_ids will be pooled.
-        strategy_id : str
-            Gating strategy identifier for loading parent masks.
         gate_node : GateNode
             Gate configuration with layer, dimensions, and parent_ids.
         step_run : StepRun
@@ -484,7 +476,7 @@ class AddGateStep(BaseStep):
 
             # Get parent mask if gate has parent
             try:
-                parent_mask = self._get_parent_mask(strategy_id, gate_node.parent_ids, sample)
+                parent_mask = self._get_parent_mask(gate_node.parent_ids, sample)
             except Exception as e:
                 raise RuntimeError(f"PARENT_MASK_ERROR: Failed to load parent masks for sample {sample_id}: {e}")
 
@@ -525,13 +517,11 @@ class AddGateStep(BaseStep):
 
         return batch_adata
 
-    def _get_parent_mask(self, strategy_id: str, parent_ids: Sequence[str], sample: SampleRef) -> NDArray[np.bool_]:
+    def _get_parent_mask(self, parent_ids: Sequence[str], sample: SampleRef) -> NDArray[np.bool_]:
         """Load parent mask for a sample.
 
         Parameters
         ----------
-        strategy_id : str
-            Gating strategy identifier
         parent_ids : Sequence[str]
             List of parent gate IDs (should be 0 or 1; multi-parent only for BooleanGates)
         sample : SampleRef
@@ -558,7 +548,6 @@ class AddGateStep(BaseStep):
             )
 
         parent_dict = self.repo.load_gating_masks(
-            strategy=strategy_id,
             sample=sample,
             mask_ids=parent_ids
         )
