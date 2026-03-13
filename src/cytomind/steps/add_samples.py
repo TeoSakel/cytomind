@@ -335,10 +335,10 @@ class AddSamplesStep(BaseStep):
         panel_dimensions = [
             DimensionDef(
                 id=ch.pnn,
-                channel_id=[ch.pnn],
+                source_dims=[ch.pnn],
                 marker=ch.pns,
                 type=ch.type,
-                use_comp=False,
+                source_layer=None,
                 transform_id="identity",
                 idx=ch.idx,
             )
@@ -348,14 +348,14 @@ class AddSamplesStep(BaseStep):
         # Build dimensions dict - always include raw, optionally include comp
         layers = {"raw": panel_dimensions}
         if any(sref.compensation is not None for sref in samples):
-            # Create comp dimensions (same as raw but with use_comp=True)
+            # Create comp dimensions as identity transforms sourced from raw.
             comp_dimensions = [
                 DimensionDef(
                     id=ch.pnn,
-                    channel_id=[ch.pnn],
+                    source_dims=[ch.pnn],
                     marker=ch.pns,
                     type=ch.type,
-                    use_comp=ch.type in ("fluorescence", "spectral"),
+                    source_layer="raw",
                     transform_id="identity",
                     idx=ch.idx,
                 )

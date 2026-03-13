@@ -8,7 +8,8 @@ except PackageNotFoundError:
 del PackageNotFoundError
 del version
 
-from cytomind.domain.flow import CompensationRef, DimensionDef, ChannelRef, TransformationRef
+from cytomind.domain.flow import CompensationRef, DimensionDef, ChannelRef
+from cytomind.domain.transforms import TransformDef
 from cytomind.domain.pipeline import Project, SampleRef, StepRun
 from cytomind.domain.qc import QCRunStatus
 from cytomind.infra.repo import ProjectRepository
@@ -26,5 +27,5 @@ __all__ = [
     "CompensationRef",
     "DimensionDef",
     "ChannelRef",
-    "TransformationRef",
+    "TransformDef",
 ]

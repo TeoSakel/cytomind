@@ -265,7 +265,8 @@ class AddGateStep(BaseStep):
             self.repo.save_gating_masks,
             reason_code_fail="SAVE_MASKS_ERROR",
             sample=sample,
-            masks=mask
+            masks=mask,
+            overwrite=True  # Overwrite any existing masks for this gate (e.g., from previous batch fit or previous runs)
         )
         if step.flag == QCFlag.FAIL:
             return {}, qc

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef, Project
+from cytomind.domain.flow import DimensionDef
 from .repo import ProjectRepository
 from cytomind.gates import GateRegistry
 from cytomind.steps import StepRegistry
@@ -993,26 +994,6 @@ class InteractivePipeline:
         StepRun
             The completed add_gate step run.
         """
-        project = self.repo.load_project()
-        sample_ids = set(project.samples.keys())
-        if not sample_ids:
-            raise ValueError("Cannot add gate: project has no samples.")
-
-        batch_id = next(
-            (bid for bid, batch in project.batches.items() if batch.sample_ids == sample_ids),
-            "",
-        )
-        if not batch_id:
-            batch_id = "__all__"
-            if batch_id in project.batches and project.batches[batch_id].sample_ids != sample_ids:
-                suffix = 1
-                while f"{batch_id}_{suffix}" in project.batches:
-                    suffix += 1
-                batch_id = f"{batch_id}_{suffix}"
-
-            self.repo.update_project_metadata(
-                batches=[BatchRef(id=batch_id, sample_ids=sample_ids, tags={"all_samples"}, meta={})]
-            )
 
         # Convert parent_id to list
         if isinstance(parent_ids, str):
@@ -1021,11 +1002,11 @@ class InteractivePipeline:
             parent_ids = list(parent_ids)
 
         if gate_type == "Boolean":
-            dime_set: set[str] = set()
+            dim_set: set[str] = set()
             for parent in parent_ids:
                 parent_node = self.repo.load_gate_node(node_id=parent)
-                dime_set.update(parent_node.dimensions)
-            dimensions = sorted(dime_set)
+                dim_set.update(parent_node.dimensions)
+            dimensions = sorted(dim_set)
 
         gate_node = {
             "id": gate_id,
@@ -1046,7 +1027,7 @@ class InteractivePipeline:
                 "custom_fit": list(custom_fit)
             },
             inputs={
-                "batch_ids": [batch_id],
+                "batch_ids": ['__all__']
             },
         )
 
@@ -1164,9 +1145,9 @@ class InteractivePipeline:
     def add_layer(
         self,
         layer: str,
-        dimensions: Iterable[Mapping[str, Any]] | None = None,
+        dimensions: Iterable[DimensionDef] | None = None,
         batch_id: str = "panel",
-        default: bool = False
+        default: bool = False,
     ) -> StepRun:
         """
         Adds a new data layer to the specified samples.
@@ -1175,8 +1156,9 @@ class InteractivePipeline:
         ----------
         layer : str
             The name of the new data layer to add.
-        dimensions : Iterable[Mapping[str, Any]] | None
-            A list of dimension definitions to create the new layer. If None, the layer will be created empty.
+        dimensions : Iterable[DimensionDef] | None
+            A list of dimension definitions to create the new layer using DimensionDef constructor.
+            If None, the layer will be created empty.
         batch_id: str
             Batch ID to which the new layer will be applied.
         default : bool
@@ -1192,21 +1174,18 @@ class InteractivePipeline:
         if layer in project.layers and dimensions is not None:
             raise ValueError(f"Data layer {layer!r} already exists use add_dimensions instead.")
 
-        if layer not in project.layers:
-            if dimensions is None:
-                raise ValueError(f"Data layer {layer!r} does not exist. Provide dimensions to create it.")
-            self.repo.add_data_layer(layer, dimensions=dimensions)
+        dimensions_dicts = [dim.to_dict() for dim in dimensions] if dimensions is not None else []
 
         return self.run_step(
             step_type="add_layer",
-            config={"layer": layer, "default": default},
+            config={"layer": layer, "dimensions": dimensions_dicts, "default": default},
             inputs={"batch_ids": [batch_id]},
         )
 
     def add_dimensions(
         self,
         layer: str,
-        dimensions: Sequence[Mapping[str, Any]],
+        dimensions: Iterable[DimensionDef],
         batch_id: str = "panel",
     ) -> StepRun:
         """
@@ -1216,8 +1195,8 @@ class InteractivePipeline:
         ----------
         layer : str
             The data layer to which dimensions will be added.
-        dimensions : Sequence[Mapping[str, Any]]
-            A list of dimension definitions to add.
+        dimensions : Iterable[DimensionDef]
+            A list of dimension definitions to add, created via DimensionDef constructor.
         batch_id: str
             Batch ID to which the new dimensions will be applied.
 
@@ -1226,11 +1205,74 @@ class InteractivePipeline:
         StepRun
             The completed add_dimensions step run.
         """
+        dimensions_dicts = [dim.to_dict() for dim in dimensions]
+
         return self.run_step(
             step_type="add_dimensions",
-            config={"layer": layer, "dimensions": dimensions},
+            config={"layer": layer, "dimensions": dimensions_dicts},
             inputs={"batch_ids": [batch_id]},
         )
+
+    def add_transformation(
+        self,
+        transform_id: str,
+        transform_type: str,
+        params: Mapping[str, Any] | None = None,
+        tags: Iterable[str] = (),
+    ) -> None:
+        """
+        Register a custom transformation in the project.
+
+        Parameters
+        ----------
+        transform_id : str
+            Unique identifier for the transformation.
+        transform_type : str
+            Human-readable type (e.g., "logicle", "asinh", "custom_transform").
+        params : Mapping[str, Any] | None
+            Parameters required by the transformation (e.g., {"param_t": 262144.0}).
+            If None, defaults to an empty dict.
+        tags : Iterable[str]
+            Optional semantic tags for downstream consumers (e.g., "boundary", "score").
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Register a custom transformation with parameters:
+
+        >>> pipeline = InteractivePipeline("/path/to/project")
+        >>> pipeline.add_transformation(
+        ...     transform_id="my_logicle",
+        ...     transform_type="logicle",
+        ...     params={"param_t": 262144.0, "param_m": 4.5, "param_a": 0.0, "param_w": 0.5}
+        ... )
+
+        Then use it in dimension definitions:
+
+        >>> dims = [
+        ...     DimensionDef(
+        ...         id="CD3",
+        ...         source_dims=["CD3"],
+        ...         marker="CD3",
+        ...         type="fluorescence",
+        ...         source_layer="comp",
+        ...         transform_id="my_logicle"
+        ...     )
+        ... ]
+        >>> pipeline.add_layer("xf", dimensions=dims)
+        """
+        from cytomind.domain.transforms import TransformDef, SCALE_TRANSFORM_TYPES
+
+        transform_ref = TransformDef(
+            id=transform_id,
+            type=transform_type,
+            params=dict(params or {}),
+            tags=tuple(set(tags) | ({"scale"} if transform_type in SCALE_TRANSFORM_TYPES else set())),
+        )
+        self.repo.update_project_metadata(transforms=[transform_ref])
 
     def add_batch(
         self,

@@ -159,7 +159,13 @@ class BaseStep:
 
         # Apply project updates, then evaluate and persist QC
         step_run = self.update_project(step_run)
-        self.evaluate_step_run(step_run)
+        try:
+            self.evaluate_step_run(step_run)
+        except Exception as exc:
+            step_qc = step_run.qc.batch_qc.get_step(self.__class__.__name__)
+            step_qc.flag = QCFlag.FAIL
+            step_qc.add_reason("STEP_QC_EVALUATION_ERROR", str(exc))
+
         step_run = self.cleanup_step_run(step_run)
         step_run.status = "completed"
 
@@ -190,11 +196,13 @@ class BaseStep:
         qc = step_run.qc.batch_qc
         try:
             batch = self.project.batches[batch_id]
+            out = {"batch": batch}
         except KeyError:
             step = qc.get_step("LoadBatch")
             step.flag = QCFlag.FAIL
             step.add_reason("BATCH_NOT_FOUND", f"Batch {batch_id} not found in project.")
-        return {}, qc
+            out = {}
+        return out, qc
 
     def run_sample(
         self,
@@ -204,7 +212,7 @@ class BaseStep:
         """
         Process one sample, optionally using batch context from prepare_batch.
 
-        Can read batch context from step_run.batch_outputs[batch_id] that was
+        Can read batch context from step_run.batch_outputs that was
         set up by prepare_batch(). Write per-sample results to
         step_run.sample_outputs[sample_id] for finalize_batch() to aggregate.
 
@@ -333,8 +341,8 @@ class BaseStep:
                     layer: [dim.id for dim in dims]
                     for layer, dims in updates["layers"].items()
                 }
-            if "transformations" in updates:
-                updates["transformations"] = list(updates["transformations"].keys())
+            if "transforms" in updates:
+                updates["transforms"] = list(updates["transforms"].keys())
             if "gating_strategy" in updates and updates["gating_strategy"] is not None:
                 updates["gating_strategy"] = updates["gating_strategy"].id
 
@@ -401,17 +409,22 @@ class BaseStep:
         qc: QCRunStatus,
         layer: str | None = None,
         mask: NDArray[np.bool_] | dict[str, NDArray[np.bool_]] | slice | None = None,
-        select: Sequence[str] | slice |None = None,
+        select: Sequence[str] | slice | None = None,
     ) -> tuple[AnnData | None, QCStepStatus]:
         """
         Load AnnData for the sample and update QC.
         Returns (AnnData, updated qc).
         """
         layer = layer or sample.default_layer
+        layer_dims = [dim.id for dim in self.project.layers.get(layer, [])]
         select = select or slice(None)
+        if isinstance(select, Sequence) and list(select) == layer_dims:
+            select = slice(None) # optimize for common case of selecting all dimensions
         mask = mask or slice(None)
         if isinstance(mask, dict):
             mask = next(iter(mask.values()))
+        if isinstance(mask, np.ndarray) and mask.all():
+            mask = slice(None) # optimize for common case of no masking
 
         return self.run_step(
             qc,
@@ -429,7 +442,8 @@ class BaseStep:
         sample: SampleRef,
         adata: AnnData,
         qc: QCRunStatus,
-        layer: str
+        layer: str,
+        overwrite: bool = False,
     ) -> tuple[None, QCStepStatus]:
         """
         Save AnnData to the sample's path and update QC.
@@ -443,5 +457,6 @@ class BaseStep:
             reason_code_fail="SAVE_ANNDATA_ERROR",
             sample_id=sample.id,
             adata=adata,
-            layer=layer
+            layer=layer,
+            overwrite=overwrite
         )

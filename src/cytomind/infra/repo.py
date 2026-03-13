@@ -6,10 +6,10 @@ import warnings
 from matplotlib.pyplot import flag
 import pandas as pd
 
-from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef, TransformationRef
+from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef
+from cytomind.domain.transforms import TransformDef
 from cytomind.domain.pipeline import Project, SampleRef, StepRun, BatchRef, RevisionSession
 from cytomind.domain.qc import EntityQCStatus
-from cytomind.domain.transforms import get_default_transformations
 from cytomind.domain.gates import GateNode, GatingStrategyRef
 from cytomind.infra.dataloader import UnifiedDataLoader
 
@@ -102,10 +102,7 @@ class ProjectRepository:
             if name is not None:
                 warnings.warn("Project name is ignored when loading existing project from disk.")
         except FileNotFoundError:
-            project = Project(
-                id=name or self.root.name,
-                transformations=get_default_transformations(),
-            )
+            project = Project(id=name or self.root.name)
             self.save_project(project)
 
 
@@ -152,7 +149,7 @@ class ProjectRepository:
         panel_catalog: Mapping[str, Sequence[ChannelRef]] = {},
         layers: Mapping[str, list[DimensionDef]] = {},
         compensations: Iterable[CompensationRef] = [],
-        transformations: Iterable[TransformationRef] = [],
+        transforms: Iterable[TransformDef] = [],
         batches: Iterable[BatchRef] = {},
         gating_strategy: GatingStrategyRef | None = None,
         drop_samples: Iterable[str] = [],
@@ -174,8 +171,8 @@ class ProjectRepository:
             Data layer dimension definitions to add/update.
         compensations : Iterable[CompensationRef], optional
             Compensation references to add/update.
-        transformations : Iterable[TransformationRef], optional
-            Transformation references to add/update.
+        transforms : Iterable[TransformDef], optional
+            Transform definitions to add/update.
         batches : Iterable[BatchRef], optional
             Iterable of BatchRef objects to add/update.
         gating_strategy : GatingStrategyRef | None, optional
@@ -226,8 +223,9 @@ class ProjectRepository:
             project.layers.update(layers)
             update_needed = True
 
-        if transformations:
-            project.transformations.update(iter_to_dict(transformations))
+        if transforms:
+            for transform in transforms:
+                project.register_transform(transform)
             update_needed = True
 
         if gating_strategy is not None:
@@ -305,58 +303,6 @@ class ProjectRepository:
             raise KeyError(f"Data layer '{layer}' not found in project.")
         df = pd.DataFrame.from_records([dim.to_record() for dim in project.layers[layer]])
         return df.set_index("id", drop=False).sort_values("idx")
-
-    def add_data_layer(self, layer: str, dimensions: Iterable[Mapping[str, Any]]) -> None:
-        """
-        Create a new data layer with provided dimensions.
-
-        Parameters
-        ----------
-        layer : str
-            Name of the new data layer.
-        dimensions : Iterable[Mapping[str, Any]]
-            Sequence of dimension records (dict-like) to create DimensionDef instances.
-
-        Raises
-        ------
-        ValueError
-            If the named layer already exists.
-        """
-        project = self.load_project()
-        if layer in project.layers:
-            raise ValueError(f"Data layer '{layer}' already exists. Call update_layer_dimensions instead.")
-        dim_refs = [DimensionDef.from_dict(dim) for dim in dimensions]
-        for i, dim in enumerate(dim_refs):
-            dim.idx = i
-        self.update_project_metadata(layers={layer: dim_refs})
-
-    def update_layer_dimensions(self, layer: str, dimensions: Iterable[Mapping[str, Any]]) -> None:
-        """
-        Add or update dimensions for an existing data layer.
-
-        If the layer does not exist it will be created.
-
-        Parameters
-        ----------
-        layer : str
-            Name of the data layer to update.
-        dimensions : Iterable[Mapping[str, Any]]
-            Sequence of dimension records (dict-like) to be added or updated.
-        """
-        project = self.load_project()
-        if layer not in project.layers:
-            warnings.warn(f"Data layer '{layer}' does not exist. Calling add_data_layer instead.")
-            self.add_data_layer(layer, dimensions)
-            return
-
-        cur_refs = {dim.id: dim for dim in project.layers[layer]}
-        new_refs = [DimensionDef.from_dict(dim) for dim in dimensions]
-        for dim in new_refs:
-            dim.idx = cur_refs[dim.id].idx if dim.id in cur_refs else len(cur_refs)
-            cur_refs[dim.id] = dim
-
-        updated_layers = {layer: sorted(list(cur_refs.values()))}
-        self.update_project_metadata(layers=updated_layers)
 
     # ------------- Sample I/O -----------------
 
@@ -601,7 +547,7 @@ class ProjectRepository:
             raise KeyError("Gating strategy not found in project.")
         return project.gating_strategy.get_node(node_id)
 
-    def save_gate_node(self, node: GateNode, force: bool = False) -> None:
+    def save_gate_node(self, node: GateNode, overwrite: bool = True) -> None:
         """
         Save a gating node definition to disk.
 
@@ -611,13 +557,13 @@ class ProjectRepository:
         ----------
         node: GateNode
             Gating node definition to save.
-        force : bool
+        overwrite : bool
             If True, overwrite existing node.
         """
         return self._dataloader.save_gate_node(
             node=node,
             serialize_func=lambda n: n.to_dict(),
-            overwrite=force,  # Map 'force' param to 'overwrite' context
+            overwrite=overwrite,
         )
 
     def load_gating_strategy(self) -> GatingStrategyRef:
@@ -643,7 +589,7 @@ class ProjectRepository:
         self,
         sample: str | SampleRef,
         masks: Mapping[str, Sequence[bool] | NDArray[np.bool_]],
-        force: bool = False
+        overwrite: bool = True
     ) -> None:
         """
         Save gating mask for a given strategy and sample.
@@ -652,7 +598,7 @@ class ProjectRepository:
         ----------
         sample : str | SampleRef
             Sample identifier or reference.
-        mask : Mapping[str, Sequence[bool]]
+        masks : Mapping[str, Sequence[bool] | NDArray[np.bool_]]
             Gating mask data to save.
         """
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
@@ -660,7 +606,7 @@ class ProjectRepository:
         return self._dataloader.save_masks(
             sample_id=sample_id,
             masks=masks,
-            overwrite=force,  # Map 'force' param to 'overwrite' context
+            overwrite=overwrite,
         )
 
     def load_gating_masks(

@@ -178,13 +178,13 @@ class CompensateStep(BaseStep):
         qc_iter = step_run.qc.sample_qc.items()
         samples = [self.project.samples[sid] for sid, qc in qc_iter if qc.overall_flag != QCFlag.FAIL]
 
-        # Create "comp" dimension layer if not exists, copying from "raw" with use_comp=True
+        # Create "comp" dimension layer if not exists, copying from "raw" with raw provenance.
         dimensions = {}
         if "raw" in self.project.layers and "comp" not in self.project.layers:
             comp_dimensions = []
             for raw_dim in self.project.layers["raw"]:
                 comp_dim = raw_dim.copy()
-                comp_dim.use_comp = comp_dim.type in ("fluorescence", "spectral")
+                comp_dim.source_layer = "raw"
                 comp_dimensions.append(comp_dim)
             dimensions["comp"] = comp_dimensions
 

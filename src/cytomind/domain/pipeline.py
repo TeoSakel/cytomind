@@ -10,7 +10,8 @@ import json
 import numpy as np
 from pandas import DataFrame
 
-from .flow import ChannelRef, DimensionDef, CompensationRef, TransformationRef
+from .flow import ChannelRef, DimensionDef, CompensationRef
+from .transforms import TransformDef, make_default_transform_def
 from .gates import GatingStrategyRef
 from .qc import EntityQCStatus
 
@@ -43,7 +44,7 @@ class Project:
     batches: dict[str, BatchRef] = field(default_factory=dict)
     layers: dict[str, list[DimensionDef]] = field(default_factory=dict)  # layer -> dimensions
     compensations: dict[str, CompensationRef] = field(default_factory=dict)
-    transformations: dict[str, TransformationRef] = field(default_factory=dict)
+    transforms: dict[str, TransformDef] = field(default_factory=dict)
     gating_strategy: GatingStrategyRef = field(default_factory=GatingStrategyRef)
 
     @property
@@ -66,6 +67,48 @@ class Project:
         df.set_index("pnn", inplace=True, drop=False)
         return df.loc[:, df.notnull().any()]  # drop empty cols
 
+    def get_channel_ref(self, channel_id: str, panel_id: str = "panel") -> ChannelRef | None:
+        channels = self.panel_catalog.get(panel_id, [])
+        for channel in channels:
+            if channel.pnn == channel_id:
+                return channel
+        return None
+
+    def register_transform(self, transform: TransformDef) -> str:
+        if transform.id in self.transforms:
+            existing = self.transforms[transform.id]
+            if existing.type != transform.type or dict(existing.params) != dict(transform.params):
+                raise ValueError(f"Conflicting transform definition for id '{transform.id}'.")
+            return transform.id
+        self.transforms[transform.id] = transform
+        return transform.id
+
+    def get_or_create_transform(
+        self,
+        transform_type: str,
+        channel_id: str | None = None,
+        panel_id: str = "panel",
+        params_override: Mapping[str, Any] | None = None,
+        tags: Iterable[str] = (),
+    ) -> TransformDef:
+        channel_ref = self.get_channel_ref(channel_id, panel_id=panel_id) if channel_id is not None else None
+        transform = make_default_transform_def(
+            transform_type=transform_type,
+            channel_ref=channel_ref,
+            params_override=params_override,
+            tags=tags,
+        )
+        self.register_transform(transform)
+        return self.transforms[transform.id]
+
+    def resolve_transform(self, transform_id: str) -> TransformDef:
+        if transform_id not in self.transforms:
+            raise KeyError(f"Unknown transform id '{transform_id}'.")
+        return self.transforms[transform_id]
+
+    def resolve_dimension_transform(self, dimension: DimensionDef) -> TransformDef:
+        return self.resolve_transform(dimension.transform_id)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Project":
         panel_catalog = {k: [ChannelRef.from_dict(ch) for ch in v] for k, v in data.get("panel_catalog", {}).items()}
@@ -80,7 +123,7 @@ class Project:
             panel_catalog=panel_catalog,
             layers={k: [DimensionDef.from_dict(dim) for dim in v] for k, v in data.get("layers", {}).items()},
             compensations={k: CompensationRef.from_dict(v) for k, v in data.get("compensations", {}).items()},
-            transformations={k: TransformationRef.from_dict(v) for k, v in data.get("transformations", {}).items()},
+            transforms={k: TransformDef.from_dict(v) for k, v in data.get("transforms", {}).items()},
             batches={k: BatchRef.from_dict(v) for k, v in data.get("batches", {}).items()},
             gating_strategy=GatingStrategyRef.from_dict(gating_strategy_data) if gating_strategy_data else GatingStrategyRef(),
         )
@@ -95,7 +138,7 @@ class Project:
             "panel_catalog": _serialize_list_catalog(self.panel_catalog),
             "layers": _serialize_list_catalog(self.layers),
             "compensations": {k: v.to_dict() for k, v in self.compensations.items()},
-            "transformations": {k: v.to_dict() for k, v in self.transformations.items()},
+            "transforms": {k: v.to_dict() for k, v in self.transforms.items()},
             "batches": {k: v.to_dict() for k, v in self.batches.items()},
             "gating_strategy": self.gating_strategy.to_dict(),
         }

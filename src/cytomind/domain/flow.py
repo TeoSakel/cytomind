@@ -153,47 +153,24 @@ class ChannelRef:
             type=data["type"],
         )
 
-@dataclass
-class TransformationRef:
-    id: str      # key to transformation registry
-    type: str    # human readable "logicle", "asinh", ...
-    params: dict[str, Any] = field(default_factory=dict) # parameters for the transform
-
-    def copy(self) -> "TransformationRef":
-        return TransformationRef(
-            id=self.id,
-            type=self.type,
-            params=self.params.copy(),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "TransformationRef":
-        return TransformationRef(
-            id=data["id"],
-            type=data["type"],
-            params=data.get("params", {}),
-        )
 
 @dataclass
 class DimensionDef:
     id: str                        # unique id for the dimension = var.index
-    channel_id: list[str]          # link to ChannelRefs
+    source_dims: list[str]         # upstream dimensions used as transform inputs
     marker: str | None             # human-readable marker name
     type: str                      # "fluorescence", "scatter", "time", ...
-    use_comp: bool                 # True/False
-    transform_id: str = "identity" # link to TransformationRef
+    source_layer: str | None = None  # source layer containing source_dims
+    transform_id: str = "identity"  # link to TransformDef
     idx: int | None = None         # resolved index in data var
 
     def copy(self) -> "DimensionDef":
         return DimensionDef(
             id=self.id,
-            channel_id=self.channel_id.copy(),
+            source_dims=self.source_dims.copy(),
             marker=self.marker,
             type=self.type,
-            use_comp=self.use_comp,
+            source_layer=self.source_layer,
             transform_id=self.transform_id,
             idx=self.idx,
         )
@@ -205,10 +182,10 @@ class DimensionDef:
     def from_dict(cls, data: Mapping[str, Any]) -> "DimensionDef":
         return DimensionDef(
             id=data["id"],
-            channel_id=data["channel_id"],
+            source_dims=list(data.get("source_dims", [])),
             marker=data.get("marker", None),
             type=data["type"],
-            use_comp=data["use_comp"],
+            source_layer=data.get("source_layer", None),
             transform_id=data.get("transform_id", "identity"),
             idx=data.get("idx", None),
         )
@@ -217,10 +194,10 @@ class DimensionDef:
     def to_record(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "channel_id": ",".join(self.channel_id),
+            "source_dims": ",".join(self.source_dims),
             "marker": self.marker,
             "type": self.type,
-            "use_comp": self.use_comp,
+            "source_layer": self.source_layer,
             "transform_id": self.transform_id,
             "idx": self.idx,
         }
@@ -229,10 +206,10 @@ class DimensionDef:
     def from_record(cls, record: Mapping[str, Any]) -> "DimensionDef":
         return DimensionDef(
             id=record["id"],
-            channel_id=record["channel_id"].split(","),
+            source_dims=record["source_dims"].split(",") if record.get("source_dims") else [],
             marker=record.get("marker"),
             type=record["type"],
-            use_comp=record["use_comp"],
+            source_layer=record.get("source_layer", None),
             transform_id=record.get("transform_id", "identity"),
             idx=record.get("idx", None),
         )
@@ -250,8 +227,8 @@ class DimensionDef:
         if not isinstance(other, DimensionDef):
             raise NotImplementedError
         return (
-            self.channel_id == other.channel_id and
+            self.source_dims == other.source_dims and
             self.transform_id == other.transform_id and
             self.marker == other.marker and  # probably not needed
-            self.use_comp == other.use_comp
+            self.source_layer == other.source_layer
         )
