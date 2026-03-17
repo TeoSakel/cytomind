@@ -156,13 +156,15 @@ class ChannelRef:
 
 @dataclass
 class DimensionDef:
-    id: str                        # unique id for the dimension = var.index
-    source_dims: list[str]         # upstream dimensions used as transform inputs
-    marker: str | None             # human-readable marker name
-    type: str                      # "fluorescence", "scatter", "time", ...
-    source_layer: str | None = None  # source layer containing source_dims
+    id: str                         # unique id for the dimension = var.index
+    source_dims: list[str]          # upstream dimensions used as transform inputs
+    marker: str | None              # human-readable marker name
+    type: str                       # "fluorescence", "scatter", "time", ...
+    source_layer: str | None = None # source layer containing source_dims
     transform_id: str = "identity"  # link to TransformDef
-    idx: int | None = None         # resolved index in data var
+    idx: int | None = None          # resolved index in data var
+    range_min: float | None = None  # min value across all samples (calculated during add_layer/add_dimensions)
+    range_max: float | None = None  # max value across all samples (calculated during add_layer/add_dimensions)
 
     def copy(self) -> "DimensionDef":
         return DimensionDef(
@@ -173,6 +175,8 @@ class DimensionDef:
             source_layer=self.source_layer,
             transform_id=self.transform_id,
             idx=self.idx,
+            range_min=self.range_min,
+            range_max=self.range_max,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -188,6 +192,8 @@ class DimensionDef:
             source_layer=data.get("source_layer", None),
             transform_id=data.get("transform_id", "identity"),
             idx=data.get("idx", None),
+            range_min=data.get("range_min", None),
+            range_max=data.get("range_max", None),
         )
 
 
@@ -200,6 +206,8 @@ class DimensionDef:
             "source_layer": self.source_layer,
             "transform_id": self.transform_id,
             "idx": self.idx,
+            "range_min": self.range_min,
+            "range_max": self.range_max,
         }
 
     @classmethod
@@ -212,6 +220,8 @@ class DimensionDef:
             source_layer=record.get("source_layer", None),
             transform_id=record.get("transform_id", "identity"),
             idx=record.get("idx", None),
+            range_min=record.get("range_min", None),
+            range_max=record.get("range_max", None),
         )
 
     # ---- comparison operations: order by idx, None goes last ----

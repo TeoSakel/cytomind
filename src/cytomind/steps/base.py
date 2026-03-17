@@ -1,6 +1,6 @@
 from __future__ import annotations
 from re import A
-from typing import Any, Callable, TypeVar, Sequence, TYPE_CHECKING
+from typing import Any, Callable, TypeVar, Sequence, Mapping, TYPE_CHECKING
 
 import numpy as np
 from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
@@ -145,7 +145,8 @@ class BaseStep:
 
         # If no batches specified but sample_ids provided, process samples directly
         if not batch_ids and input_sample_ids:
-            for sample_id in input_sample_ids:
+            samples_to_process = input_sample_ids
+            for sample_id in samples_to_process:
                 try:
                     output_info, qc = self.run_sample(sample_id, step_run)
                 except Exception as exc:
@@ -157,6 +158,12 @@ class BaseStep:
 
                 step_run.sample_outputs[sample_id] = output_info
 
+        # On hard failure, persist a serializable step record but skip project mutation and QC evaluation.
+        if step_run.qc.overall_flag == QCFlag.FAIL:
+            step_run = self.cleanup_step_run(step_run, failed=True)
+            step_run.status = "failed"
+            return step_run
+
         # Apply project updates, then evaluate and persist QC
         step_run = self.update_project(step_run)
         try:
@@ -166,7 +173,7 @@ class BaseStep:
             step_qc.flag = QCFlag.FAIL
             step_qc.add_reason("STEP_QC_EVALUATION_ERROR", str(exc))
 
-        step_run = self.cleanup_step_run(step_run)
+        step_run = self.cleanup_step_run(step_run, failed=False)
         step_run.status = "completed"
 
         return step_run
@@ -312,13 +319,14 @@ class BaseStep:
 
         return step_run
 
-    def cleanup_step_run(self, step_run: StepRun) -> StepRun:
+    def cleanup_step_run(self, step_run: StepRun, failed: bool = False) -> StepRun:
         """
         Cleanup any temporary data in step_run before persisting.
 
-        Removes custom objects from project_updates and keeps only IDs
-        to avoid JSON serialization issues. Subclasses can override
-        to remove additional large intermediate data structures if needed.
+        Removes custom objects from project_updates and batch_outputs and keeps
+        only IDs where possible to avoid JSON serialization issues.
+        Subclasses can override to remove additional large intermediate data
+        structures if needed.
 
         Args:
             step_run: execution context to cleanup
@@ -326,6 +334,13 @@ class BaseStep:
         Returns:
             step_run: with custom objects replaced by IDs
         """
+        if failed:
+            step_run.project_updates = self._to_serializable(step_run.project_updates)
+            step_run.sample_outputs = self._to_serializable(step_run.sample_outputs)
+            step_run.batch_outputs = self._to_serializable(step_run.batch_outputs)
+            step_run.evaluable_products = self._to_serializable(step_run.evaluable_products)
+            return step_run
+
         # Clean up project_updates: keep only IDs of updated entries
         for updates in step_run.project_updates:
             if "samples" in updates:
@@ -346,7 +361,53 @@ class BaseStep:
             if "gating_strategy" in updates and updates["gating_strategy"] is not None:
                 updates["gating_strategy"] = updates["gating_strategy"].id
 
+        # Clean up batch_outputs: BaseStep.prepare_batch stores the BatchRef for
+        # in-memory execution, but the persisted StepRun should only keep the id.
+        for batch_output in step_run.batch_outputs.values():
+            if "batch" in batch_output and batch_output["batch"] is not None:
+                batch_output["batch"] = batch_output["batch"].id
+
         return step_run
+
+    def _to_serializable(self, value: Any) -> Any:
+        """Convert values to JSON-safe containers, dropping unsupported artifacts."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, np.ndarray):
+            return None
+
+        if type(value).__name__ == "DataFrame":
+            return None
+
+        if isinstance(value, Mapping):
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                serialized = self._to_serializable(item)
+                if serialized is not None:
+                    out[str(key)] = serialized
+            return out
+
+        if isinstance(value, (list, tuple, set)):
+            out_list = []
+            for item in value:
+                serialized = self._to_serializable(item)
+                if serialized is not None:
+                    out_list.append(serialized)
+            return out_list
+
+        if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+            try:
+                return self._to_serializable(value.to_dict())
+            except Exception:
+                return None
+
+        if hasattr(value, "id"):
+            value_id = getattr(value, "id", None)
+            if isinstance(value_id, (str, int)):
+                return value_id
+
+        return None
 
     # --- utility methods for steps -----
 

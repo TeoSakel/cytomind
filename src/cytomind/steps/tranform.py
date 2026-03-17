@@ -1,4 +1,5 @@
 from __future__ import annotations
+from turtle import st
 from typing import Iterable, TYPE_CHECKING
 
 from cytomind.domain.flow import DimensionDef
@@ -13,10 +14,9 @@ import pandas as pd
 import anndata as ad
 
 if TYPE_CHECKING:
-    from cytomind.domain.pipeline import SampleRef, StepRun
+    from cytomind.domain.pipeline import StepRun
     from cytomind.domain.pipeline import Project
 else:
-    SampleRef = object
     StepRun = object
     Project = object
 
@@ -105,8 +105,16 @@ class AddLayerStep(BaseStep):
         dim_plan: dict[str, list[DimensionDef]] = batch_output["dimension_plan"]
         required_layer: dict[str, list[str] | slice] = batch_output["required_layer"]
 
-
         n_events = sample.n_events
+
+        # Handle empty sample: save zero-row adata from dimension names, leave ranges as None
+        if n_events == 0:
+            vars_df = pd.DataFrame.from_records([dim.to_record() for dim in sorted(dimensions)])
+            vars_df.set_index("id", drop=False, inplace=True)
+            adata_xf = ad.AnnData(X=np.zeros((0, len(dimensions))), var=vars_df) # pyright: ignore[reportArgumentType]
+            self.save_adata(sample, adata_xf, qc, layer=target_layer)
+            return {}, qc
+
         new_X = np.zeros((n_events, len(dimensions)))
         step_xform = qc.get_step("apply_transformations")
         adata: ad.AnnData | None = None
@@ -133,45 +141,60 @@ class AddLayerStep(BaseStep):
             # this should not happen since dimensions should have been validated to have source_dims, but just in case
             adata = ad.AnnData(X=new_X)
 
-        # 3) Save results
+        # Compute per-column min/max in one vectorized pass; columns with no valid value get NaN
+        step = qc.get_step("compute_sample_ranges")
+        try:
+            valid_mask = ~(np.isnan(new_X) | np.isinf(new_X))
+            has_valid = np.any(valid_mask, axis=0)
+            min_vals = np.where(has_valid, np.min(new_X, axis=0, where=valid_mask, initial=np.inf), np.nan).tolist()
+            max_vals = np.where(has_valid, np.max(new_X, axis=0, where=valid_mask, initial=-np.inf), np.nan).tolist()
+        except Exception as e:
+            step.flag = QCFlag.FAIL
+            step.add_reason(
+                code="RANGE_COMPUTE_ERROR",
+                message=f"Error computing min/max ranges for sample {sample_id}: {e}"
+            )
+            return {}, qc
+
+        # 2) Save results
         vars_df = pd.DataFrame.from_records([dim.to_record() for dim in sorted(dimensions)])
+        vars_df["range_min"] = min_vals
+        vars_df["range_max"] = max_vals
         vars_df.set_index("id", drop=False, inplace=True)
         adata_xf = ad.AnnData(X=new_X, obs=adata.obs.copy(), var=vars_df) # pyright: ignore[reportArgumentType]
         self.save_adata(sample, adata_xf, qc, layer=target_layer)
+        return {"min_vals": min_vals, "max_vals": max_vals}, qc
+
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
+        """Aggregate ranges from all samples in the batch using min/max vectors."""
+
+        output_info = step_run.batch_outputs.get(batch_id, {})
+        updates = {}
+
+        if "dimensions" not in output_info:
+            return {}, qc
+
+        target_layer = step_run.config["layer"]
+        dimensions = _update_dim_ranges(step_run, qc, output_info["dimensions"])
+        if dimensions is None:
+            return {}, qc
+        updates["layers"] = {target_layer: dimensions}
+
+        # Persist default-layer sample updates through the standard project_updates path.
+        if step_run.config.get("default", True):
+            samples_to_update = []
+            for sample_id, sample_qc in step_run.qc.sample_qc.items():
+                if sample_qc.overall_flag == QCFlag.FAIL:
+                    continue
+                sample_ref = self.project.samples[sample_id]
+                sample_ref.default_layer = target_layer
+                samples_to_update.append(sample_ref)
+
+            if samples_to_update:
+                updates["samples"] = samples_to_update
+
+        step_run.project_updates.append(updates)
         return {}, qc
-
-    def update_project(self, step_run: StepRun) -> StepRun:
-        layer: str = step_run.config["layer"]
-        dimensions: list[DimensionDef] = []
-        for output in step_run.batch_outputs.values():
-            if "dimensions" in output:
-                dimensions = output["dimensions"]
-                break
-        if not dimensions:
-            return step_run
-
-        samples_to_update: list[SampleRef] = []
-        default: bool = step_run.config.get("default", True)
-        if default:
-            for sid, qc in step_run.qc.sample_qc.items():
-                if qc.overall_flag != QCFlag.FAIL:
-                    sample = self.project.samples[sid]
-                    sample.default_layer = layer
-                    samples_to_update.append(sample)
-
-        self.repo.update_project_metadata(
-            layers={layer: sorted(dimensions)},
-            samples=samples_to_update,
-        )
-        return step_run
-
-    def cleanup_step_run(self, step_run: StepRun) -> StepRun:
-        step_run = super().cleanup_step_run(step_run)
-        for batch_output in step_run.batch_outputs.values():
-            batch_output.pop("dimensions", None)
-            batch_output.pop("dimension_plan", None)
-            batch_output.pop("required_layer", None)
-        return step_run
 
 
 @register_step("add_dimensions")
@@ -314,9 +337,6 @@ class AddDimensionsStep(BaseStep):
         required_layer: dict[str, list[str]] = batch_output["required_layer"]
 
         if not new_dims:
-            step = qc.get_step(f"update_dimensions_{layer}")
-            step.flag = QCFlag.PASS
-            step.add_reason("INFO", f"No new dimensions to add in layer {layer}.")
             return {}, qc
 
         # 2) load target
@@ -324,11 +344,20 @@ class AddDimensionsStep(BaseStep):
         if target_adata is None or target_adata.X is None:
             return {}, qc
 
+        n_obs = target_adata.n_obs
+
+        # Handle empty sample: return original adata with no ranges
+        if n_obs == 0:
+            final_var = pd.DataFrame.from_records([dim.to_record() for dim in final_dim])
+            final_var.set_index("id", drop=False, inplace=True)
+            adata_xf = ad.AnnData(X=np.zeros((0, len(final_dim))), obs=target_adata.obs.copy(), var=final_var) # pyright: ignore[reportArgumentType]
+            self.save_adata(sample, adata_xf, qc, layer=layer, overwrite=True)
+            return {}, qc
+
         # 3) Apply transforms and build final X
         step_apply = qc.get_step("apply_transformations")
         final_var = pd.DataFrame.from_records([dim.to_record() for dim in final_dim])
         final_var.set_index("id", drop=False, inplace=True)
-        n_obs = target_adata.n_obs
         n_var_added = len(final_dim) - target_adata.n_vars
         final_X = np.concatenate([target_adata.X, np.zeros((n_obs, n_var_added))], axis=1) # pyright: ignore[reportCallIssue, reportArgumentType]
         source_adatas: dict[str, ad.AnnData] = {layer: target_adata}
@@ -354,35 +383,31 @@ class AddDimensionsStep(BaseStep):
                         f"Error applying transformation {transform_def.id} to dimension {dim.id}: {e}"
                     )
                     return {}, qc
+                final_var.at[dim.id, "range_min"] = float(np.nanmin(final_X[:, j]))
+                final_var.at[dim.id, "range_max"] = float(np.nanmax(final_X[:, j]))
 
         # 4) Save results
         adata_xf = ad.AnnData(X=final_X, obs=target_adata.obs.copy(), var=final_var) # pyright: ignore[reportArgumentType]
         self.save_adata(sample, adata_xf, qc, layer=layer, overwrite=True)
+
+        # Compute per-column min/max for new dimensions only; columns with no valid value get NaN
+        min_vals = final_var["range_min"].values.tolist()
+        max_vals = final_var["range_max"].values.tolist()
+        return {"min_vals": min_vals, "max_vals": max_vals}, qc
+
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
+        """Aggregate ranges for new dimensions across all samples in the batch."""
+        output_info = step_run.batch_outputs.get(batch_id, {})
+        if "final_dimensions" not in output_info:
+            return {}, qc
+
+        dimensions = _update_dim_ranges(step_run, qc, output_info["final_dimensions"])
+        if dimensions is None:
+            return {}, qc
+
+        layer = step_run.config["layer"]
+        step_run.project_updates.append({"layers": {layer: dimensions}})
         return {}, qc
-
-    def update_project(self, step_run: StepRun) -> StepRun:
-        layer: str = step_run.config["layer"]
-        final_dim: list[DimensionDef] | None = None
-        for output in step_run.batch_outputs.values():
-            if "final_dimensions" in output:
-                final_dim = output["final_dimensions"]
-                break
-        if final_dim is None:
-            return step_run
-        self.repo.update_project_metadata(layers={layer: final_dim})
-        return step_run
-
-    def merge_config(self, step_run: StepRun) -> dict:
-        return super().merge_config(step_run)
-
-    def cleanup_step_run(self, step_run: StepRun) -> StepRun:
-        step_run = super().cleanup_step_run(step_run)
-        for batch_output in step_run.batch_outputs.values():
-            batch_output.pop("new_dimensions", None)
-            batch_output.pop("final_dimensions", None)
-            batch_output.pop("dimension_plan", None)
-            batch_output.pop("required_layer", None)
-        return step_run
 
 
 def validate_dimensions(
@@ -450,3 +475,41 @@ def validate_dimensions(
         return step_check
 
     return step_check
+
+
+def _update_dim_ranges(step_run: StepRun, qc: QCRunStatus, dimensions: list[DimensionDef]) -> list[DimensionDef] | None:
+    # Stack per-sample min/max vectors into 2-D arrays and reduce along sample axis
+
+    step = qc.get_step("aggregate_ranges")
+    sample_mins, sample_maxs = [], []
+    for sid, out in step_run.sample_outputs.items():
+        if step_run.qc.sample_qc[sid].overall_flag == QCFlag.FAIL:
+            continue
+
+        if "min_vals" in out and "max_vals" in out:
+            sample_mins.append(out.pop("min_vals"))
+            sample_maxs.append(out.pop("max_vals"))
+
+    if sample_mins:
+        aggregated_min = np.nanmin(np.asarray(sample_mins), axis=0)  # (n_dms,)
+        aggregated_max = np.nanmax(np.asarray(sample_maxs), axis=0)
+        if len(dimensions) != len(aggregated_min):
+            step.flag = QCFlag.WARN
+            step.add_reason(
+                code="RANGE_DIMENSION_MISMATCH",
+                message=(
+                    f"Number of dimensions ({len(dimensions)}) does not match length of aggregated range vectors "
+                    f"({len(aggregated_min)}); cannot update dimension ranges."
+                ),
+            )
+            return
+        for min_val, max_val, dim in zip(aggregated_min, aggregated_max, dimensions):
+            if not np.isnan(min_val):
+                dim.range_min = float(min(min_val, dim.range_min) if dim.range_min is not None else min_val)
+            if not np.isnan(max_val):
+                dim.range_max = float(max(max_val, dim.range_max) if dim.range_max is not None else max_val)
+    else:
+        step.flag = QCFlag.WARN
+        step.add_reason("NO_RANGES_CALCULATED", "No valid data found to calculate ranges.")
+
+    return dimensions

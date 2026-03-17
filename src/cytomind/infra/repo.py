@@ -212,7 +212,7 @@ class ProjectRepository:
             update_needed = True
 
         if panel_catalog:
-            project.panel_catalog = {k: list(v) for k, v in panel_catalog.items()}
+            project.panel_catalog.update({k: list(v) for k, v in panel_catalog.items()})
             update_needed = True
 
         if compensations:

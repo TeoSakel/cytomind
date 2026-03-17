@@ -1,10 +1,12 @@
 from __future__ import annotations
+from turtle import update
 
 from cytomind.domain.pipeline import StepRun
 from cytomind.domain.qc import QCRunStatus, QCFlag
 from .base import BaseStep
 from . import register_step
 
+import numpy as np
 import flowkit as fk
 import anndata as ad
 
@@ -77,27 +79,70 @@ class LoadFCS(BaseStep):
             return {}, qc
 
         # update sample metadata
-        sample.n_events = adata.n_obs
-        if sample.n_events != fcs.event_count:
+        n_events = int(adata.n_obs)
+        if n_events != fcs.event_count:
             step_load.flag = QCFlag.WARN
             step_load.add_reason(
                 code="MALFORMED_FCS",
                 message=(f"Event count mismatch between FCS file",
-                         f"({fcs.event_count}) and loaded data ({sample.n_events})."))
+                         f"({fcs.event_count}) and loaded data ({n_events})."))
 
         output_info = {
-            "inputs": [sample.fcs_path.as_posix()],
-            "n_events": sample.n_events,
-            "outputs": [self.repo.sample_adata_path(sample.id, layer=layer).as_posix()],
+            "n_events": n_events,
+            "layer": layer,
         }
+        # Compute actual per-channel min/max for range refinement
+        if X.shape[0] > 0:
+            valid_mask = ~(np.isnan(X) | np.isinf(X))
+            has_valid = np.any(valid_mask, axis=0)
+            output_info["min_vals"] = np.where(has_valid, np.min(X, axis=0, where=valid_mask, initial=np.inf), np.nan).tolist()
+            output_info["max_vals"] = np.where(has_valid, np.max(X, axis=0, where=valid_mask, initial=-np.inf), np.nan).tolist()
         return output_info, qc
 
-    def update_project(self, step_run: StepRun) -> StepRun:
-        samples = [
-            self.project.samples[sid]
-            for sid, qc in step_run.qc.sample_qc.items() if qc.overall_flag != QCFlag.FAIL
-         ]
-        for ref in samples:
-            ref.n_events = step_run.sample_outputs[ref.id].get("n_events", 0)
-        self.repo.update_project_metadata(samples=samples)
-        return step_run
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
+        """Aggregate per-channel ranges within batch, update dim objects, store in batch output."""
+
+        updates: dict = {}
+        step = qc.get_step("aggregate_ranges")
+
+        samples_to_update = []
+        layer_ranges: dict[str, dict[str, list[float]]] = {}
+        for sid, out in step_run.sample_outputs.items():
+            sample_qc = step_run.qc.sample_qc.get(sid)
+            if sample_qc is not None and sample_qc.overall_flag == QCFlag.FAIL:
+                continue
+
+            sample_ref = self.project.samples[sid]
+            sample_ref.n_events = int(out["n_events"])
+            samples_to_update.append(sample_ref)
+
+            if "min_vals" not in out:
+                continue
+            lyr = out["layer"]
+            layer_ranges.setdefault(lyr, {}).setdefault("mins", []).append(out.pop("min_vals"))
+            layer_ranges.setdefault(lyr, {}).setdefault("maxs", []).append(out.pop("max_vals"))
+
+        if samples_to_update:
+            updates["samples"] = samples_to_update
+
+        if not layer_ranges:
+            step.flag = QCFlag.WARN
+            step.add_reason("NO_RANGE_DATA", "No valid sample data found to compute ranges.")
+            step_run.project_updates.append(updates)
+            return {}, qc
+
+        updated_layers: dict = {}
+        for lyr, ranges in layer_ranges.items():
+            agg_min = np.nanmin(np.asarray(ranges["mins"]), axis=0)
+            agg_max = np.nanmax(np.asarray(ranges["maxs"]), axis=0)
+            has_range = ~np.isnan(agg_min) & ~np.isnan(agg_max)
+            dims = [dim.copy() for dim in self.project.layers[lyr]]
+            for idx, dim in enumerate(dims):
+                if has_range[idx]:
+                    dim.range_min = float(np.min([agg_min[idx], dim.range_min]) if dim.range_min is not None else agg_min[idx])
+                    dim.range_max = float(np.max([agg_max[idx], dim.range_max]) if dim.range_max is not None else agg_max[idx])
+            updated_layers[lyr] = dims
+
+        updates["layers"] = updated_layers
+        step_run.project_updates.append(updates)
+        return {}, qc

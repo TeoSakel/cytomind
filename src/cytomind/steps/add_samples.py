@@ -230,8 +230,14 @@ class AddSamplesStep(BaseStep):
             step_panel.add_reason("NO_PANELS", "No valid panels extracted from any sample.")
             return {}, qc
 
-        # Identify the primary panel group (largest by sample count)
-        panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
+        # Identify the primary panel group.
+        # If the project already has a main panel, prefer its hash over the majority group.
+        existing_panel = self.project.panel_catalog.get("panel")
+        if existing_panel:
+            existing_hash = _compute_panel_hash(existing_panel)
+            panel_hash = existing_hash if existing_hash in panel_groups else max(panel_groups.items(), key=lambda x: len(x[1]))[0]
+        else:
+            panel_hash = max(panel_groups.items(), key=lambda x: len(x[1]))[0]
         panel = panel_cache[panel_hash]
         sample_ids = panel_groups[panel_hash]
 
@@ -265,8 +271,9 @@ class AddSamplesStep(BaseStep):
             for comp_rec in sid_comps:
                 dedupe_key = (comp_rec["key"], comp_rec["mat_txt"])
                 if dedupe_key not in comp_dedupe:
+                    existing_comp = self.project.compensations.get(comp_rec["id"])
                     comp_rec["source"] = "fcs"
-                    comp_rec["batch"] = [sid]
+                    comp_rec["batch"] = (list(existing_comp.batch) if existing_comp else []) + [sid]
                     comp_dedupe[dedupe_key] = CompensationRef.from_dict(comp_rec)
                 else:
                     comp_dedupe[dedupe_key].batch.append(sid)
@@ -293,10 +300,12 @@ class AddSamplesStep(BaseStep):
         # 5) Create batches
         step_create_batches = qc.get_step("create_batches")
         batches = []
+        existing_panel_batch = self.project.batches.get("panel")
+        panel_batch_samples = (existing_panel_batch.sample_ids if existing_panel_batch else set()) | set(sample_ids)
         batches.append(
             BatchRef(
                 id="panel",
-                sample_ids=set(sample_ids),
+                sample_ids=panel_batch_samples,
                 tags={"panel_group"},
                 meta={"panel_hash": panel_hash}
             )
@@ -305,11 +314,13 @@ class AddSamplesStep(BaseStep):
         for ph, sids in panel_groups.items():
             if ph == panel_hash:
                 continue
-            batch_id = f"panel_{ph}"
+            bid = f"panel_{ph}"
+            existing_batch = self.project.batches.get(bid)
+            merged_sids = (existing_batch.sample_ids if existing_batch else set()) | set(sids)
             batches.append(
                 BatchRef(
-                    id=batch_id,
-                    sample_ids=set(sids),
+                    id=bid,
+                    sample_ids=merged_sids,
                     tags={"panel_group"},
                     meta={"panel_hash": ph, "is_primary": False},
                 )
@@ -320,10 +331,12 @@ class AddSamplesStep(BaseStep):
         for comp_ref in compensations:
             if len(comp_ref.batch) <= 1:
                 continue  # skip trivial batches
+            existing_comp_batch = self.project.batches.get(comp_ref.id)
+            merged_sids = (existing_comp_batch.sample_ids if existing_comp_batch else set()) | set(comp_ref.batch)
             batches.append(
                 BatchRef(
                     id=comp_ref.id,
-                    sample_ids=set(comp_ref.batch),
+                    sample_ids=merged_sids,
                     tags={"compensation_group"},
                     meta={"comp_id": comp_ref.id},
                 )
@@ -363,20 +376,46 @@ class AddSamplesStep(BaseStep):
             ]
             layers["comp"] = comp_dimensions
 
-        # Append project updates for this batch
+        # Set default dimension ranges from pnr (instrument amplifier range: 0 to pnr).
+        # Build a lookup from channel pnn -> pnr using the primary panel.
+        pnr_by_pnn = {ch.pnn: ch.pnr for ch in panel}
+        missing_pnr: list[str] = []
+        for layer_dims in layers.values():
+            for dim in layer_dims:
+                pnr = pnr_by_pnn.get(dim.id)
+                if pnr is not None:
+                    dim.range_min = 0.0
+                    dim.range_max = float(pnr)
+                else:
+                    missing_pnr.append(dim.id)
+        if missing_pnr:
+            step_build_dims.flag = QCFlag.WARN
+            step_build_dims.add_reason(
+                code="PNR_MISSING",
+                message=(f"pnr not set for {len(missing_pnr)} channel(s): {missing_pnr}. "
+                         "Ranges will remain None until load_fcs is run or set manually.")
+            )
+
+        # Append project updates for this batch.
+        # Only include panel catalog entries not already present in the project.
+        existing_catalog_keys = set(self.project.panel_catalog.keys())
         panel_catalog = {
             f"panel_{ph}": panel_cache[ph]
             for ph in panel_groups
-            if ph != panel_hash
+            if ph != panel_hash and f"panel_{ph}" not in existing_catalog_keys
         }
-        panel_catalog["panel"] = panel
+        if "panel" not in existing_catalog_keys:
+            panel_catalog["panel"] = panel
+
+        # Only include layers not already defined in the project.
+        new_layers = {layer: dims for layer, dims in layers.items() if layer not in self.project.layers}
 
         step_run.project_updates.append({
             "panel_catalog": panel_catalog,
             "compensations": compensations,
             "samples": samples,
             "batches": batches,
-            "layers": layers,
+            "layers": new_layers,
         })
 
         # Populate evaluable_products: these entities are fully initialized and ready for QC

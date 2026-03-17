@@ -4,6 +4,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 import numpy as np
 from flowutils.compensate import compensate, inverse_compensate
 
+from cytomind.domain.flow import DimensionDef
 from cytomind.domain.qc import QCRunStatus, QCStepStatus, QCFlag
 from .base import BaseStep
 from . import register_step
@@ -165,6 +166,14 @@ class CompensateStep(BaseStep):
 
         output_info["comp_applied"] = sample.compensation = comp.id
 
+        # Compute per-channel min/max for range tracking
+        X = np.asarray(adata.X)
+        if X.shape[0] > 0:
+            valid_mask = ~(np.isnan(X) | np.isinf(X))
+            has_valid = np.any(valid_mask, axis=0)
+            output_info["min_vals"] = np.where(has_valid, np.min(X, axis=0, where=valid_mask, initial=np.inf), np.nan)
+            output_info["max_vals"] = np.where(has_valid, np.max(X, axis=0, where=valid_mask, initial=-np.inf), np.nan)
+
         # Populate evaluable_products for QC evaluation
         if "compensation" not in step_run.evaluable_products:
             step_run.evaluable_products["compensation"] = {}
@@ -174,22 +183,79 @@ class CompensateStep(BaseStep):
 
         return output_info, qc
 
-    def update_project(self, step_run: StepRun) -> StepRun:
-        qc_iter = step_run.qc.sample_qc.items()
-        samples = [self.project.samples[sid] for sid, qc in qc_iter if qc.overall_flag != QCFlag.FAIL]
+    def finalize_batch(self, batch_id: str, step_run: StepRun, qc: QCRunStatus) -> tuple[dict, QCRunStatus]:
+        """Aggregate per-channel ranges in this batch and prepare updated comp layer dims."""
+        updates: dict[str, Any] = {}
+        sample_ids = list(step_run.sample_outputs.keys())
+        step = qc.get_step("aggregate_ranges")
 
-        # Create "comp" dimension layer if not exists, copying from "raw" with raw provenance.
-        dimensions = {}
+        # Persist sample compensation updates through the standard project_updates path.
+        samples_to_update: list[SampleRef] = []
+        sample_mins: list[np.ndarray] = []
+        sample_maxs: list[np.ndarray] = []
+        for sample_id, sample_output in step_run.sample_outputs.items():
+            sample_qc = step_run.qc.sample_qc[sample_id]
+            if sample_qc.overall_flag == QCFlag.FAIL:
+                continue
+
+            if "min_vals" in sample_output and "max_vals" in sample_output:
+                sample_mins.append(sample_output.pop("min_vals"))
+                sample_maxs.append(sample_output.pop("max_vals"))
+
+            comp_id = sample_output.get("comp_applied")
+            if comp_id:
+                sample_ref = self.project.samples[sample_id]
+                sample_ref.compensation = comp_id
+                samples_to_update.append(sample_ref)
+
+        if samples_to_update:
+            updates["samples"] = samples_to_update
+
+        if not sample_mins:
+            step.flag = QCFlag.WARN
+            step.add_reason("NO_RANGE_DATA", "No valid compensated sample data found to compute ranges.")
+            return {}, qc
+
+        aggregated_min = np.nanmin(np.asarray(sample_mins), axis=0)
+        aggregated_max = np.nanmax(np.asarray(sample_maxs), axis=0)
+        has_range = ~np.isnan(aggregated_min)
+
+        updated_layers: dict[str, list[DimensionDef]] = {}
         if "raw" in self.project.layers and "comp" not in self.project.layers:
+            # New layer is added
             comp_dimensions = []
-            for raw_dim in self.project.layers["raw"]:
+            for idx, raw_dim in enumerate(self.project.layers["raw"]):
                 comp_dim = raw_dim.copy()
                 comp_dim.source_layer = "raw"
+                if has_range[idx]:
+                    comp_dim.range_min = float(aggregated_min[idx])
+                    comp_dim.range_max = float(aggregated_max[idx])
+                else:
+                    comp_dim.range_min = None
+                    comp_dim.range_max = None
                 comp_dimensions.append(comp_dim)
-            dimensions["comp"] = comp_dimensions
+            updated_layers["comp"] = comp_dimensions
+        elif "comp" in self.project.layers:
+            # comp layer is only updated if needed
+            comp_dimensions = [dim.copy() for dim in self.project.layers["comp"]]
+            for idx, dim in enumerate(comp_dimensions):
+                if has_range[idx]:
+                    new_min = float(aggregated_min[idx])
+                    new_max = float(aggregated_max[idx])
+                    # Preserve wider existing bounds (partial reruns may observe a subset of samples).
+                    dim.range_min = min(dim.range_min, new_min) if dim.range_min is not None else new_min
+                    dim.range_max = max(dim.range_max, new_max) if dim.range_max is not None else new_max
+            updated_layers["comp"] = comp_dimensions
 
-        self.repo.update_project_metadata(samples=samples, layers=dimensions)
-        return step_run
+        if not updated_layers:
+            step.flag = QCFlag.FAIL
+            step.add_reason("COMP_LAYER_MISSING", "Could not resolve comp layer dimensions to update ranges.")
+            return {}, qc
+
+        updates["layers"] = updated_layers
+        step_run.project_updates.append(updates)
+
+        return {}, qc
 
     def _undo_compensation(self, sample: SampleRef, qc: QCRunStatus) -> tuple[AnnData | None, QCStepStatus]:
         """

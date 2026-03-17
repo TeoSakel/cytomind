@@ -329,7 +329,7 @@ class AddGateStep(BaseStep):
             # Has been checked in prepare_batch but re-checking here for safety since graph is being modified
             step = qc.get_step("AddGateNode")
             step.flag = QCFlag.FAIL
-            step.add_reason("CYCLE_DETECTED", str(e))
+            step.add_reason("ADD_NODE_ERROR", str(e))
             return {}, qc
 
         gate_ids = [gate_node.id]
@@ -364,24 +364,44 @@ class AddGateStep(BaseStep):
                 except ValueError as e:
                     step = qc.get_step("AddQuadrantNode")
                     step.flag = QCFlag.FAIL
-                    step.add_reason("CYCLE_DETECTED", str(e))
+                    step.add_reason("ADD_NODE_ERROR", str(e))
                     return {}, qc
 
                 gate_ids.append(quadrant_node.id)
 
         step_run.project_updates.append({"gating_strategy": strategy})
 
+        # Build QC sample scope for incremental sample-level updates:
+        # - sample_ids: samples updated in this run and not failed
+        failed_sample_ids = {
+            sample_id
+            for sample_id, sample_qc in step_run.qc.sample_qc.items()
+            if sample_qc.overall_flag == QCFlag.FAIL
+        }
+        sample_ids = [
+            sample_id
+            for sample_id in step_run.sample_outputs.keys()
+            if sample_id not in failed_sample_ids
+        ]
+
         # Populate evaluable_products: gating strategy is now updated with new gate(s)
         # Include metadata about parent dependencies for QC validation
-        step_run.evaluable_products["gate_node"] = {gid: {} for gid in gate_ids}
+        step_run.evaluable_products["gate_node"] = {
+            gid: {
+                "sample_ids": list(sample_ids),
+            }
+            for gid in gate_ids
+        }
 
         output_info["gate_node"] = gate_node.to_dict()
         del output_info["gate"]
 
         return output_info, qc
 
-    def cleanup_step_run(self, step_run: StepRun) -> StepRun:
-        step_run = super().cleanup_step_run(step_run)
+    def cleanup_step_run(self, step_run: StepRun, failed: bool = False) -> StepRun:
+        step_run = super().cleanup_step_run(step_run, failed=failed)
+        if failed:
+            return step_run
         # Remove params from sample outputs as they are persisted to the database
         # Keep only debugging/QC context information in outputs
         for sample_id, sample_info in step_run.sample_outputs.items():
