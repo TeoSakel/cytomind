@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 import warnings
-from typing import Any, Sequence, Mapping, TYPE_CHECKING
+from typing import Any, Hashable, Sequence, Mapping, TYPE_CHECKING
 
 import anndata as ad
 import numpy as np
@@ -116,6 +116,9 @@ class RootGate(Gate):
             raise ValueError("RootGate does not support use_as_complement")
         super().__init__(gate_name, [], {}, use_as_complement)
 
+    def __param_key(self) -> Hashable:
+        return ()
+
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """No fitting needed for Root gate."""
         pass
@@ -225,6 +228,10 @@ class RectangleGate(Gate):
         boundaries_max = [max_vals.get(dim, None) for dim in self.dimensions]
         self.params["boundaries"] = [boundaries_min, boundaries_max]
 
+    def __param_key(self) -> Hashable:
+        boundaries_min, boundaries_max = self.params["boundaries"]
+        return tuple(boundaries_min + boundaries_max)
+
     def _check_thresholds(self, thresholds: Mapping[str, float]) -> None:
         """Validate threshold dictionary."""
         dim_set = set(self.dimensions)
@@ -249,6 +256,18 @@ class RectangleGate(Gate):
         if not isinstance(maxs, list) or len(maxs) != len(self.dimensions):
             raise ValueError("RectangleGate boundaries[1] must match gate dimensions")
         return mins, maxs
+
+    @property
+    def min_vals(self) -> dict[str, float | None]:
+        """Return per-dimension minimum thresholds as {dim_id: value}."""
+        mins, _ = self._boundaries()
+        return {dim: mins[idx] for idx, dim in enumerate(self.dimensions)}
+
+    @property
+    def max_vals(self) -> dict[str, float | None]:
+        """Return per-dimension maximum thresholds as {dim_id: value}."""
+        _, maxs = self._boundaries()
+        return {dim: maxs[idx] for idx, dim in enumerate(self.dimensions)}
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For RectangleGate, fit just copies hyperparams to params."""
@@ -371,10 +390,8 @@ class RectangleGate(Gate):
             histnorm=histnorm,
         ))
 
-        mins, maxs = self._boundaries()
-        dim_idx = list(self.dimensions).index(dim)
-        min_val = mins[dim_idx]
-        max_val = maxs[dim_idx]
+        min_val = self.min_vals[dim]
+        max_val = self.max_vals[dim]
 
         if min_val is not None:
             fig.add_vline(
@@ -435,14 +452,12 @@ class RectangleGate(Gate):
             use_gl=use_gl,
         ))
 
-        dim_to_idx = {dim: idx for idx, dim in enumerate(self.dimensions)}
-        mins, maxs = self._boundaries()
-        x_idx = dim_to_idx[x_dim]
-        y_idx = dim_to_idx[y_dim]
-        x_min_raw = mins[x_idx]
-        x_max_raw = maxs[x_idx]
-        y_min_raw = mins[y_idx]
-        y_max_raw = maxs[y_idx]
+        min_vals = self.min_vals
+        max_vals = self.max_vals
+        x_min_raw = min_vals[x_dim]
+        x_max_raw = max_vals[x_dim]
+        y_min_raw = min_vals[y_dim]
+        y_max_raw = max_vals[y_dim]
         x_min = float(x_min_raw) if x_min_raw is not None else None
         x_max = float(x_max_raw) if x_max_raw is not None else None
         y_min = float(y_min_raw) if y_min_raw is not None else None
@@ -479,8 +494,8 @@ class RectangleGate(Gate):
         title = kwargs.get("title")
         plot_title = title if title is not None else f"RectangleGate: {self.gate_name} (Pairwise Projections)"
         downsample_idx = _downsample_indices(events.n_obs, max_points, downsample_seed)
-        dim_to_idx = {dim: idx for idx, dim in enumerate(self.dimensions)}
-        mins, maxs = self._boundaries()
+        min_vals = self.min_vals
+        max_vals = self.max_vals
 
         for idx, (i, j) in enumerate(pairs):
             row = idx // n_cols + 1
@@ -508,12 +523,10 @@ class RectangleGate(Gate):
                 row=row, col=col,
             )
 
-            x_idx = dim_to_idx[x_dim]
-            y_idx = dim_to_idx[y_dim]
-            x_min_raw = mins[x_idx]
-            x_max_raw = maxs[x_idx]
-            y_min_raw = mins[y_idx]
-            y_max_raw = maxs[y_idx]
+            x_min_raw = min_vals[x_dim]
+            x_max_raw = max_vals[x_dim]
+            y_min_raw = min_vals[y_dim]
+            y_max_raw = max_vals[y_dim]
             x_min = float(x_min_raw) if x_min_raw is not None else None
             x_max = float(x_max_raw) if x_max_raw is not None else None
             y_min = float(y_min_raw) if y_min_raw is not None else None
@@ -639,6 +652,9 @@ class PolygonGate(Gate):
             np.logical_not(mask, out=mask)
 
         return {self.gate_name: mask}
+
+    def __param_key(self) -> Hashable:
+        return tuple(self.vertices.flatten().tolist())
 
     def plot(
         self,
@@ -894,6 +910,11 @@ class EllipsoidGate(Gate):
             np.logical_not(mask, out=mask)
 
         return {self.gate_name: mask}
+
+    def __param_key(self) -> Hashable:
+        center = self.center.tolist()
+        cov_flat = self.covariance_matrix.flatten().tolist()
+        return tuple(center + cov_flat + [self.distance_square])
 
     def plot(
         self,
@@ -1293,6 +1314,13 @@ class QuadrantGate(Gate):
             results[quad_id] = quad_mask
 
         return results
+
+    def __param_key(self) -> Hashable:
+        quadrants_tuple = tuple(
+            (quad_id, tuple((dim, locations[dim]) for dim in self.dimensions if dim in locations))
+            for quad_id, locations in sorted(self.locations.items())
+        )
+        return quadrants_tuple
 
     def plot(
         self,
@@ -1888,6 +1916,10 @@ class BooleanGate(Gate):
 
         self.params["expression"] = expression
         self.params["variables"] = variables
+
+    def __param_key(self) -> Hashable:
+        # this is not really an invariant but reducing is NP-hard...
+        return self.expression
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return

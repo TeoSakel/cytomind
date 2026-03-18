@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Sequence, Mapping, TYPE_CHECKING
+from typing import Any, Hashable, Sequence, Mapping, TYPE_CHECKING
 
 import numpy as np
 
@@ -183,6 +183,9 @@ class Gate(ABC):
         >>> gate = Gate.from_node(node, sample_id="sample_123")
         >>> masks = gate.apply(adata)
         """
+
+        assert node.gate_type == cls.gate_type, f"Gate type mismatch: expected {cls.gate_type}, got {node.gate_type}"
+
         # Get params: sample-specific override or batch-level fallback
         if sample_id and sample_id in node.custom_gates:
             merged_params = node.custom_gates[sample_id]
@@ -509,3 +512,22 @@ class Gate(ABC):
             Subclasses should define the specific type and content of the plot.
         """
         pass
+
+    @abstractmethod
+    def __param_key(self) -> Hashable:
+        """
+        Generate a hashable object that uniquely identifies the gate's configuration.
+
+        This is used for hashing and equality checks. Subclasses should implement this
+        to include all relevant hyperparameters and learned parameters that define the gate.
+
+        Returns
+        -------
+        Hashable
+            A hashable object containing all relevant parameters for hashing.
+        """
+        pass
+
+    def __hash__(self) -> int:
+        gate_type = self.glm_type or self.gate_type
+        return hash((gate_type, self.dimensions, self.use_as_complement, self.__param_key()))

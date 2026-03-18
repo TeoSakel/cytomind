@@ -110,7 +110,6 @@ class MinDensityGate(RectangleGate):
             max_range = self.hyperparams["max_ranges"].get(dim)
             res = improved_mindensity(vals, min_range, max_range)
             cut: float = res.pop("cut_point")
-            self.diagnostics[dim] = res
 
             if not np.isfinite(cut):
                 raise ValueError(f"Computed cut point for dimension '{dim}' is not finite")
@@ -118,12 +117,17 @@ class MinDensityGate(RectangleGate):
             if direction == 1:
                 # Keep high side: values >= cut
                 min_vals[dim] = cut
+                res["mass"] = res["mass"][1]  # mass on the high
             else:  # direction == -1
                 # Keep low side: values < cut
                 max_vals[dim] = cut
+                res["mass"] = res["mass"][0]  # mass on the low
+            self.diagnostics[dim] = res
 
-        self.params["min_vals"] = min_vals
-        self.params["max_vals"] = max_vals
+        self.params["boundaries"] = [
+            [min_vals.get(dim, None) for dim in self.dimensions],
+            [max_vals.get(dim, None) for dim in self.dimensions]
+        ]
 
 
 @GateRegistry.register("min_density_quadrant")
@@ -218,8 +222,8 @@ class MinDensityQuadrantGate(QuadrantGate):
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
         # Remove computed "hyperparameters" of QuadrantGate
-        del base["hyperparams"]["dividers"]
-        del base["hyperparams"]["quadrants"]
+        base["hyperparams"].pop("dividers", None)
+        base["hyperparams"].pop("quadrants", None)
         return base
 
 
@@ -243,20 +247,16 @@ def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, 
 
     # Step 1: Parse extreme values
     min_val, max_val = np.min(vals), np.max(vals)
-    if low_bd is None:
-        low_bd = min_val
-    if up_bd is None:
-        up_bd = max_val
+    low_bd = max(low_bd, min_val) if low_bd is not None else min_val
+    up_bd = min(up_bd, max_val) if up_bd is not None else max_val
     if low_bd > up_bd:
         raise ValueError(f"low_bd {low_bd} cannot be greater than up_bd {up_bd}")
-    if low_bd < min_val or up_bd > max_val:
-        raise ValueError(f"Specified range [{low_bd}, {up_bd}] must be within data range [{min_val}, {max_val}]")
 
     # Degenerate case: all values are the same or range is a single point
     if np.allclose(low_bd, up_bd):
         return {
             'cut_point': low_bd,
-            'balance': [.5, .5],
+            'mass': [.5, .5],
             'minima': [(low_bd, 1.0)],
             'maxima': [],
             'shoulders': [],
@@ -318,7 +318,7 @@ def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, 
     mass /= mass.sum()  # normalize to sum to 1
     return {
         'cut_point': float(pt),
-        'balance': mass.tolist(),
+        'mass': mass.tolist(),
         'minima': list(zip(x_vals[min_idx].tolist(), y_vals[min_idx].tolist())),
         'maxima': list(zip(x_vals[max_idx].tolist(), y_vals[max_idx].tolist())),
         'shoulders': list(zip(x_vals[sld_idx].tolist(), y_vals[sld_idx].tolist())),

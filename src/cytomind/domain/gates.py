@@ -1,8 +1,6 @@
-import json
 import re
 from typing import Any, Iterable, Mapping
 from dataclasses import dataclass, field, asdict
-from pathlib import Path
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -56,9 +54,6 @@ class GateNode:
 
         if self.name is None:
             self.name = self.id
-
-    def __hash__(self) -> int:
-        return hash(self.id)
 
     def __repr__(self) -> str:
         return f"GateNode(id={self.id}, type={self.gate_type}, parents={self.parent_ids})"
