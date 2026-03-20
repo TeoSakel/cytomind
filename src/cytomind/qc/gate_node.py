@@ -5,27 +5,23 @@ Performs QC analysis on individual gates within their gating strategy context.
 Evaluates event counts, ratios, fitting quality, and outlier detection for a single gate.
 """
 from __future__ import annotations
-from typing import Any, Hashable, Iterable, Mapping, Sequence, TYPE_CHECKING
+from math import dist
+from typing import Any, Hashable, Iterable, Mapping, Sequence, TYPE_CHECKING, cast
+import warnings
 from pathlib import Path
-import hashlib
-import json
 
 import numpy as np
+import pandas as pd
 import anndata as ad
 import plotly.graph_objects as go
 
-from cytomind.domain.qc import EntityQCStatus, QCTestRecord
-from cytomind.domain.pipeline import NumpyEncoder
-from cytomind.gates import GateRegistry
+from cytomind.domain.qc import EntityQCStatus, QCFlag, QCStepStatus, QCTestRecord
+from cytomind.gates import GateRegistry, Gate
+from cytomind.infra.dataloader import UnifiedDataLoader
 from cytomind.utils import now_iso
 
 from . import EntityQCEvaluatorRegistry
 from .base import EntityQCEvaluator, QCTester, make_scalar_outlier_tester
-from .utils import (
-    validate_percentage_range,
-    dict_iqr_score,
-    dict_zscore,
-)
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import BooleanArray, FloatArray, PathLike
@@ -39,161 +35,802 @@ else:
     UnifiedDataLoader = object
 
 
-_GLM_GATE_SPACE_ARTIFACT_VERSION = 1
+_GATE_SPACE_ARTIFACT_VERSION = 3
 
 
-def _compute_gate_space_bounds(
-    *,
-    gates: Mapping[str, Any],
-    dimensions: Sequence[str],
-    glm_type: str | None,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    dims = len(dimensions)
-    low = np.full(dims, np.inf, dtype=float)
-    high = np.full(dims, -np.inf, dtype=float)
+# ============================================================================
+# Gate Space Geometry
+# ============================================================================
 
-    for gid, gate in gates.items():
-        if list(gate.dimensions) != list(dimensions):
-            raise ValueError(
-                f"Gate {gid} dimensions must match space dimensions: "
-                f"expected {list(dimensions)}, got {list(gate.dimensions)}"
-            )
-    if glm_type == "RectangleGate":
-        for gate in gates.values():
-            mins, maxs = np.asarray(gate.params["boundaries"], dtype=float)
-            low = np.minimum(low, np.where(np.isfinite(mins), mins, np.inf))
-            high = np.maximum(high, np.where(np.isfinite(maxs), maxs, -np.inf))
-    elif glm_type == "PolygonGate":
-        for gate in gates.values():
-            verts = np.asarray(gate.vertices, dtype=float)
-            low = np.minimum(low, np.min(verts, axis=0))
-            high = np.maximum(high, np.max(verts, axis=0))
-    elif glm_type == "EllipsoidGate":
-        for gate in gates.values():
-            center = np.asarray(gate.center, dtype=float)
-            cov = np.asarray(gate.covariance_matrix, dtype=float)
-            radius = np.sqrt(max(float(gate.distance_square), 0.0))
-            extent = np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=np.inf)) * radius
-            low = np.minimum(low, center - extent)
-            high = np.maximum(high, center + extent)
-    else:
-        low = np.full(dims, 0.0, dtype=float)
-        high = np.full(dims, 1.0, dtype=float)
+class GateSpaceGeometry:
+    """Owns gate-space basis generation, mask evaluation, pairwise distance state,
+    centrality scoring, and artifact serialization/deserialization.
 
-    finite = np.isfinite(low) & np.isfinite(high)
-    if not np.any(finite):
-        return None
-
-    low = np.where(np.isfinite(low), low, 0.0)
-    high = np.where(np.isfinite(high), high, 1.0)
-    span = np.maximum(high - low, 1e-9)
-    return low - 0.05 * span, high + 0.05 * span
-
-
-def _make_gate_space_eval_points(
-    *,
-    dimensions: Sequence[str],
-    low: np.ndarray,
-    high: np.ndarray,
-    n_points: int,
-    seed: int,
-) -> ad.AnnData:
-    dims = len(dimensions)
-    if dims == 1:
-        X = np.linspace(low[0], high[0], max(n_points, 64)).reshape(-1, 1)
-    elif dims == 2:
-        side = int(max(8, np.ceil(np.sqrt(n_points))))
-        x = np.linspace(low[0], high[0], side)
-        y = np.linspace(low[1], high[1], side)
-        gx, gy = np.meshgrid(x, y, indexing="xy")
-        X = np.column_stack((gx.ravel(), gy.ravel()))
-    else:
-        rng = np.random.default_rng(seed)
-        X = rng.uniform(low=low, high=high, size=(n_points, dims))
-
-    adata = ad.AnnData(X=X)
-    adata.var_names = list(dimensions)
-    return adata
-
-
-def _compute_gate_space_masks(
-    *,
-    gates: Mapping[str, Any],
-    eval_points: ad.AnnData,
-    gate_id: str,
-) -> dict[str, np.ndarray]:
-    root_mask = np.ones(eval_points.n_obs, dtype=bool)
-    masks: dict[str, np.ndarray] = {}
-    for sample_id, gate in gates.items():
-        gate_masks = gate.apply(eval_points, {"root": root_mask})
-        if len(gate_masks) > 1:
-            raise ValueError(
-                f"Expected a single mask for gate {gate_id} in sample {sample_id}, "
-                f"but got {len(gate_masks)} masks from apply()"
-            )
-        masks[sample_id] = np.asarray(next(iter(gate_masks.values())), dtype=bool)
-    return masks
-
-
-def _compute_jaccard_distance_matrix(mask_matrix: np.ndarray) -> np.ndarray:
-    if mask_matrix.shape[0] == 0:
-        return np.zeros((0, 0), dtype=float)
-    mask_matrix_u16 = mask_matrix.astype(np.uint16)
-    intersections = mask_matrix_u16 @ mask_matrix_u16.T
-    support = np.sum(mask_matrix, axis=1, dtype=float)
-    unions = support[:, None] + support[None, :] - intersections
-    distance = 1.0 - np.divide(
-        intersections,
-        unions,
-        out=np.ones_like(intersections, dtype=float),
-        where=unions > 0,
-    )
-    np.fill_diagonal(distance, 0.0)
-    return distance
-
-
-def _compute_jaccard_distance_between(mask_matrix_a: np.ndarray, mask_matrix_b: np.ndarray) -> np.ndarray:
-    if mask_matrix_a.shape[0] == 0 or mask_matrix_b.shape[0] == 0:
-        return np.zeros((mask_matrix_a.shape[0], mask_matrix_b.shape[0]), dtype=float)
-    mask_matrix_a_u16 = mask_matrix_a.astype(np.uint16)
-    mask_matrix_b_u16 = mask_matrix_b.astype(np.uint16)
-    intersections = mask_matrix_a_u16 @ mask_matrix_b_u16.T
-    support_a = np.sum(mask_matrix_a, axis=1, dtype=float)
-    support_b = np.sum(mask_matrix_b, axis=1, dtype=float)
-    unions = support_a[:, None] + support_b[None, :] - intersections
-    return 1.0 - np.divide(
-        intersections,
-        unions,
-        out=np.ones_like(intersections, dtype=float),
-        where=unions > 0,
-    )
-
-
-def _compute_gate_space_centrality(distance_matrix: np.ndarray) -> np.ndarray:
+    Lifecycle
+    ---------
+    - :meth:`ensure` — primary entry point: load-or-build with update policy applied.
+    - :meth:`build_from_entity` — full build from scratch.
+    - :meth:`load` — restore from persisted artifacts.
+    - :meth:`save` — persist artifacts and update ``entity_qc.artifacts`` metadata.
+    - :meth:`centrality_by_sample` — compute per-sample centrality from the stored distance state.
     """
-    Compute per-sample centrality as mean deviation from the group.
 
-    Centrality = mean pairwise Jaccard distance to all other samples.
-    - Low centrality (→ 0): Sample has gate coverage similar to the group → typical
-    - High centrality (→ 1): Sample has gate coverage dissimilar from group → outlier
-    """
-    n_samples = distance_matrix.shape[0]
-    if n_samples <= 1:
-        return np.zeros(n_samples, dtype=float)
-    return np.sum(distance_matrix, axis=1) / (n_samples - 1)
+    artifact_key = "gate_space_geometry"
+    _info_fields = ("gate_id", "gate_type", "glm_type", "layer", "dimensions", "lower_bounds", "upper_bounds", "resolution", "seed")
+    # Maximum number of random evaluation points for dims >= 3
+    _MAX_RANDOM_EVAL_POINTS = 2 ** 20
 
+    # --------- Init and Helpers to allow reloading ---------
 
-def _pack_mask_matrix(mask_matrix: np.ndarray) -> np.ndarray:
-    return np.packbits(mask_matrix.astype(np.uint8), axis=1)
+    @classmethod
+    def create_artifact(
+        cls,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        sample_ids: list[str],
+        resolution: int = 256,
+        seed: int | None = 42,
+    ) -> "GateSpaceGeometry":
 
+        layer=dataloader.load_data("project").layers[entity.layer]
 
-def _unpack_mask_matrix(packed_masks: np.ndarray, n_eval_points: int) -> np.ndarray:
-    return np.unpackbits(packed_masks, axis=1, count=n_eval_points).astype(bool)
+        # `resolution` is interpreted as points-per-axis for up to 3D grids.
+        # For dims > 3 we will randomly sample the space using `resolution**3`
+        # points (capped by _MAX_RANDOM_EVAL_POINTS).
+        if resolution <= 64:
+            raise ValueError("Resolution (points per axis) must be greater than 64 for meaningful gate space geometry.")
 
+        dims_by_id = {dim.id: dim for dim in layer}
+        low: list[float] = []
+        high: list[float] = []
+        for dim_id in entity.dimensions:
+            dim = dims_by_id.get(dim_id)
+            if dim is None or dim.range_min is None or dim.range_max is None:
+                raise ValueError(f"Dimension {dim_id} is missing or does not have valid range bounds in layer {entity.layer}.")
+            low.append(float(dim.range_min))
+            high.append(float(dim.range_max))
 
-def _hash_payload(payload: Any) -> str:
-    serialized = json.dumps(payload, sort_keys=True, cls=NumpyEncoder)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        n_dims = len(entity.dimensions)
+        info = {
+            "gate_id": entity.id,
+            "gate_type": entity.gate_type,
+            "glm_type": entity.glm_type,
+            "layer": entity.layer,
+            "dimensions": entity.dimensions,
+            "lower_bounds": low,
+            "upper_bounds": high,
+            "resolution": resolution,
+            "seed": seed if n_dims >= 3 else None,
+        }
+
+        missing = [field for field in cls._info_fields if field not in info]
+        if missing:
+            raise ValueError(f"Info dictionary is missing required fields: {missing}")
+        gsg = cls(info=info, gate_node=entity, sample_ids=sample_ids)
+        gsg.save(entity_qc=entity_qc, dataloader=dataloader)
+        return gsg
+
+    @classmethod
+    def _validate_gate(cls, gate_node: GateNode, info: Mapping[str, Any]) -> None:
+        if gate_node.id != info["gate_id"]:
+            raise ValueError(f"Gate ID mismatch: expected {info['gate_id']}, got {gate_node.id}")
+        if gate_node.gate_type != info["gate_type"]:
+            raise ValueError(f"Gate type mismatch: expected {info['gate_type']}, got {gate_node.gate_type}")
+        if gate_node.glm_type != info["glm_type"]:
+            raise ValueError(f"GLM type mismatch: expected {info['glm_type']}, got {gate_node.glm_type}")
+        if gate_node.layer != info["layer"]:
+            raise ValueError(f"Layer mismatch: expected {info['layer']}, got {gate_node.layer}")
+        if tuple(gate_node.dimensions) != tuple(info["dimensions"]):
+            raise ValueError(f"Dimensions mismatch: expected {info['dimensions']}, got {gate_node.dimensions}")
+
+    def __init__(
+        self,
+        *,
+        info: Mapping[str, Any],
+        gate_node: GateNode,
+        sample_ids: list[str] | None = None,
+        # Arguments below are meant to be passed internally when loading from artifacts or patching, not by external callers.
+        eval_points: ad.AnnData | FloatArray | None = None,
+        masks: dict[str, BooleanArray] | None = None,
+        dist_matrix: FloatArray | None = None,
+    ) -> None:
+
+        # Basis metadata
+        self.gate_node = gate_node
+        self.info = {field: info[field] for field in self._info_fields}
+        # samples |> gates == masks
+        self.sample_hashes: dict[str, str] = {}  # map sample_id to hash of gate params for that sample
+        self.gates: dict[str, int] = {}  # map gate param hash to index in mask_matrix rows
+        self._centrality: FloatArray | None = None
+        self._distances: FloatArray | None = None
+
+        # Coarse Grain Gate-Space
+        self._make_eval_points() if eval_points is None else self._update_eval_points(eval_points)
+        # Mask = Sample Geometry
+        if masks is None:
+            self._compute_masks()
+            if dist_matrix is not None:
+                warnings.warn("Provided dist_matrix will be ignored since masks were not provided and had to be computed.")
+            self._compute_distances_full()
+        else:
+            original_keys = list(masks.keys())
+            self._validate_masks(masks=masks)
+            new_keys = list(self.masks.keys())
+            # If mask keys unchanged and a distance matrix was provided, coerce it
+            if original_keys == new_keys and dist_matrix is not None:
+                self._condense_distances(dist_matrix=dist_matrix)
+            else:
+                # Keys changed. If a dist_matrix was provided for the original
+                # keyset, inflate/deflate it to match the new keyset and only
+                # compute distances for newly added masks. This keeps work
+                # minimal compared to a full rebuild.
+                if dist_matrix is not None and original_keys:
+                    new_condensed = self._update_distance_matrix(dist_matrix, original_keys)
+                    if new_condensed is not None:
+                        self._distances = new_condensed
+                        self._centrality = None
+                    else:
+                        self._compute_distances_full()
+                else:
+                    # No dist_matrix available for inflation -> full recompute
+                    if dist_matrix is not None:
+                        warnings.warn(
+                            "Provided dist_matrix will be ignored since the set of mask keys has changed. "
+                            "Distances will be recomputed based on the new masks."
+                        )
+                    self._compute_distances_full()
+
+        if sample_ids is not None:
+            self._add_missing_samples(sample_ids)
+
+    def _add_missing_samples(self, sample_ids: list[str]) -> None:
+        missing = list(set(sample_ids) - set(self.sample_hashes.keys()))
+        if missing and "__batch__" not in self.sample_hashes:
+            raise ValueError(f"Missing samples: {missing} with no default gate configuration found for gate {self.gate_node.id}.")
+        batch_key = self.sample_hashes["__batch__"]
+        for sid in missing:
+            self.sample_hashes[sid] = batch_key
+
+    def _make_eval_points(self):
+        dims = len(self.dimensions)
+        # `resolution` is points per axis for up to 3 dimensions. For 1/2/3
+        # dimensions create a regular grid. For higher dimensions randomly
+        # sample `resolution**3` points (capped) to avoid combinatorial explosion.
+        if dims == 1:
+            X = np.linspace(self.low[0], self.high[0], self.resolution, dtype=np.float32).reshape(-1, 1)
+        elif dims == 2:
+            x = np.linspace(self.low[0], self.high[0], self.resolution, dtype=np.float32)
+            y = np.linspace(self.low[1], self.high[1], self.resolution, dtype=np.float32)
+            gx, gy = np.meshgrid(x, y, indexing="xy")
+            X = np.column_stack((gx.ravel(), gy.ravel())).astype(np.float32, copy=False)
+        else:
+            # For 3D and higher dimensions random-sample the space. Use
+            # resolution**3 points (independent of the actual dimension count)
+            # but cap to _MAX_RANDOM_EVAL_POINTS to avoid explosion.
+            rng = np.random.default_rng(self.seed)
+            n_points = min(self.resolution ** 3, self._MAX_RANDOM_EVAL_POINTS)
+            X = rng.uniform(low=self.low, high=self.high, size=(int(n_points), dims)).astype(np.float32)
+
+        var_df = {
+            "id": list(self.dimensions),
+            "lower_bound": self.low,
+            "upper_bound": self.high,
+        }
+        adata = ad.AnnData(X=X, var=pd.DataFrame(var_df).set_index("id", drop=True))
+        self.eval_points = adata
+
+    def _update_eval_points(self, eval_points: ad.AnnData | FloatArray):
+        if isinstance(eval_points, np.ndarray):
+            if eval_points.ndim != 2:
+                raise ValueError("eval_points array must be 2D.")
+            if eval_points.shape[1] != len(self.dimensions):
+                raise ValueError(
+                    f"eval_points array must have {len(self.dimensions)} columns corresponding to gate dimensions."
+                )
+            self.eval_points = ad.AnnData(X=eval_points.astype(np.float32, copy=False))
+            self.eval_points.var_names = list(self.dimensions)
+        else:
+            if not set(self.dimensions).issubset(set(eval_points.var_names)):
+                raise ValueError("Eval points must include all gate dimensions as var_names.")
+            self.eval_points = eval_points[:, list(self.dimensions)].copy()
+
+        self.eval_points.var["lower_bound"] = self.low
+        self.eval_points.var["upper_bound"] = self.high
+
+        # Ensure that bounds are valid
+        point_mins = self.eval_points.X.min(axis=0) # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        if np.any(point_mins < np.asarray(self.low)):
+            warnings.warn(
+                "Eval points have minimum values outside the specified lower bounds. "
+                "Expanding low bounds to include eval points."
+            )
+            self.low = point_mins.tolist()
+
+        point_maxs = self.eval_points.X.max(axis=0) # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        if np.any(point_maxs > np.asarray(self.high)):
+            warnings.warn(
+                "Eval points have maximum values outside the specified upper bounds. "
+                "Expanding high bounds to include eval points."
+            )
+            self.high = point_maxs.tolist()
+
+        # Normalize stored `resolution` to mean points-per-axis for up to 3D.
+        # If eval_points were provided externally, estimate the per-axis
+        # resolution by taking the n'th root where n = min(dimensions, 3).
+        per_axis = int(round(self.eval_points.n_obs ** (1.0 / min(len(self.dimensions), 3))))
+        self.info["resolution"] = max(1, per_axis)
+
+    def get_mask(self, gate: Gate, parent_mask: dict[str, BooleanArray] | None = None) -> BooleanArray:
+        if parent_mask is None:
+            parent_mask = {"root": np.ones(self.n_eval_points, dtype=bool)}
+        mask = gate.apply(self.eval_points, parent_mask)
+        if len(mask) > 1:
+            raise ValueError(
+                f"Expected a single mask for gate {gate.gate_name}, but got {len(mask)} masks from apply()"
+            )
+        return next(iter(mask.values()))
+
+    def _compute_masks(self):
+        gate_cls = GateRegistry.get(self.gate_node.gate_type)
+        self.masks: dict[str, BooleanArray] = {}
+        parent_mask = {"root": np.ones(self.n_eval_points, dtype=bool)}
+
+        # First enumerate custom (sample-specific) gates and assign indices
+        for i, sample_id in enumerate(self.gate_node.custom_gates):
+            gate = gate_cls.from_node(self.gate_node, sample_id=sample_id)
+            try:
+                key = hex(hash(gate))
+            except Exception:
+                continue
+            self.sample_hashes[sample_id] = key
+            self.masks[key] = self.get_mask(gate, parent_mask)
+            self.gates[key] = i
+
+        # Now try to add the default/batch gate, placing it after custom gates
+        # so it receives index `i+1` (or 0 when there are no custom gates).
+        try:
+            default_gate = gate_cls.from_node(self.gate_node)
+            default_key = hex(hash(default_gate))
+        except Exception:
+            default_key = None
+
+        if default_key is not None:
+            self.sample_hashes["__batch__"] = default_key
+            if default_key not in self.masks:
+                self.masks[default_key] = self.get_mask(default_gate, parent_mask) # pyright: ignore[reportPossiblyUnboundVariable]
+            if default_key not in self.gates:
+                ix = 0 if not self.gates else max(self.gates.values()) + 1
+                self.gates[default_key] = ix
+
+    def _validate_masks(self, masks: dict[str, BooleanArray]):
+
+        # Ensure that mask formats are correct and consistent with eval points
+        gate_idx: dict[str, int] = {}
+        for i, (key, mask) in enumerate(masks.items()):
+            if not isinstance(key, str):
+                raise ValueError(f"Mask key {key} is not a string.")
+            if mask.shape != (self.n_eval_points,):
+                raise ValueError(
+                    f"Mask for key {key} has shape {mask.shape}, expected ({self.n_eval_points},)."
+                )
+            if mask.dtype != bool:
+                raise ValueError(f"Mask for key {key} has dtype {mask.dtype}, expected bool.")
+            gate_idx[key] = i
+
+        gate_cls = GateRegistry.get(self.gate_node.gate_type)
+
+        self.masks = dict(masks)  # make a copy to ensure internal consistency
+        sample_hashes: dict[str, str] = {}
+        parent_mask = {"root": np.ones(self.n_eval_points, dtype=bool)}
+
+        # Try to get default gate
+        gate = gate_cls.from_node(self.gate_node)
+        try:
+            key = hex(hash(gate))
+        except Exception:
+            key = None
+
+        if key is not None:
+            sample_hashes["__batch__"] = key
+            if key not in self.masks:
+                self.masks[key] = self.get_mask(gate, parent_mask)
+
+        for sample_id in self.gate_node.custom_gates:
+            gate = gate_cls.from_node(self.gate_node, sample_id=sample_id)
+            key = hex(hash(gate))
+            sample_hashes[sample_id] = key
+            if key not in self.masks:
+                self.masks[key] = self.get_mask(gate, parent_mask)
+
+        self.gates.update(gate_idx)
+        self.sample_hashes.update(sample_hashes)
+        inactive_masks = list(set(self.masks.keys()) - set(self.sample_hashes.values()))
+        for inactive in inactive_masks:
+            del self.masks[inactive]
+            del self.gates[inactive]
+
+    @staticmethod
+    def _condensed_index(a: int, b: int) -> int:
+        """Return index into condensed lower-triangular array for pair (a,b)."""
+        if a == b:
+            raise ValueError("No condensed index for identical indices")
+        if a < b:
+            a, b = b, a
+        return a * (a - 1) // 2 + b
+
+    def _compute_distances_full(self) -> None:
+        """Full recompute of pairwise distances using float32 + BLAS."""
+        mask_matrix = self.mask_matrix
+        n_entries = self.n_entries
+        if n_entries == 0:
+            self._distances = np.zeros(0, dtype=np.float32)
+            self._centrality = None
+            return
+
+        mask_f32 = np.ascontiguousarray(mask_matrix.astype(np.float32))
+        support = np.sum(mask_matrix, axis=1, dtype=float)
+
+        intersections = mask_f32 @ mask_f32.T
+        unions = support[:, None] + support[None, :] - intersections
+        distance_matrix = 1.0 - np.divide(
+            intersections,
+            unions,
+            out=np.ones_like(intersections, dtype=float),
+            where=unions > 0,
+        )
+        self._distances = distance_matrix[np.tril_indices(n_entries, k=-1)]
+        self._centrality = None
+
+    @staticmethod
+    def inflate_distances(distances: Sequence[float] | FloatArray | None, N: int) -> np.ndarray:
+        """Expand a condensed distance array (or an NxN matrix) to a full symmetric matrix.
+
+        Returns an NxN float matrix.
+        """
+        if distances is None:
+            return np.zeros((N, N), dtype=np.float32)
+
+        arr = np.asarray(distances, dtype=np.float32)
+        if arr.ndim == 1:
+            if arr.shape[0] != (N * (N - 1) // 2):
+                raise ValueError("Condensed distances length does not match N")
+            mat = np.zeros((N, N), dtype=np.float32)
+            mat[np.tril_indices(N, k=-1)] = arr
+            return mat + mat.T
+        elif arr.ndim == 2:
+            if arr.shape != (N, N):
+                raise ValueError("Square distance matrix shape does not match N")
+            return arr.copy()
+        else:
+            raise ValueError("Invalid distances array")
+
+    def _update_distance_matrix(
+        self,
+        dist_matrix: Sequence[float] | FloatArray,
+        original_keys: list[str]
+    ) -> np.ndarray | None:
+        """Inflate/deflate a condensed distance array from original_keys -> new_keys.
+
+        If `dist_matrix` is None or invalid, returns None to signal caller to
+        perform a full recompute. Otherwise returns a condensed distance array
+        matching `new_keys` order. Uses `self.masks` for mask lookups.
+        """
+
+        try:
+            old_full = self.inflate_distances(dist_matrix, len(original_keys))
+        except Exception:
+            return None
+
+        # derive new_keys from current instance masks
+        new_keys = list(self.masks.keys())
+        L = len(new_keys)
+        new_full = np.zeros((L, L), dtype=float)
+
+        old_idx = {k: i for i, k in enumerate(original_keys)}
+        new_idx = {k: i for i, k in enumerate(new_keys)}
+
+        # copy common block
+        common = [k for k in new_keys if k in old_idx]
+        if common:
+            old_pos = [old_idx[k] for k in common]
+            new_pos = [new_idx[k] for k in common]
+            new_full[np.ix_(new_pos, new_pos)] = old_full[np.ix_(old_pos, old_pos)]
+
+        # compute distances for added keys
+        added = [new_idx[k] for k in new_keys if k not in old_idx]
+        if added:
+            mask_matrix = np.vstack([self.masks[k] for k in new_keys]).astype(np.float32)
+            mask_matrix = np.ascontiguousarray(mask_matrix)
+            intersections = mask_matrix[added, :] @ mask_matrix.T  # (k, L)
+            support = np.sum(mask_matrix, axis=1)
+            sup_added = support[added][:, None]
+            unions = sup_added + support[None, :] - intersections
+            with np.errstate(divide='ignore', invalid='ignore'):
+                dists = 1.0 - np.divide(intersections, unions, out=np.zeros_like(intersections, dtype=float), where=unions > 0)
+            for r, i in enumerate(added):
+                new_full[i, :] = dists[r]
+                new_full[:, i] = dists[r]
+
+        return new_full[np.tril_indices(L, k=-1)]
+
+    def _compute_distances_partial(self, changed_keys: Sequence[str]) -> None:
+        """Partial update: recompute distances only for pairs involving changed mask keys."""
+
+        changed = [k for k in changed_keys if k in self.masks]
+        if not changed:
+            # No masks affected => distances unchanged, keep cached centrality
+            return
+
+        N = self.n_entries
+        if N == 0:
+            self._distances = np.zeros(0, dtype=np.float32)
+            self._centrality = None
+            return
+
+        mask_f32 = np.ascontiguousarray(self.mask_matrix.astype(np.float32))
+        support: np.ndarray = mask_f32.sum(axis=1)
+
+        # Ensure _distances exists and has correct length
+        if self._distances is None or len(self._distances) != self.n_distances:
+            # fall back to full recompute
+            self._compute_distances_full()
+            return
+
+        changed_indices = [self.gates[k] for k in changed]
+        intersections_sub = mask_f32[changed_indices, :] @ mask_f32.T  # shape (k, N)
+
+        # Vectorized update for pairs involving changed indices.
+        # Build flattened pair arrays (A,B) for all changed -> all entries,
+        # mask out diagonal (i==j), compute intersections/unions in one pass,
+        # then compute condensed indices and write distances.
+        changed_idx_arr = np.asarray(changed_indices, dtype=int)
+        k = changed_idx_arr.size
+        if k:
+            # intersections_sub has shape (k, N) in row-major order
+            inter_flat = intersections_sub.ravel()  # length k * N
+            A = np.repeat(changed_idx_arr, N)
+            B = np.tile(np.arange(N, dtype=int), k)
+            neq = A != B
+            if np.any(neq):
+                A_mask = A[neq]
+                B_mask = B[neq]
+                inter_vals = inter_flat[neq].astype(np.float32)
+                union = support[A_mask] + support[B_mask] - inter_vals
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    dvals = np.where(union > 0, 1.0 - (inter_vals / union), 0.0)
+                # Ensure condensed index uses a >= b
+                swap = A_mask < B_mask
+                a = np.where(swap, B_mask, A_mask)
+                b = np.where(swap, A_mask, B_mask)
+                ci = (a * (a - 1) // 2 + b).astype(int)
+                self._distances[ci] = dvals.astype(np.float32)
+
+        self._centrality = None
+
+    def _compute_distances(self, changed_keys: Sequence[str] | None = None) -> None:
+        """Compatibility wrapper: dispatch to full or partial implementation."""
+        if changed_keys:
+            return self._compute_distances_partial(changed_keys)
+        return self._compute_distances_full()
+
+    def _condense_distances(self, dist_matrix: Sequence[float] | FloatArray):
+        distances = np.asarray(dist_matrix, dtype=np.float32)
+        N = self.n_entries
+
+        if distances.ndim == 1:
+            if distances.shape[0] != self.n_distances:
+                raise ValueError(
+                    f"Provided dist_matrix must have length {self.n_distances} for condensed distance matrix."
+                )
+            self._distances = distances.copy()
+        elif distances.ndim == 2:
+            if distances.shape != (N, N) or \
+                not np.allclose(distances, distances.T, atol=1e-6) or \
+                not np.allclose(np.diag(distances), 0.0, atol=1e-6):
+                raise ValueError(
+                    f"Provided dist_matrix must be a symmetric {N}x{N} matrix with zeros on the diagonal."
+                )
+            self._distances = distances[np.tril_indices(N, k=-1)]
+        else:
+            raise ValueError("dist_matrix must be either a 1D condensed distance array or a 2D square matrix.")
+
+        if not np.all(self._distances >= 0):
+            # Zeros are allowed because different configuration can produce identical masks
+            raise ValueError("All distances must be non-negative.")
+
+    # --------- Properties for key dimensions of the gate space geometry ---------
+
+    @property
+    def dimensions(self) -> tuple[str, ...]:
+        return tuple(self.info["dimensions"])
+
+    @property
+    def resolution(self) -> int:
+        return self.info["resolution"]
+
+    @property
+    def low(self) -> list[float]:
+        return self.info["lower_bounds"]
+
+    @low.setter
+    def low(self, new_low: list[float]) -> None:
+        if len(new_low) != len(self.dimensions):
+            raise ValueError(f"Expected {len(self.dimensions)} lower bound values, got {len(new_low)}.")
+        self.info["lower_bounds"] = new_low
+        self.eval_points.var["lower_bound"] = new_low
+
+    @property
+    def high(self) -> list[float]:
+        return self.info["upper_bounds"]
+
+    @high.setter
+    def high(self, new_high: list[float]) -> None:
+        if len(new_high) != len(self.dimensions):
+            raise ValueError(f"Expected {len(self.dimensions)} upper bound values, got {len(new_high)}.")
+        self.info["upper_bounds"] = new_high
+        self.eval_points.var["upper_bound"] = new_high
+
+    @property
+    def seed(self) -> int | None:
+        return self.info.get("seed")
+
+    @property
+    def n_eval_points(self) -> int:
+        return self.eval_points.n_obs
+
+    @property
+    def n_entries(self) -> int:
+        return len(self.masks)
+
+    @property
+    def mask_matrix(self) -> BooleanArray:
+        # TODO: move it to eval_points.obs ?
+        if self.masks:
+            return np.vstack(list(self.masks.values()))
+        return np.zeros((0, self.n_eval_points), dtype=bool)
+
+    @property
+    def mean_mask(self) -> FloatArray:
+        """Return the mean mask geometry as a float array of shape (n_eval_points,)."""
+        if self.n_entries == 0:
+            return np.zeros(self.n_eval_points)
+        weights = np.asarray(self.sample_per_gate())
+        return np.average(self.mask_matrix, axis=0, weights=weights)
+
+    @property
+    def n_distances(self) -> int:
+        N = self.n_entries
+        return N * (N - 1) // 2
+
+    @property
+    def distance_matrix(self) -> FloatArray:
+        N = self.n_entries
+        return self.inflate_distances(self._distances, N)
+
+    @property
+    def centrality(self) -> FloatArray:
+        if self._centrality is None:
+            self._centrality = self._compute_centrality()
+        return self._centrality
+
+    def _compute_centrality(self) -> FloatArray:
+        if self.n_entries == 0:
+            return np.zeros(0, dtype=np.float32)
+        dist_mat = self.distance_matrix
+        return np.sum(dist_mat, axis=1) / (self.n_entries - 1)
+
+    def get_sample_mask(self, sample_id: str) -> BooleanArray:
+        try:
+            key = self.sample_hashes[sample_id]
+            return self.masks[key]
+        except KeyError as e:
+            raise ValueError(f'No mask found for sample_id: "{sample_id}".') from e
+
+    def _sample_index(self, sample_id: str) -> int:
+        try:
+            key = self.sample_hashes[sample_id]
+            return self.gates[key]
+        except KeyError as e:
+            raise ValueError(f'No gate index found for sample_id: "{sample_id}".') from e
+
+    def centrality_by_sample(self) -> dict[str, float]:
+        return {sid: self.centrality[self.gates[key]] for sid, key in self.sample_hashes.items() if sid != "__batch__"}
+
+    def sample_per_gate(self) -> list[int]:
+        """Return a mapping of sample_id to gate hash key for all samples with masks."""
+        gate_count = [0 for k in self.gates]
+        for sid, key in self.sample_hashes.items():
+            if sid == "__batch__": continue
+            idx = self.gates[key]
+            gate_count[idx] += 1
+        return gate_count
+
+    # ------------------------------------------------------------------
+    # Artifact I/O helpers
+    # ------------------------------------------------------------------
+
+    def save(
+        self,
+        *,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+    ) -> None:
+        """Persist all gate-space artifacts and update ``entity_qc.artifacts``."""
+        artifact_dir = dataloader.get_entity_qc_artifact_path(
+            entity_type="gate_node",
+            entity_id=self.info["gate_id"],
+            artifact_key=self.artifact_key
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        info = dict(self.info)  # copy to avoid mutating in-memory state
+        info["sample_hashes"] = self.sample_hashes
+        # gate_index will be reconstructed masks in `._validate_masks()`, so we don't need to persist it
+        info["distances"] = self._distances
+
+        # Save eval_points as a single .h5ad file and store masks in `.obs`
+        adata = self.eval_points.copy()
+        # Ensure obs contains mask columns: one column per mask key, rows == n_eval_points
+        if self.masks:
+            obs_df = pd.DataFrame({k: np.asarray(v, dtype=bool) for k, v in self.masks.items()})
+        else:
+            obs_df = pd.DataFrame(index=range(self.n_eval_points))
+        adata.obs = obs_df
+
+        h5ad_name = "eval_points.h5ad"
+        dataloader._save_h5ad(adata, artifact_dir / h5ad_name)
+
+        # Record pointer to h5ad in info (do not inline large arrays)
+        info["eval_points_h5ad"] = h5ad_name
+
+        # Persist remaining metadata
+        dataloader._save_json(artifact_dir / "info.json", info)
+
+        entity_qc.artifacts[self.artifact_key] = {
+            "artifact_type": self.artifact_key,
+            "gate_id": info["gate_id"],
+            "schema_version": _GATE_SPACE_ARTIFACT_VERSION,
+            "updated_at": now_iso(),
+        }
+
+    @classmethod
+    def load(
+        cls,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader,
+        entity: GateNode,
+    ) -> "GateSpaceGeometry | None":
+        """Load persisted gate-space state.  Returns ``None`` if absent or corrupt."""
+
+        artifact_key = cls.artifact_key
+        artifact_dir = dataloader.get_entity_qc_artifact_path(
+            entity_type="gate_node",
+            entity_id=entity.id,
+            artifact_key=artifact_key
+        )
+
+        try:
+            metadata: dict[str, str] = entity_qc.artifacts[artifact_key]
+        except KeyError:
+            return None
+
+        assert metadata["artifact_type"] == artifact_key, \
+            f"Expected artifact_type {artifact_key}, got {metadata['artifact_type']}"
+
+        try:
+            info = dataloader._load_json(artifact_dir / "info.json")
+        except Exception:
+            entity_qc.artifacts.pop(artifact_key, None)
+            return None
+        info = cast(Mapping[str, Any], info)  # for type checking purposes only
+
+        cls._validate_gate(entity, info)
+
+        # Load eval_points H5AD (which stores masks in `.obs`)
+        h5ad_name = info.get("eval_points_h5ad", "eval_points.h5ad")
+        try:
+            eval_points = dataloader._load_h5ad(artifact_dir / h5ad_name)
+        except Exception:
+            # If we fail to load the heavy artifact, consider artifact corrupt
+            entity_qc.artifacts.pop(artifact_key, None)
+            return None
+
+        # Extract masks from AnnData.obs -- columns correspond to mask keys
+        masks: dict[str, BooleanArray] = {}
+        if hasattr(eval_points, "obs") and isinstance(eval_points.obs, pd.DataFrame):
+            for col in eval_points.obs.columns:
+                masks[col] = np.asarray(eval_points.obs[col].values, dtype=bool)
+
+        raw_dist = info.get("distances")
+        dist_matrix = None
+        if raw_dist is not None:
+            dist_matrix = np.asarray(raw_dist, dtype=float)
+
+        return cls(
+            info=info,
+            gate_node=entity,
+            eval_points=eval_points,
+            masks=masks,
+            dist_matrix=dist_matrix,
+        )
+
+    @classmethod
+    def update(
+        cls,
+        *,
+        entity: GateNode,
+        dataloader: UnifiedDataLoader,
+        entity_qc: EntityQCStatus,
+        sample_ids: list[str],
+        config: Mapping[str, Any] | None = None,
+    ):
+        """Update gate-space geometry based on the current gate configuration and provided sample IDs.
+
+        This method applies the following update policy:
+        - If the gate type is Boolean or Quadrant, or if the config policy is "skip", no updates are made.
+        - If an artifact exists but the gate configuration has changed (as determined by hash keys), the artifact is deleted and rebuilt from scratch.
+        - If an artifact exists and the gate configuration has not changed, only the distance matrix is recomputed to reflect any changes in eval points or masks.
+        - If no artifact exists, a new one is created from scratch.
+        """
+
+        config = config or {}
+        resolution=config.get("gate_space_resolution", 1024)
+        seed=config.get("gate_space_seed", 42)
+        artifact = cls.load(entity_qc=entity_qc, dataloader=dataloader, entity=entity)
+        if artifact is None or resolution != artifact.resolution or seed != artifact.seed:
+            artifact = cls.create_artifact(
+                entity=entity,
+                entity_qc=entity_qc,
+                dataloader=dataloader,
+                sample_ids=sample_ids,
+                resolution=resolution,
+                seed=seed,
+            )
+            return
+        # For update we rebuild the GateSpaceGeometry object using the
+        # current artifact state (masks/eval_points) and the existing
+        # condensed distances. The heavy inflate/deflate logic lives in
+        # ``__init__`` after ``_validate_masks`` so we delegate to that
+        # machinery by re-instantiating the object.
+        artifact._add_missing_samples(sample_ids)
+        gate_cls = GateRegistry.get(entity.gate_type)
+
+        # Ensure masks exist for any newly required gate configs
+        for sample_id in sample_ids:
+            try:
+                gate = gate_cls.from_node(entity, sample_id=sample_id)
+                key = hex(hash(gate))
+            except Exception:
+                key = None
+            if key is None:
+                continue
+            artifact.sample_hashes[sample_id] = key
+            if key not in artifact.masks:
+                artifact.masks[key] = artifact.get_mask(gate) # pyright: ignore[reportPossiblyUnboundVariable]
+
+        # Default gate
+        try:
+            default_gate = gate_cls.from_node(entity)
+            default_key = hex(hash(default_gate))
+        except Exception:
+            default_key = None
+
+        if default_key is not None:
+            artifact.sample_hashes.setdefault("__batch__", default_key)
+            if default_key not in artifact.masks:
+                artifact.masks[default_key] = artifact.get_mask(default_gate) # pyright: ignore[reportPossiblyUnboundVariable]
+
+        # Rebuild via constructor to let __init__ handle inflation/deflation
+        new_artifact = cls(
+            info=artifact.info,
+            gate_node=entity,
+            sample_ids=sample_ids,
+            eval_points=artifact.eval_points,
+            masks=artifact.masks,
+            dist_matrix=artifact._distances
+        )
+        new_artifact.save(entity_qc=entity_qc, dataloader=dataloader)
 
 
 # ============================================================================
@@ -650,7 +1287,6 @@ class _GateCoverageOutlierProxy(QCTester):
 
 
 @EntityQCEvaluatorRegistry.register("gate_node")
-
 class GateNodeQCEvaluator(EntityQCEvaluator):
     """QC evaluator for individual gate nodes within a gating strategy.
 
@@ -674,7 +1310,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         },
     }
     _supported_figures = {}  # Test plots are auto-discovered from registered tests
-    _glm_gate_space_artifact_name = "glm_gate_space"
+    _gate_space_artifact_name = "gate_space"
 
     default_config = {
         "ratio_total_min": 0.0,
@@ -695,12 +1331,12 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         "use_mad": True,
         # Full-gate geometry outlier config
         "gate_space_min_samples": 6,
-        "gate_space_n_points": 2048,
+        "gate_space_resolution": 256,
         "gate_space_thresholds": {
             "warn": (-3.0, 3.0),
             "severe": (-5.0, 5.0),
         },
-        "gate_space_seed": 0,
+        "gate_space_seed": 42,
         "gate_space_update_policy": "incremental",
     }
 
@@ -770,6 +1406,41 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         """
         return dataloader.load_gate_node(node_id=str(entity_id))
 
+    def prepare_artifacts(
+        self,
+        entity: Any,
+        entity_qc: EntityQCStatus,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+
+        dataloader_context = dataloader_context or {}
+        context = context or {}
+
+        config = self.config.copy()
+        config.update(context)
+        sample_ids = list(
+            context.get("sample_ids")
+            or dataloader_context.get("sample_ids")
+            or entity_qc.sample_qc.keys()
+        )
+
+        if dataloader is None:
+            raise ValueError("dataloader must be provided to load gate masks")
+
+        if entity.gate_type in {"Boolean", "Quadrant"} or config.get("gate_space_update_policy") == "skip":
+            return
+
+        GateSpaceGeometry.update(
+            entity=entity,
+            entity_qc=entity_qc,
+            dataloader=dataloader,
+            sample_ids=sample_ids,
+            config=config,
+        )
+
     def update_sample_qc(
         self,
         entity: GateNode,
@@ -777,7 +1448,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate gate node QC against sample data.
 
@@ -800,19 +1471,25 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         """
         # Default context to empty dict to avoid None checks
         dataloader_context = dataloader_context or {}
+        context = context or {}
 
         config = self.config.copy()
         config.update(context)
-        entity_qc.context = config
+        sample_ids = list(
+            context.get("sample_ids")
+            or dataloader_context.get("sample_ids")
+            or entity_qc.sample_qc.keys()
+        )
+        entity_qc.context = {
+            **config,
+            "sample_ids": sample_ids,
+        }
 
         # Dataloader is required to load masks for QC evaluation.
         if dataloader is None:
             raise ValueError("dataloader must be provided to load gate masks")
 
-        # Gate event count QC only needs masks; no need to load AnnData.
-        sample_ids = dataloader_context.get("sample_ids") or list(entity_qc.sample_qc.keys())
-
-        # Process all samples
+        # Main evaluation
         for sample_id in sample_ids:
             self._evaluate_gate_node(
                 entity=entity,
@@ -822,6 +1499,137 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                 dataloader=dataloader,
             )
 
+    def _evaluate_gate_node(
+        self,
+        entity: GateNode,
+        entity_qc: EntityQCStatus,
+        sample_id: str,
+        config: Mapping[str, Any],
+        dataloader: UnifiedDataLoader,
+    ) -> None:
+        """Evaluate the gate node for a single sample.
+
+        Parameters
+        ----------
+        entity : GateNode
+            The gate node to evaluate
+        entity_qc : EntityQCStatus
+            QC status to update
+        sample_id : str
+            Sample identifier
+        config : Mapping[str, Any]
+            Evaluation config with threshold settings
+        dataloader : UnifiedDataLoader
+            Dataloader for loading gate masks
+        """
+        sample_steps = entity_qc.get_sample_steps(sample_id)
+        mask_step = sample_steps.get_step("GATE_QC_MASK")
+        diagnostics_step = sample_steps.get_step("GATE_QC_DIAGNOSTICS")
+        gate_targets = {
+            "sample_id": sample_id,
+            "gate_id": entity.id,
+        }
+
+        self._evaluate_gate_mask(
+            entity=entity,
+            sample_id=sample_id,
+            config=config,
+            dataloader=dataloader,
+            step=mask_step,
+            gate_targets=gate_targets,
+        )
+
+        self._evaluate_gate_diagnostics(
+            entity=entity,
+            config=config,
+            step=diagnostics_step,
+            gate_targets=gate_targets,
+        )
+
+    def _evaluate_gate_mask(
+        self,
+        entity: GateNode,
+        sample_id: str,
+        config: Mapping[str, Any],
+        dataloader: UnifiedDataLoader,
+        step: QCStepStatus,
+        gate_targets: dict[str, str],
+    ) -> None:
+        """Evaluate mask-derived gate metrics for a single sample."""
+        gate_id = gate_targets["gate_id"]
+        masks_to_load = [pid for pid in entity.parent_ids if pid != "root"]
+        masks_to_load.append(gate_id)
+
+        try:
+            masks = dataloader.load_masks(
+                sample_id=sample_id,
+                gate_ids=masks_to_load,
+            )
+        except FileNotFoundError as e:
+            step.flag = QCFlag.FAIL
+            step.add_reason(
+                code="GATE_MASKS_MISSING",
+                message=f"Required gate masks are missing for sample {sample_id}: {e}",
+            )
+            return
+
+        event_tester = GateMaskRatioTest(
+            config={},
+            thresholds={
+                "ratio_total": {
+                    "warn": (config["ratio_total_min"], config["ratio_total_max"]),
+                    "severe": (None, None),
+                },
+                "ratio_parent": {
+                    "warn": (config["ratio_parent_min"], config["ratio_parent_max"]),
+                    "severe": (None, None),
+                },
+            }
+        )
+
+        for classified_test in event_tester.fit_classify(
+            targets=gate_targets,
+            entity=entity,
+            masks=masks,
+        ):
+            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
+                step.add_reason(
+                    code=f"GATING_{classified_test.status}",
+                    message=classified_test.message,
+                    tests=[classified_test],
+                )
+            else:
+                step.add_test(classified_test)
+
+    def _evaluate_gate_diagnostics(
+        self,
+        entity: GateNode,
+        config: Mapping[str, Any],
+        step: QCStepStatus,
+        gate_targets: dict[str, str],
+    ) -> None:
+        """Evaluate fitted-gate diagnostics for a single sample."""
+        fitting_tester = GateFitDiagnosticTest(
+            thresholds={
+                "r_squared": {"warn": (config["r_squared"], None), "severe": (None, None)},
+                "residual_std": {"warn": (None, config["residual_std"]), "severe": (None, None)},
+                "n_outliers": {"warn": (None, config["n_outliers"]), "severe": (None, None)},
+            }
+        )
+
+        for classified_test in fitting_tester.fit_classify(
+            targets=gate_targets,
+            entity=entity,
+        ):
+            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
+                step.add_reason(
+                    code=f"GATE_FITTING_{classified_test.status}",
+                    message=classified_test.message,
+                    tests=[classified_test],
+                )
+            else:
+                step.add_test(classified_test)
+
     def update_batch_qc(
         self,
         entity: GateNode,
@@ -829,37 +1637,31 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Update batch-level QC tests for gate node.
 
         Runs outlier detection across samples for this gate's event metrics.
         """
+        if dataloader is None:
+            raise ValueError("dataloader must be provided to load gate masks and geometry for batch QC")
+
+        context = context or {}
         config = self.config.copy()
         config.update(context)
 
-        # Get batch QC step
+        # Get basic QC
+        sample_ids = list(entity_qc.sample_qc.keys())
         batch_step = entity_qc.batch_qc.get_step("GATE_NODE_BATCH_QC")
-        param_metrics = self._collect_sample_params(entity_qc, gate_node=entity)
-        sample_ids = param_metrics["sample_ids"]
-
-        has_custom_gates = bool(entity.custom_gates)
-        # Without per-sample custom gates, params and gate-space centrality are
-        # deterministic across samples and not informative for outlier detection.
-        skip_param_and_centrality = not has_custom_gates
-
-        mask_metrics = self._collect_sample_metrics(
-            entity_qc,
-            gate_id=entity.id,
-            sample_ids=sample_ids,
-        )
-
+        param_metrics, diag_metrics = self._collect_sample_params(entity_qc, gate_node=entity)
+        mask_metrics = self._collect_mask_metrics(entity_qc, gate_id=entity.id)
         sample_metrics: dict[str, dict[str, list[float]]] = {
-            "diagnostics": param_metrics["diagnostics"],
+            "diagnostics": diag_metrics,
             "mask": mask_metrics,
         }
-        if not skip_param_and_centrality:
-            sample_metrics["params"] = param_metrics["params"]
+
+        if entity.custom_gates:
+            sample_metrics["params"] = param_metrics
 
         # Run outlier detection for this gate
         method = config["outlier_method"]
@@ -901,465 +1703,58 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                     else:
                         batch_step.add_test(classified_test)
 
-        # Compare full gate spaces across samples using glm_type-specific geometry.
-        # Skip this when gate parameters are deterministic across samples.
-        if not skip_param_and_centrality:
-            gate_space_sample_ids = list(entity_qc.sample_qc.keys())
-            gate_space_thresholds = self._normalize_outlier_thresholds(
-                config.get("gate_space_thresholds", config.get("outlier_thresholds", config.get("thresholds")))
-            )
-            gate_space_state = None
-            if dataloader is not None:
-                gate_space_state = self._get_or_build_glm_gate_space_state(
-                    entity=entity,
-                    entity_qc=entity_qc,
-                    dataloader=dataloader,
-                    sample_ids=gate_space_sample_ids,
-                    config=config,
+        # Compare full gate spaces across samples using the cached coarse-grained geometry.
+        gate_space_geometry = GateSpaceGeometry.load(entity_qc=entity_qc, dataloader=dataloader, entity=entity)
+        if gate_space_geometry is None: return
+
+        # Build Tester
+        gate_space_targets = {"entity_id": entity.id, "metric_type": "params"}
+        gate_space_min_samples = int(config["gate_space_min_samples"])
+        gate_space_config = {
+            "min_samples": gate_space_min_samples,
+            "outlier_method": "zscore",
+            "use_mad": config["use_mad"],
+        }
+        gate_space_thresholds = self._normalize_outlier_thresholds(
+            config["gate_space_thresholds"]
+        )
+        centrality = gate_space_geometry.centrality_by_sample()
+        space_tester = make_scalar_outlier_tester(
+            entity,
+            test_name="gate_geometry_outlier",
+            test_type="gate_batch",
+            config=gate_space_config,
+            thresholds=gate_space_thresholds,
+            extra_meta_fields=[
+                ("glm_type",   "Type of GLM gate"),
+                ("resolution", "Resolution of the gate space geometry"),
+            ],
+            extra_static_meta={
+                "glm_type":   entity.glm_type or "",
+                "resolution": config.get("gate_space_resolution", 256),
+            },
+            plot_description="Gate-space centrality outlier score per sample",
+        )
+
+        # Run outlier detection on gate space centrality scores
+        for classified_test in space_tester.fit_classify(
+            targets=gate_space_targets,
+            sample_values=centrality,
+            metric_name="centrality_score",
+        ):
+            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
+                batch_step.add_reason(
+                    code=f"GATE_GLM_SPACE_OUTLIER_{classified_test.status}",
+                    message=classified_test.message,
+                    tests=[classified_test],
                 )
-
-            gate_space_targets = {"entity_id": entity.id, "metric_type": "params"}
-            gate_space_min_samples = int(config["gate_space_min_samples"])
-            gate_space_config = {
-                "min_samples": gate_space_min_samples,
-                "outlier_method": "zscore",
-                "use_mad": config["use_mad"],
-            }
-
-            # Determine if scoring is possible before building the tester.
-            skip_msg: str | None = None
-            if entity.gate_type in {"Boolean", "Quadrant"}:
-                skip_msg = f"GLM gate outlier test is not applicable for gate_type '{entity.gate_type}'"
-            elif len(gate_space_sample_ids) < gate_space_min_samples:
-                skip_msg = "GLM gate outlier test is not applicable due to insufficient samples"
-            elif gate_space_state is None:
-                skip_msg = (
-                    "gate_space_state must be provided by GateNodeQCEvaluator"
-                    " via _get_or_build_glm_gate_space_state()"
-                )
-
-            n_eval_points = 0
-            centrality: dict[str, float] = {}
-            if skip_msg is None:
-                assert gate_space_state is not None
-                n_eval_points = int(gate_space_state.get("n_eval_points", 0))
-                centrality = {
-                    sid: float(gate_space_state.get("centrality", {}).get(sid, float("nan")))
-                    for sid in gate_space_sample_ids
-                }
-                if not n_eval_points or not any(np.isfinite(v) for v in centrality.values()):
-                    skip_msg = (
-                        "No evaluation points could be generated for GLM gate outlier test,"
-                        " cannot compute gate-space similarity."
-                    )
-
-            space_tester = make_scalar_outlier_tester(
-                entity,
-                test_name="gate_coverage_outlier",
-                test_type="gate_batch",
-                config=gate_space_config,
-                thresholds=gate_space_thresholds,
-                extra_meta_fields=[
-                    ("glm_type",      "Type of GLM gate"),
-                    ("n_eval_points", "Number of evaluation points used"),
-                ],
-                extra_static_meta={
-                    "glm_type":      entity.glm_type or "",
-                    "n_eval_points": n_eval_points,
-                },
-                plot_description="Gate-space centrality outlier score per sample",
-            )
-
-            if skip_msg is not None:
-                thresholds_rec = {"outlier_score": space_tester.thresholds["outlier_score"]}
-                for sid in gate_space_sample_ids:
-                    meta = {
-                        "metric_name":  "centrality_score",
-                        "metric_value": float("nan"),
-                        "sample_id":    sid,
-                        "glm_type":     entity.glm_type or "",
-                        "n_eval_points": n_eval_points,
-                    }
-                    classified_test = QCTestRecord(
-                        id=space_tester.make_key(gate_space_targets, meta),
-                        test_type=space_tester.test_type,
-                        test_name=space_tester.test_name,
-                        targets=gate_space_targets,
-                        metadata=meta,
-                        metrics={"outlier_score": float("nan")},
-                        thresholds=thresholds_rec,
-                        status="SKIP",
-                        message=skip_msg,
-                    )
-                    batch_step.add_test(classified_test)
             else:
-                for classified_test in space_tester.fit_classify(
-                    targets=gate_space_targets,
-                    sample_values=centrality,
-                    metric_name="centrality_score",
-                ):
-                    if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
-                        batch_step.add_reason(
-                            code=f"GATE_GLM_SPACE_OUTLIER_{classified_test.status}",
-                            message=classified_test.message,
-                            tests=[classified_test],
-                        )
-                    else:
-                        batch_step.add_test(classified_test)
+                batch_step.add_test(classified_test)
 
-    def _gate_space_artifact_key(self) -> str:
-        return self._glm_gate_space_artifact_name
-
-    def _gate_space_artifact_dir(
-        self,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-    ) -> Path:
-        return self.artifact_dir(
-            entity_qc,
-            dataloader,
-            self._glm_gate_space_artifact_name,
-        )
-
-    def _gate_space_artifact_paths(
-        self,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-    ) -> dict[str, Path]:
-        artifact_dir = self._gate_space_artifact_dir(entity_qc, dataloader)
-        return {
-            "dir": artifact_dir,
-            "basis": artifact_dir / "basis.json",
-            "sample_index": artifact_dir / "sample_index.json",
-            "eval_points": artifact_dir / "eval_points.npz",
-            "coverage_masks": artifact_dir / "coverage_masks.npz",
-            "distance_state": artifact_dir / "distance_state.npz",
-        }
-
-    def _gate_space_config_payload(
-        self,
-        entity: GateNode,
-        config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
-            "gate_id": entity.id,
-            "gate_type": entity.gate_type,
-            "glm_type": entity.glm_type,
-            "dimensions": list(entity.dimensions),
-            "n_points": int(config["gate_space_n_points"]),
-            "seed": int(config["gate_space_seed"]),
-        }
-
-    def _sample_gate_signature(self, entity: GateNode, sample_id: str) -> str:
-        return _hash_payload(entity.get_params_for_sample(sample_id))
-
-    def _load_glm_gate_space_state(
-        self,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-    ) -> dict[str, Any] | None:
-        artifact_key = self._gate_space_artifact_key()
-        metadata = self.get_artifact_metadata(entity_qc, artifact_key)
-        if not metadata:
-            return None
-
-        paths = self._gate_space_artifact_paths(entity_qc, dataloader)
-        if not all(path.exists() for name, path in paths.items() if name != "dir"):
-            self.invalidate_artifact(entity_qc, artifact_key)
-            return None
-
-        basis = json.loads(paths["basis"].read_text())
-        sample_index = json.loads(paths["sample_index"].read_text())
-        eval_points = np.load(paths["eval_points"], allow_pickle=False)
-        coverage_masks = np.load(paths["coverage_masks"], allow_pickle=False)
-        distance_state = np.load(paths["distance_state"], allow_pickle=False)
-
-        n_eval_points = int(basis.get("n_eval_points", 0))
-        sample_ids = list(sample_index.get("sample_ids", []))
-        packed_masks = np.asarray(coverage_masks["packed_masks"])
-        mask_matrix = _unpack_mask_matrix(packed_masks, n_eval_points) if n_eval_points else np.zeros((0, 0), dtype=bool)
-        centrality_values = np.asarray(distance_state["centrality"], dtype=float)
-
-        return {
-            "metadata": metadata,
-            "basis": basis,
-            "sample_index": sample_index,
-            "eval_points": np.asarray(eval_points["X"], dtype=float),
-            "mask_matrix": mask_matrix,
-            "distance_matrix": np.asarray(distance_state["distance_matrix"], dtype=float),
-            "centrality_vector": centrality_values,
-            "sample_ids": sample_ids,
-            "sample_hashes": dict(sample_index.get("sample_hashes", {})),
-            "n_eval_points": n_eval_points,
-            "centrality": dict(zip(sample_ids, centrality_values.tolist())),
-        }
-
-    def _save_glm_gate_space_state(
-        self,
-        *,
-        entity: GateNode,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-        config: Mapping[str, Any],
-        sample_ids: list[str],
-        sample_hashes: dict[str, str],
-        low: np.ndarray,
-        high: np.ndarray,
-        eval_points: np.ndarray,
-        mask_matrix: np.ndarray,
-        distance_matrix: np.ndarray,
-        centrality_vector: np.ndarray,
-    ) -> dict[str, Any]:
-        paths = self._gate_space_artifact_paths(entity_qc, dataloader)
-        paths["dir"].mkdir(parents=True, exist_ok=True)
-
-        basis = {
-            **self._gate_space_config_payload(entity, config),
-            "low": low.tolist(),
-            "high": high.tolist(),
-            "n_eval_points": int(eval_points.shape[0]),
-        }
-        sample_index = {
-            "sample_ids": sample_ids,
-            "sample_hashes": sample_hashes,
-        }
-
-        paths["basis"].write_text(json.dumps(basis, indent=2, cls=NumpyEncoder))
-        paths["sample_index"].write_text(json.dumps(sample_index, indent=2, cls=NumpyEncoder))
-        np.savez_compressed(paths["eval_points"], X=eval_points)
-        np.savez_compressed(paths["coverage_masks"], packed_masks=_pack_mask_matrix(mask_matrix))
-        np.savez_compressed(
-            paths["distance_state"],
-            distance_matrix=distance_matrix.astype(np.float32),
-            centrality=centrality_vector.astype(np.float32),
-        )
-
-        relative_dir = paths["dir"].relative_to(dataloader.root_dir).as_posix()
-        artifact_key = self._gate_space_artifact_key()
-        artifact_metadata = {
-            "artifact_type": self._glm_gate_space_artifact_name,
-            "schema_version": _GLM_GATE_SPACE_ARTIFACT_VERSION,
-            "relative_dir": relative_dir,
-            "config_fingerprint": _hash_payload(self._gate_space_config_payload(entity, config)),
-            "sample_count": len(sample_ids),
-            "n_eval_points": int(eval_points.shape[0]),
-            "updated_at": now_iso(),
-        }
-        self.set_artifact_metadata(entity_qc, artifact_key, artifact_metadata)
-
-        return {
-            "metadata": artifact_metadata,
-            "basis": basis,
-            "sample_index": sample_index,
-            "eval_points": eval_points,
-            "mask_matrix": mask_matrix,
-            "distance_matrix": distance_matrix,
-            "centrality_vector": centrality_vector,
-            "sample_ids": sample_ids,
-            "sample_hashes": sample_hashes,
-            "n_eval_points": int(eval_points.shape[0]),
-            "centrality": dict(zip(sample_ids, centrality_vector.tolist())),
-        }
-
-    def _rebuild_glm_gate_space_state(
-        self,
-        *,
-        entity: GateNode,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-        sample_ids: list[str],
-        config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        gate_cls = GateRegistry.get(entity.gate_type)
-        gates = {sample_id: gate_cls.from_node(entity, sample_id=sample_id) for sample_id in sample_ids}
-        bounds = _compute_gate_space_bounds(
-            gates=gates,
-            dimensions=entity.dimensions,
-            glm_type=entity.glm_type,
-        )
-        if bounds is None:
-            self.invalidate_artifact(entity_qc, self._gate_space_artifact_key())
-            return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
-
-        low, high = bounds
-        eval_points_adata = _make_gate_space_eval_points(
-            dimensions=entity.dimensions,
-            low=low,
-            high=high,
-            n_points=int(config["gate_space_n_points"]),
-            seed=int(config["gate_space_seed"]),
-        )
-        eval_points = np.asarray(eval_points_adata.X, dtype=float)
-        masks = _compute_gate_space_masks(
-            gates=gates,
-            eval_points=eval_points_adata,
-            gate_id=entity.id,
-        )
-        mask_matrix = np.vstack([masks[sample_id] for sample_id in sample_ids]) if sample_ids else np.zeros((0, eval_points.shape[0]), dtype=bool)
-        distance_matrix = _compute_jaccard_distance_matrix(mask_matrix)
-        centrality_vector = _compute_gate_space_centrality(distance_matrix)
-        sample_hashes = {sample_id: self._sample_gate_signature(entity, sample_id) for sample_id in sample_ids}
-        return self._save_glm_gate_space_state(
-            entity=entity,
-            entity_qc=entity_qc,
-            dataloader=dataloader,
-            config=config,
-            sample_ids=sample_ids,
-            sample_hashes=sample_hashes,
-            low=low,
-            high=high,
-            eval_points=eval_points,
-            mask_matrix=mask_matrix,
-            distance_matrix=distance_matrix,
-            centrality_vector=centrality_vector,
-        )
-
-    def _maybe_incremental_glm_gate_space_state(
-        self,
-        *,
-        entity: GateNode,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-        sample_ids: list[str],
-        config: Mapping[str, Any],
-        existing_state: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        existing_sample_ids = list(existing_state["sample_ids"])
-        if sample_ids[:len(existing_sample_ids)] != existing_sample_ids:
-            return None
-
-        sample_hashes = {sample_id: self._sample_gate_signature(entity, sample_id) for sample_id in sample_ids}
-        for sample_id in existing_sample_ids:
-            if sample_hashes[sample_id] != existing_state["sample_hashes"].get(sample_id):
-                return None
-
-        new_sample_ids = sample_ids[len(existing_sample_ids):]
-        if not new_sample_ids:
-            centrality_vector = _compute_gate_space_centrality(existing_state["distance_matrix"])
-            existing_state["centrality_vector"] = centrality_vector
-            existing_state["centrality"] = dict(zip(existing_sample_ids, centrality_vector.tolist()))
-            return existing_state
-
-        basis = existing_state["basis"]
-        gate_cls = GateRegistry.get(entity.gate_type)
-        new_gates = {sample_id: gate_cls.from_node(entity, sample_id=sample_id) for sample_id in new_sample_ids}
-        new_bounds = _compute_gate_space_bounds(
-            gates=new_gates,
-            dimensions=entity.dimensions,
-            glm_type=entity.glm_type,
-        )
-        if new_bounds is None:
-            return None
-
-        low = np.asarray(basis["low"], dtype=float)
-        high = np.asarray(basis["high"], dtype=float)
-        new_low, new_high = new_bounds
-        if np.any(new_low < low) or np.any(new_high > high):
-            return None
-
-        eval_points_adata = ad.AnnData(X=existing_state["eval_points"])
-        eval_points_adata.var_names = entity.dimensions
-        new_masks = _compute_gate_space_masks(
-            gates=new_gates,
-            eval_points=eval_points_adata,
-            gate_id=entity.id,
-        )
-        new_mask_matrix = np.vstack([new_masks[sample_id] for sample_id in new_sample_ids])
-
-        old_mask_matrix = existing_state["mask_matrix"]
-        new_to_old = _compute_jaccard_distance_between(new_mask_matrix, old_mask_matrix)
-        new_to_new = _compute_jaccard_distance_matrix(new_mask_matrix)
-        upper = np.hstack([existing_state["distance_matrix"], new_to_old.T])
-        lower = np.hstack([new_to_old, new_to_new])
-        distance_matrix = np.vstack([upper, lower])
-        mask_matrix = np.vstack([old_mask_matrix, new_mask_matrix])
-        centrality_vector = _compute_gate_space_centrality(distance_matrix)
-
-        return self._save_glm_gate_space_state(
-            entity=entity,
-            entity_qc=entity_qc,
-            dataloader=dataloader,
-            config=config,
-            sample_ids=sample_ids,
-            sample_hashes=sample_hashes,
-            low=low,
-            high=high,
-            eval_points=existing_state["eval_points"],
-            mask_matrix=mask_matrix,
-            distance_matrix=distance_matrix,
-            centrality_vector=centrality_vector,
-        )
-
-    def _get_or_build_glm_gate_space_state(
-        self,
-        *,
-        entity: GateNode,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-        sample_ids: list[str],
-        config: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        if entity.gate_type in {"Boolean", "Quadrant"}:
-            return {"n_eval_points": 0, "centrality": {}, "sample_ids": sample_ids}
-
-        config_payload = self._gate_space_config_payload(entity, config)
-        config_fingerprint = _hash_payload(config_payload)
-        artifact_key = self._gate_space_artifact_key()
-        artifact_metadata = self.get_artifact_metadata(entity_qc, artifact_key)
-        existing_state = self._load_glm_gate_space_state(entity_qc, dataloader)
-        if artifact_metadata is None or existing_state is None:
-            return self._rebuild_glm_gate_space_state(
-                entity=entity,
-                entity_qc=entity_qc,
-                dataloader=dataloader,
-                sample_ids=sample_ids,
-                config=config,
-            )
-
-        if artifact_metadata.get("schema_version") != _GLM_GATE_SPACE_ARTIFACT_VERSION:
-            return self._rebuild_glm_gate_space_state(
-                entity=entity,
-                entity_qc=entity_qc,
-                dataloader=dataloader,
-                sample_ids=sample_ids,
-                config=config,
-            )
-        if artifact_metadata.get("config_fingerprint") != config_fingerprint:
-            return self._rebuild_glm_gate_space_state(
-                entity=entity,
-                entity_qc=entity_qc,
-                dataloader=dataloader,
-                sample_ids=sample_ids,
-                config=config,
-            )
-
-        update_policy = config.get("gate_space_update_policy", "incremental")
-        if update_policy == "incremental":
-            updated_state = self._maybe_incremental_glm_gate_space_state(
-                entity=entity,
-                entity_qc=entity_qc,
-                dataloader=dataloader,
-                sample_ids=sample_ids,
-                config=config,
-                existing_state=existing_state,
-            )
-            if updated_state is not None:
-                return updated_state
-
-        return self._rebuild_glm_gate_space_state(
-            entity=entity,
-            entity_qc=entity_qc,
-            dataloader=dataloader,
-            sample_ids=sample_ids,
-            config=config,
-        )
-
-    def _collect_sample_metrics(
+    def _collect_mask_metrics(
         self,
         entity_qc: EntityQCStatus,
         gate_id: str,
-        sample_ids: list[str] | None = None,
     ) -> dict[str, list[float]]:
         """Collect scalar mask metrics in metric-centric format.
 
@@ -1369,32 +1764,25 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             Mapping ``metric_name -> [value_per_sample, ...]`` aligned with
             ``sample_ids``. Missing values are filled with ``NaN``.
         """
-        aligned_sample_ids = sample_ids or list(entity_qc.sample_qc.keys())
-        n_samples = len(aligned_sample_ids)
-        sample_index = {sid: idx for idx, sid in enumerate(aligned_sample_ids)}
+        sample_ids = list(entity_qc.sample_qc.keys())
+        n_samples = len(sample_ids)
         metrics_by_name: dict[str, list[float]] = {}
 
-        for sample_id, sample_qc_run in entity_qc.sample_qc.items():
-            if sample_id not in sample_index:
-                continue
+        for idx, sample_id in enumerate(sample_ids):
+            for step_name, test_key, test_record in entity_qc.iter_sample_tests(sample_id):
+                if (test_record.test_type == GateMaskRatioTest.test_type and
+                    test_record.test_name == GateMaskRatioTest.test_name and
+                    test_record.targets["gate_id"] == gate_id):
 
-            for step in sample_qc_run.steps.values():
-                for test_record in step.tests.values():
-                    if (test_record.test_type == "gate" and
-                        test_record.test_name == GateMaskRatioTest.test_name and
-                        test_record.targets.get("gate_id") == gate_id):
-
-                        idx = sample_index[sample_id]
-                        # Extract metrics and align them by sample index.
-                        for metric_key, metric_value in test_record.metrics.items():
-                            metric_series = metrics_by_name.setdefault(
-                                metric_key,
-                                [float("nan")] * n_samples,
-                            )
-                            try:
-                                metric_series[idx] = float(metric_value)
-                            except (TypeError, ValueError):
-                                continue
+                    for metric_key, metric_value in test_record.metrics.items():
+                        metric_series = metrics_by_name.setdefault(
+                            metric_key,
+                            [float("nan")] * n_samples,
+                        )
+                        try:
+                            metric_series[idx] = float(metric_value)
+                        except (TypeError, ValueError):
+                            continue
 
         return metrics_by_name
 
@@ -1402,7 +1790,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         self,
         entity_qc: EntityQCStatus,
         gate_node: GateNode
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Collect scalar gate metrics across samples in metric-centric format.
 
         Expected shape (by convention, not enforced by all gates):
@@ -1413,12 +1801,11 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
 
         Returns
         -------
-        dict[str, Any]
-            {
-                "sample_ids": [sample_id, ...],
-                "params": {metric_name: [value_per_sample, ...]},
-                "diagnostics": {metric_name: [value_per_sample, ...]},
-            }
+        tuple[dict[str, Any], dict[str, Any]]
+            (
+                {"params": {metric_name: [value_per_sample, ...]}},
+                {"diagnostics": {metric_name: [value_per_sample, ...]}},
+            )
             Metric series are aligned with "sample_ids".
         """
         sample_ids = list(entity_qc.sample_qc.keys())
@@ -1446,111 +1833,4 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                         # Keep NaN for non-numeric values.
                         continue
 
-        return {
-            "sample_ids": sample_ids,
-            "params": sample_params,
-            "diagnostics": sample_diagnostics,
-        }
-
-    def _evaluate_gate_node(
-        self,
-        entity: GateNode,
-        entity_qc: EntityQCStatus,
-        sample_id: str,
-        config: Mapping[str, Any],
-        dataloader: UnifiedDataLoader,
-    ) -> None:
-        """Evaluate the gate node for a single sample.
-
-        Parameters
-        ----------
-        entity : GateNode
-            The gate node to evaluate
-        entity_qc : EntityQCStatus
-            QC status to update
-        sample_id : str
-            Sample identifier
-        config : Mapping[str, Any]
-            Evaluation config with threshold settings
-        dataloader : UnifiedDataLoader
-            Dataloader for loading gate masks
-        """
-        # Get QC step for this sample
-        step = entity_qc.get_sample_steps(sample_id).get_step("GATE_NODE_QC")
-
-        # Load gate masks from dataloader
-        gate_id = entity.id
-        masks_to_load = [gate_id] + entity.parent_ids
-        try:
-            masks_to_load.remove("root")
-        except ValueError:
-            pass  # No root mask to pop, continue with available masks
-
-        try:
-            masks = dataloader.load_masks(
-                sample_id=sample_id,
-                gate_ids=masks_to_load,
-            )
-        except FileNotFoundError as e:
-            raise ValueError(
-                f"Missing required masks for sample {sample_id}: {e}"
-            )
-
-
-        gate_targets = {
-            "sample_id": sample_id,
-            "gate_id": gate_id,
-        }
-
-        # Run event count test
-        event_tester = GateMaskRatioTest(
-            config={},
-            thresholds={
-                "ratio_total": {
-                    "warn": (config["ratio_total_min"], config["ratio_total_max"]),
-                    "severe": (None, None),
-                },
-                "ratio_parent": {
-                    "warn": (config["ratio_parent_min"], config["ratio_parent_max"]),
-                    "severe": (None, None),
-                },
-            }
-        )
-
-        for classified_test in event_tester.fit_classify(
-            targets=gate_targets,
-            entity=entity,
-            masks=masks,
-        ):
-            # Add to step
-            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
-                step.add_reason(
-                    code=f"GATING_{classified_test.status}",
-                    message=classified_test.message,
-                    tests=[classified_test],
-                )
-            else:
-                step.add_test(classified_test)
-
-        # Run gate fitting quality test
-        fitting_tester = GateFitDiagnosticTest(
-            thresholds={
-                "r_squared": {"warn": (config["r_squared"], None), "severe": (None, None)},
-                "residual_std": {"warn": (None, config["residual_std"]), "severe": (None, None)},
-                "n_outliers": {"warn": (None, config["n_outliers"]), "severe": (None, None)},
-            }
-        )
-
-        for classified_test in fitting_tester.fit_classify(
-            targets=gate_targets,
-            entity=entity,
-        ):
-            # Add to step
-            if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
-                step.add_reason(
-                    code=f"GATE_FITTING_{classified_test.status}",
-                    message=classified_test.message,
-                    tests=[classified_test],
-                )
-            else:
-                step.add_test(classified_test)
+        return sample_params, sample_diagnostics
