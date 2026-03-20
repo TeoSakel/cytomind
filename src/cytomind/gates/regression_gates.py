@@ -12,11 +12,11 @@ from cytomind.gates.glm_gates import PolygonGate
 from . import GateRegistry
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
+    from cytomind.domain.constants import FloatArray
     from pandas import DataFrame
 else:
-    NDArray = object
     DataFrame = object
+    FloatArray = object
 
 
 class RegressionGate(PolygonGate):
@@ -43,7 +43,10 @@ class RegressionGate(PolygonGate):
         x_range: Sequence[float] | None = None,
         y_range: Sequence[float] | None = None,
         num_vertices: int = 5,
+        subsample: float = 1.0,
+        min_points: int = 50,
         use_as_complement: bool = False,
+        vertices = [[0, 0], [0, 1], [1, 0]]
     ) -> None:
         """
         Initialize regression gate.
@@ -62,6 +65,10 @@ class RegressionGate(PolygonGate):
             Optional [min, max] bounds to clip y predictions
         num_vertices : int, optional
             Number of vertices to sample along the curve (default: 50)
+        subsample : float, optional
+            Fraction of data to use for fitting (default: 1.0)
+        min_points : int, optional
+            Minimum number of points required for fitting (default: 50)
         use_as_complement : bool, optional
             Whether to use gate as complement (default: False)
         """
@@ -71,6 +78,10 @@ class RegressionGate(PolygonGate):
             raise ValueError("alpha must be between 0 and 1 (exclusive).")
         if num_vertices < 2:
             raise ValueError("num_vertices must be at least 2.")
+        if not (0.0 < subsample <= 1.0):
+            raise ValueError("subsample must be in (0, 1].")
+        if min_points < 1:
+            raise ValueError("min_points must be >= 1.")
         if x_range is not None:
             if len(x_range) != 2:
                 raise ValueError("x_range must be a sequence of two values [min, max].")
@@ -87,7 +98,6 @@ class RegressionGate(PolygonGate):
                 raise ValueError("y_range max must be greater than or equal to min.")
 
         # Initialize with placeholder vertices (will be set during fitting)
-        vertices = [[0, 0], [0, 1], [1, 0]]
         super().__init__(
             gate_name=gate_name,
             dimensions=dimensions,
@@ -100,31 +110,33 @@ class RegressionGate(PolygonGate):
             "x_range": x_range,
             "y_range": y_range,
             "num_vertices": num_vertices,
+            "subsample": float(subsample),
+            "min_points": int(min_points),
         })
 
     @abstractmethod
-    def _fit_regression(self, x: NDArray[np.float64], y: NDArray[np.float64]) -> None:
+    def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """
         Fit regression model to data.
 
         Parameters
         ----------
-        x : NDArray
+        x : FloatArray
             Independent variable values
-        y : NDArray
+        y : FloatArray
             Dependent variable values
 
         Notes
         -----
         Implementations should store the fitted model as instance attributes
-        for use by _predict_with_confidence().
+        for use by _predict_with_confidence(). Note that `x` and `y` may be
+        a random subsample of the original events (controlled by the
+        `subsample` and `min_points` hyperparameters).
         """
         pass
 
     @abstractmethod
-    def _predict_with_confidence(
-        self, x: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """
         Predict y values with confidence intervals for given x values.
 
@@ -144,7 +156,7 @@ class RegressionGate(PolygonGate):
         """
         pass
 
-    def _get_x_bouns(self, x: NDArray[np.float64]) -> tuple[float, float]:
+    def _get_x_bouns(self, x: FloatArray) -> tuple[float, float]:
         """Get x bounds for prediction based on hyperparams and data."""
         x_min, x_max = x.min(), x.max()
         x_range_data = x_max - x_min
@@ -170,14 +182,33 @@ class RegressionGate(PolygonGate):
         dim_x, dim_y = self.dimensions
 
         # Extract data and convert to numpy arrays
-        x = events_slice[dim_x].to_numpy()
-        y = events_slice[dim_y].to_numpy()
+        x = events_slice[dim_x].to_numpy(np.float32)
+        y = events_slice[dim_y].to_numpy(np.float32)
 
-        # Fit the regression model (implemented by subclass)
-        self._fit_regression(x, y)
+        # Decide whether to subsample for fitting
+        n_total = int(len(x))
+        subsample = float(self.hyperparams.get("subsample", 1.0))
+        min_points = int(self.hyperparams.get("min_points", 1))
 
-        # Store sample size in params (required for confidence interval calculations)
-        self.params["n_obs"] = int(len(x))
+        # Compute number of points to use for fitting
+        k = int(np.ceil(subsample * n_total)) if n_total > 0 else 0
+        k = int(max(min_points, k))
+        k = min(k, n_total)
+
+        if k < n_total and k > 0:
+            rng = np.random.default_rng()
+            idx = rng.choice(n_total, size=k, replace=False)
+            x_fit = x[idx]
+            y_fit = y[idx]
+        else:
+            x_fit = x
+            y_fit = y
+
+        # Fit the regression model (implemented by subclass) on the chosen subset
+        self._fit_regression(x_fit, y_fit)
+
+        # Store sample sizes in params (required for confidence interval calculations)
+        self.params["n_obs"] = int(len(x_fit))
 
         # Generate x values for predictions
         x_low, x_high = self._get_x_bouns(x)
@@ -222,6 +253,8 @@ class LinearRegressionGate(RegressionGate):
     and no significant outliers.
     """
 
+    gate_type = "linear_regression"
+
     def __init__(
         self,
         gate_name: str,
@@ -230,6 +263,8 @@ class LinearRegressionGate(RegressionGate):
         x_range: Sequence[float] | None = None,
         y_range: Sequence[float] | None = None,
         num_vertices: int = 5,
+        subsample: float = 1.0,
+        min_points: int = 50,
         use_as_complement: bool = False,
     ) -> None:
         """
@@ -259,13 +294,15 @@ class LinearRegressionGate(RegressionGate):
             x_range=x_range,
             y_range=y_range,
             num_vertices=num_vertices,
+            subsample=subsample,
+            min_points=min_points,
             use_as_complement=use_as_complement,
         )
 
         # Will store fitted model
         self._ols_fit = None
 
-    def _fit_regression(self, x: NDArray[np.float64], y: NDArray[np.float64]) -> None:
+    def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit ordinary least squares linear regression."""
         # Prepare design matrix with intercept
         X = sm.add_constant(x)
@@ -290,9 +327,7 @@ class LinearRegressionGate(RegressionGate):
         cook_pval = ols_inf.cooks_distance[1] * len(x)  # Adjust p-values for number of observations
         self.diagnostics["n_outliers"] = int(np.sum(cook_pval < 0.05))
 
-    def _predict_with_confidence(
-        self, x: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Predict using OLS model with confidence intervals."""
         if self._ols_fit is None:
             raise RuntimeError("Model not fitted. Call _fit_regression first.")
@@ -323,6 +358,8 @@ class RobustRegressionGate(RegressionGate):
     are computed using weighted least squares with the robust weights.
     """
 
+    gate_type = "robust_regression"
+
     def __init__(
         self,
         gate_name: str,
@@ -331,8 +368,11 @@ class RobustRegressionGate(RegressionGate):
         x_range: Sequence[float] | None = None,
         y_range: Sequence[float] | None = None,
         num_vertices: int = 5,
+        subsample: float = 1.0,
+        min_points: int = 50,
         huber_t: float = 2.01,
         use_as_complement: bool = False,
+        vertices = [[0, 0], [0, 1], [1, 0]]
     ) -> None:
         """
         Initialize robust regression gate.
@@ -351,6 +391,10 @@ class RobustRegressionGate(RegressionGate):
             Optional [min, max] bounds to clip y predictions
         num_vertices : int, optional
             Number of vertices to sample along the curve (default: 50)
+        subsample : float, optional
+            Fraction of data to use for fitting (default: 1.0)
+        min_points : int, optional
+            Minimum number of points required for fitting (default: 50)
         huber_t : float, optional
             Tuning constant for Huber's T function (default: 1.345 for 95% efficiency)
         use_as_complement : bool, optional
@@ -363,6 +407,8 @@ class RobustRegressionGate(RegressionGate):
             x_range=x_range,
             y_range=y_range,
             num_vertices=num_vertices,
+            subsample=subsample,
+            min_points=min_points,
             use_as_complement=use_as_complement,
         )
         self._hyperparams["huber_t"] = huber_t
@@ -371,7 +417,7 @@ class RobustRegressionGate(RegressionGate):
         self._rlm_fit = None
         self._wls_fit = None
 
-    def _fit_regression(self, x: NDArray[np.float64], y: NDArray[np.float64]) -> None:
+    def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit Huber's robust regression and weighted least squares."""
         # Prepare design matrix with intercept
         X = sm.add_constant(x)
@@ -398,9 +444,7 @@ class RobustRegressionGate(RegressionGate):
         self.diagnostics["resid_std"] = float(np.sqrt(self._wls_fit.mse_resid))
         self.diagnostics["n_outliers"] = int(np.sum(self._rlm_fit.weights < 0.9))
 
-    def _predict_with_confidence(
-        self, x: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Predict using WLS model with confidence intervals."""
         if self._wls_fit is None:
             raise RuntimeError("Model not fitted. Call _fit_regression first.")
@@ -429,6 +473,7 @@ class LinearGAMGate(RegressionGate):
     Fits a generalized additive model with a B-spline basis on x to produce
     a smooth curve. Confidence intervals are derived from the GAM prediction.
     """
+    gate_type = "linear_gam"
 
     def __init__(
         self,
@@ -438,6 +483,8 @@ class LinearGAMGate(RegressionGate):
         x_range: Sequence[float] | None = None,
         y_range: Sequence[float] | None = None,
         num_vertices: int = 50,
+        subsample: float = 1.0,
+        min_points: int = 50,
         df: int = 6,
         degree: int = 3,
         use_as_complement: bool = False,
@@ -477,6 +524,8 @@ class LinearGAMGate(RegressionGate):
             x_range=x_range,
             y_range=y_range,
             num_vertices=num_vertices,
+            subsample=subsample,
+            min_points=min_points,
             use_as_complement=use_as_complement,
         )
         self._hyperparams.update({
@@ -487,7 +536,7 @@ class LinearGAMGate(RegressionGate):
         self._bs: Any = None
         self._gam_fit: Any = None
 
-    def _fit_regression(self, x: NDArray[np.float64], y: NDArray[np.float64]) -> None:
+    def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit a linear GAM using B-spline basis on x."""
         from statsmodels.gam.api import BSplines, GLMGam
         df = self.hyperparams["df"]
@@ -512,9 +561,7 @@ class LinearGAMGate(RegressionGate):
             "aic": float(self._gam_fit.aic),
         })
 
-    def _predict_with_confidence(
-        self, x: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Predict using GAM with confidence intervals."""
         if self._gam_fit is None:
             raise RuntimeError("Model not fitted. Call _fit_regression first.")
@@ -587,11 +634,13 @@ def huber_efficiency(t: float) -> float:
 
     return ((A**2) / B)[0]
 
-def huber_c_for_efficiency(target_eff: float = 0.95,
-                           bracket=(1e-6, 50.0),
-                           xtol: float = 1e-12,
-                           rtol: float = 1e-12,
-                           maxiter: int = 20) -> float:
+def huber_c_for_efficiency(
+        target_eff: float = 0.95,
+        bracket=(1e-6, 50.0),
+        xtol: float = 1e-12,
+        rtol: float = 1e-12,
+        maxiter: int = 20
+    ) -> float:
     """
     Find the Huber tuning constant c such that huber_efficiency(c) ~= target_eff.
 

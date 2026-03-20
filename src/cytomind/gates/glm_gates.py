@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from math import e
 import warnings
 from typing import Any, Hashable, Sequence, Mapping, TYPE_CHECKING
 
@@ -8,6 +9,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from .base import Gate
 from . import GateRegistry
@@ -116,7 +118,7 @@ class RootGate(Gate):
             raise ValueError("RootGate does not support use_as_complement")
         super().__init__(gate_name, [], {}, use_as_complement)
 
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         return ()
 
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
@@ -183,8 +185,8 @@ class RectangleGate(Gate):
         self,
         gate_name: str,
         dimensions: Sequence[str],
-        min_vals: Mapping[str, float] = {},
-        max_vals: Mapping[str, float] = {},
+        min_vals: Mapping[str, float] | None = None,
+        max_vals: Mapping[str, float] | None = None,
         use_as_complement: bool = False,
     ) -> None:
         """
@@ -197,7 +199,7 @@ class RectangleGate(Gate):
         use_as_complement : bool
             If True, returns complement (negative) of the gate
         """
-        hyperparams = {"min_vals": dict(min_vals), "max_vals": dict(max_vals)}
+        hyperparams = {"min_vals": dict(min_vals or {}), "max_vals": dict(max_vals or {})}
         super().__init__(gate_name, dimensions, hyperparams, use_as_complement)
         self._parse_hyperparams()
 
@@ -228,7 +230,7 @@ class RectangleGate(Gate):
         boundaries_max = [max_vals.get(dim, None) for dim in self.dimensions]
         self.params["boundaries"] = [boundaries_min, boundaries_max]
 
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         boundaries_min, boundaries_max = self.params["boundaries"]
         return tuple(boundaries_min + boundaries_max)
 
@@ -256,6 +258,25 @@ class RectangleGate(Gate):
         if not isinstance(maxs, list) or len(maxs) != len(self.dimensions):
             raise ValueError("RectangleGate boundaries[1] must match gate dimensions")
         return mins, maxs
+
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+
+        # Parsability and type checks
+        try:
+            boundaries = params["boundaries"]
+            mins = boundaries[0]
+            maxs = boundaries[1]
+        except Exception:
+            return False
+
+        # Structural checks
+        if not isinstance(mins, list) or len(mins) != len(self.dimensions):
+            return False
+        if not isinstance(maxs, list) or len(maxs) != len(self.dimensions):
+            return False
+
+        return True
+
 
     @property
     def min_vals(self) -> dict[str, float | None]:
@@ -298,6 +319,7 @@ class RectangleGate(Gate):
         events: ad.AnnData,
         mask: dict[str, BooleanArray],
         dimensions: Sequence[str] | None = None,
+        marginals: bool = False,
         *,
         hist_nbins: int = 100,
         hist_color: str = "rgba(100, 100, 200, 0.6)",
@@ -329,6 +351,9 @@ class RectangleGate(Gate):
             Event data (pre-filtered by parent mask)
         mask : dict[str, BooleanArray]
             Parent gate mask (required but not used for plotting)
+        marginals : bool, optional
+            If True and plotting 2D projections, show marginal 1D histograms
+            on the top (x) and right (y) sides of the scatter plot.
 
         Returns
         -------
@@ -358,6 +383,7 @@ class RectangleGate(Gate):
             "gate_line_color": gate_line_color,
             "gate_line_width": gate_line_width,
             "gate_line_dash": gate_line_dash,
+            "marginals": marginals,
             "title": title,
             "width": width,
             "height": height,
@@ -417,6 +443,10 @@ class RectangleGate(Gate):
 
     def _plot_2D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
         x_dim, y_dim = plot_dims
+        # support optional marginal (side) plots: dispatch to auxiliary method
+        show_marginals = bool(kwargs.get("marginals", False) or kwargs.get("show_marginals", False))
+        if show_marginals:
+            return self._plot_2D_marginals(events, plot_dims, **kwargs)
         x_data = np.asarray(events[:, x_dim].X).ravel()
         y_data = np.asarray(events[:, y_dim].X).ravel()
         density_nbins = int(kwargs.get("density_nbins", 50))
@@ -477,6 +507,170 @@ class RectangleGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
+
+    def _plot_2D_marginals(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
+        """2D scatter with marginal 1D plots on top and right side."""
+        x_dim, y_dim = plot_dims
+        x_data = np.asarray(events[:, x_dim].X).ravel()
+        y_data = np.asarray(events[:, y_dim].X).ravel()
+
+        density_nbins = int(kwargs.get("density_nbins", 50))
+        density_log_scale = bool(kwargs.get("density_log_scale", True))
+        marker_size = int(kwargs.get("marker_size", 3))
+        colorscale = str(kwargs.get("colorscale", "Viridis"))
+        use_gl = bool(kwargs.get("use_gl", True))
+        max_points = int(kwargs.get("max_points", 50000))
+        downsample_seed = int(kwargs.get("downsample_seed", 0))
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+        hist_nbins = int(kwargs.get("hist_nbins", 100))
+        hist_color = str(kwargs.get("hist_color", "rgba(100, 100, 200, 0.6)"))
+        histnorm = str(kwargs.get("histnorm", "probability"))
+        margin_pad_scale = float(kwargs.get("margin_pad_scale", 0.01))
+
+        title = kwargs.get("title")
+        plot_title = title if title is not None else f"RectangleGate: {self.gate_name}"
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        plot_width = 900 if width is None else int(width)
+        plot_height = 700 if height is None else int(height)
+
+        downsample_idx = _downsample_indices(x_data.shape[0], max_points, downsample_seed)
+        if downsample_idx is not None:
+            x_data = x_data[downsample_idx]
+            y_data = y_data[downsample_idx]
+
+        density = _compute_density_colors(x_data, y_data, nbins=density_nbins, log_scale=density_log_scale)
+
+        fig = make_subplots(
+            rows=2,
+            cols=2,
+            column_widths=[0.8, 0.2],
+            row_heights=[0.2, 0.8],
+            specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "xy"}, {"type": "xy"}]],
+            horizontal_spacing=0.02,
+            vertical_spacing=0.02,
+        )
+
+        # Scatter in bottom-left (row=2,col=1)
+        fig.add_trace(
+            _create_scatter_trace(x_data, y_data, density, marker_size=marker_size, colorscale=colorscale, use_gl=use_gl),
+            row=2,
+            col=1,
+        )
+
+        # Prepare threshold values for marginals
+        min_vals = self.min_vals
+        max_vals = self.max_vals
+        x_min_raw = min_vals[x_dim]
+        x_max_raw = max_vals[x_dim]
+        y_min_raw = min_vals[y_dim]
+        y_max_raw = max_vals[y_dim]
+        x_min = float(x_min_raw) if x_min_raw is not None else None
+        x_max = float(x_max_raw) if x_max_raw is not None else None
+        y_min = float(y_min_raw) if y_min_raw is not None else None
+        y_max = float(y_max_raw) if y_max_raw is not None else None
+
+        # X marginal (top-left)
+        fig.add_trace(
+            go.Histogram(
+                x=x_data,
+                nbinsx=hist_nbins,
+                marker=dict(color=hist_color),
+                histnorm=histnorm,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+
+        # Add x thresholds to top histogram
+        if x_min is not None:
+            fig.add_vline(
+                x=float(x_min),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="min",
+                row=1, col=1, # pyright: ignore[reportArgumentType]
+            )
+        if x_max is not None:
+            fig.add_vline(
+                x=float(x_max),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="max",
+                row=1, col=1, # pyright: ignore[reportArgumentType]
+            )
+
+        # Y marginal (right, bottom-right) as horizontal histogram
+        fig.add_trace(
+            go.Histogram(
+                y=y_data,
+                nbinsy=hist_nbins,
+                marker=dict(color=hist_color),
+                histnorm=histnorm,
+                orientation="h",
+                showlegend=False,
+            ),
+            row=2,
+            col=2,
+        )
+
+        # Add y thresholds to right histogram (horizontal lines)
+        if y_min is not None:
+            fig.add_hline(
+                y=float(y_min),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="min",
+                row=2, col=2, # pyright: ignore[reportArgumentType]
+            )
+        if y_max is not None:
+            fig.add_hline(
+                y=float(y_max),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="max",
+                row=2, col=2, # pyright: ignore[reportArgumentType]
+            )
+
+        # Rectangle overlay on main scatter (reuse computed thresholds)
+
+        data_x_range = (x_data.min(), x_data.max())
+        data_y_range = (y_data.min(), y_data.max())
+
+        fig.add_trace(
+            _create_rectangle_trace(
+                x_min, x_max, y_min, y_max, data_x_range, data_y_range,
+                line_color=gate_line_color, line_width=gate_line_width, name=self.gate_name, use_gl=use_gl,
+            ),
+            row=2, col=1, # pyright: ignore[reportArgumentType]
+        )
+
+        # Axes titles
+        fig.update_xaxes(title_text=x_dim, row=2, col=1)
+        fig.update_yaxes(title_text=y_dim, row=2, col=1)
+
+        # Lock x/y ranges so marginals align tightly with the scatter
+        margin_x = margin_pad_scale * (data_x_range[1] - data_x_range[0])
+        margin_y = margin_pad_scale * (data_y_range[1] - data_y_range[0])
+        padded_range_x = (data_x_range[0] - margin_x, data_x_range[1] + margin_x)
+        padded_range_y = (data_y_range[0] - margin_y, data_y_range[1] + margin_y)
+        fig.update_xaxes(range=[padded_range_x[0], padded_range_x[1]], row=2, col=1)
+        fig.update_xaxes(range=[padded_range_x[0], padded_range_x[1]], row=1, col=1)
+        fig.update_yaxes(range=[padded_range_y[0], padded_range_y[1]], row=2, col=1)
+        fig.update_yaxes(range=[padded_range_y[0], padded_range_y[1]], row=2, col=2)
+
+        # Hide marginal tick labels (they would duplicate the main axes)
+        fig.update_xaxes(showticklabels=False, row=1, col=1)
+        fig.update_yaxes(showticklabels=False, row=2, col=2)
+
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
@@ -636,6 +830,25 @@ class PolygonGate(Gate):
 
         self.params["vertices"] = coords
 
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+
+        # Parsability and type checks
+        try:
+            vertices = params["vertices"]
+            coords = np.asarray(vertices, dtype=np.float64)
+        except Exception:
+            return False
+
+        # Shape checks
+        if coords.ndim != 2 or coords.shape[1] != 2 or coords.shape[0] < 3:
+            return False
+
+        # Content checks
+        if not np.isfinite(coords).all() or np.isnan(coords).any():
+            return False
+
+        return True
+
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         """For PolygonGate, fit just copies hyperparams to params."""
         pass
@@ -653,7 +866,7 @@ class PolygonGate(Gate):
 
         return {self.gate_name: mask}
 
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         return tuple(self.vertices.flatten().tolist())
 
     def plot(
@@ -889,6 +1102,34 @@ class EllipsoidGate(Gate):
 
         self.params["distance_square"] = value
 
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+        # Parsability and type checks
+        try:
+            center = np.asarray(params["center"], dtype=np.float64)
+            covariance_matrix = np.asarray(params["covariance_matrix"], dtype=np.float64)
+            distance_square = float(params["distance_square"])
+        except Exception:
+            return False
+
+        # Shape
+        D = len(self.dimensions)
+        if center.shape != (D,) or covariance_matrix.shape != (D, D):
+            return False
+
+        # Semidefiniteness and symmetry of covariance matrix
+        if not np.allclose(covariance_matrix, covariance_matrix.T):
+            return False
+        atol, rtol = 1e-8, 1e-5
+        w = np.linalg.eigvalsh(covariance_matrix)
+        if not w.min() >= -max(atol, rtol * np.abs(w).max(initial=0.0)):
+            return False
+
+        # Non-negativity of distance_square
+        if distance_square <= 0.:
+            return False
+
+        return True
+
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         pass
 
@@ -911,7 +1152,7 @@ class EllipsoidGate(Gate):
 
         return {self.gate_name: mask}
 
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         center = self.center.tolist()
         cov_flat = self.covariance_matrix.flatten().tolist()
         return tuple(center + cov_flat + [self.distance_square])
@@ -1281,6 +1522,30 @@ class QuadrantGate(Gate):
         # Store computed quadrants
         self.params["quadrants"] = computed_quadrants
 
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+        try:
+            quadrants = params["quadrants"]
+        except KeyError:
+            return False
+
+        if not isinstance(quadrants, dict):
+            return False
+
+        for quad in quadrants.values():
+            if not isinstance(quad, dict):
+                return False
+            for dim_id, (min_val, max_val) in quad.items():
+                if dim_id not in self.dimensions:
+                    return False
+                if min_val is not None and not isinstance(min_val, (int, float)):
+                    return False
+                if max_val is not None and not isinstance(max_val, (int, float)):
+                    return False
+                if min_val is not None and max_val is not None and min_val >= max_val:
+                    return False
+
+        return True
+
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
 
@@ -1315,7 +1580,7 @@ class QuadrantGate(Gate):
 
         return results
 
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         quadrants_tuple = tuple(
             (quad_id, tuple((dim, locations[dim]) for dim in self.dimensions if dim in locations))
             for quad_id, locations in sorted(self.locations.items())
@@ -1840,7 +2105,7 @@ class BooleanGate(Gate):
         self,
         gate_name: str,
         expression: str,
-        dimensions: list[str] = [],
+        dimensions: tuple[str, ...] = (),
         use_as_complement: bool = False,
         **kwargs: Any,
     ):
@@ -1917,7 +2182,20 @@ class BooleanGate(Gate):
         self.params["expression"] = expression
         self.params["variables"] = variables
 
-    def __param_key(self) -> Hashable:
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+        try:
+            dummy_vals = {var: False for var in params["variables"]}
+            expression = params["expression"]
+            res = pd.eval(expression, local_dict=dummy_vals, global_dict={})
+        except Exception:
+            return False
+
+        if not isinstance(res, int) or (res != 0 and res != 1):
+            return False
+
+        return True
+
+    def _param_key(self) -> Hashable:
         # this is not really an invariant but reducing is NP-hard...
         return self.expression
 

@@ -68,9 +68,9 @@ class Gate(ABC):
         self,
         gate_name: str,
         dimensions: Sequence[str],
-        hyperparams: Mapping[str, Any] = {},
+        hyperparams: Mapping[str, Any] | None = None,
         use_as_complement: bool = False,
-        **kwargs
+        **kwargs: Any
     ) -> None:
         """
         Initialize gate with hyperparameters (user-provided configuration).
@@ -97,7 +97,7 @@ class Gate(ABC):
         self.gate_name = gate_name
         self.dimensions = list(dimensions)
         self.use_as_complement = use_as_complement
-        self._hyperparams: dict[str, Any] = dict(hyperparams)
+        self._hyperparams: dict[str, Any] = dict(hyperparams or {})
         self._hyperparams.update(kwargs)
         self.params: dict[str, Any] = {}
         self.diagnostics: dict[str, Any] = {}
@@ -209,11 +209,22 @@ class Gate(ABC):
         # Apply saved params and diagnostics.
         # If persisted params are empty, keep constructor-initialized params
         # (important for parameter-only gates initialized from hyperparams).
-        if params:
+        if params and gate.validate_params(params):
             gate.params = params
-        gate.diagnostics = diagnostics
+            gate.diagnostics = diagnostics
 
         return gate
+
+    @abstractmethod
+    def validate_params(self, params: Mapping[str, Any]) -> bool:
+        """Validate the gate's parameters.
+
+        Returns
+        -------
+        bool
+            True if parameters are valid, False otherwise.
+        """
+        pass
 
     def copy(self) -> "Gate":
         """Create a deep copy of the gate (includes current params and diagnostics).
@@ -341,7 +352,7 @@ class Gate(ABC):
         """
         return {}
 
-    def fit(self, events: AnnData, mask: dict[str, BooleanArray] = {}) -> "Gate":
+    def fit(self, events: AnnData) -> "Gate":
         """
         Fit gate parameters from events (optional for parameter-only gates).
 
@@ -353,12 +364,6 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, BooleanArray], default {}
-            Dictionary of boolean masks from parent gates (optional).
-            - {}: empty dict (default), fit using all events
-            - {key: mask_array}: single or multiple entries, fit using masked subset
-            For gates with single parent, pass that single mask.
-            For multi-parent scenarios (e.g., BooleanGate), pass all parent masks.
 
         Returns
         -------
@@ -366,6 +371,7 @@ class Gate(ABC):
             Self, for method chaining
         """
 
+        # TODO: Consider adding optional mask parameter for fitting on pre-filtered events (e.g., fit only on parent gate's positive events).
         if events.isbacked:
             events = events.to_memory()
         events_adata = events[:, self.dimensions]
@@ -387,7 +393,7 @@ class Gate(ABC):
         """
         pass
 
-    def apply(self, events: AnnData, mask: dict[str, BooleanArray],) -> dict[str, BooleanArray]:
+    def apply(self, events: AnnData, mask: dict[str, BooleanArray] | None = None) -> dict[str, BooleanArray]:
         """
         Apply gate to pre-filtered events and expand result to parent-mask length.
 
@@ -395,7 +401,7 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Pre-filtered event data for this gate (already subset by AddGateStep).
-        mask : dict[str, BooleanArray]
+        mask : dict[str, BooleanArray] | None, default None
             Parent gate masks (required, must be non-empty).
             Exactly one parent/root mask for standard gates.
 
@@ -410,8 +416,8 @@ class Gate(ABC):
         ValueError
             If mask dict is empty.
         """
-        if not mask:
-            raise ValueError("mask dict is required and cannot be empty. Pass at least one parent mask.")
+        if mask is None or len(mask) == 0:
+            mask = {"root": np.ones(events.n_obs, dtype=bool)}
 
         if len(mask) == 1:
             parent_mask = next(iter(mask.values()))
@@ -473,7 +479,7 @@ class Gate(ABC):
         """
         pass
 
-    def fit_apply(self, events: AnnData, mask: dict[str, BooleanArray] = {}) -> dict[str, BooleanArray]:
+    def fit_apply(self, events: AnnData, mask: dict[str, BooleanArray] | None = None) -> dict[str, BooleanArray]:
         """
         Convenience method to fit and then apply the gate in one step.
 
@@ -481,18 +487,18 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, BooleanArray]
-            Dictionary of boolean masks from parent gates (default: empty dict)
+        mask : dict[str, BooleanArray] | None, default None
+            Dictionary of boolean masks from parent gates (default: None → treated as no mask, fit/apply on all events)
 
         Returns
         -------
         dict[str, BooleanArray]
             Dictionary mapping region/quadrant IDs to boolean masks
         """
-        return self.fit(events, mask).apply(events, mask)
+        return self.fit(events).apply(events, mask)
 
     @abstractmethod
-    def plot(self, events: AnnData, mask: dict[str, BooleanArray], **kwargs: Any) -> Any:
+    def plot(self, events: AnnData, mask: dict[str, BooleanArray] | None = None, **kwargs: Any) -> Any:
         """
         Generate diagnostic plot for the gate.
 
@@ -500,8 +506,8 @@ class Gate(ABC):
         ----------
         events : ad.AnnData
             Event data with dimension IDs as var_names
-        mask : dict[str, BooleanArray]
-            Dictionary of boolean masks from parent gates (default: empty dict)
+        mask : dict[str, BooleanArray] | None, default None
+            Dictionary of boolean masks from parent gates (default: None → treated as no mask, fit/apply on all events)
         **kwargs : Any
             Optional plot configuration parameters passed through by callers.
 
@@ -514,7 +520,7 @@ class Gate(ABC):
         pass
 
     @abstractmethod
-    def __param_key(self) -> Hashable:
+    def _param_key(self) -> Hashable:
         """
         Generate a hashable object that uniquely identifies the gate's configuration.
 
@@ -530,4 +536,4 @@ class Gate(ABC):
 
     def __hash__(self) -> int:
         gate_type = self.glm_type or self.gate_type
-        return hash((gate_type, self.dimensions, self.use_as_complement, self.__param_key()))
+        return hash((gate_type, tuple(self.dimensions), self.use_as_complement, self._param_key()))
