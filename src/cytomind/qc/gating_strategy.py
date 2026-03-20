@@ -317,13 +317,14 @@ class GatingStrategyQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Update batch-level QC tests for gating strategy.
 
         Performs cross-gate outlier detection using Mahalanobis distance on
         feature vectors composed of ratio_parent and centrality_score for each gate.
         """
+        context = context or {}
         config = self.config.copy()
         config.update(context)
 

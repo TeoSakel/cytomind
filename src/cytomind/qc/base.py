@@ -719,59 +719,10 @@ class EntityQCEvaluator(ABC):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Optional hook for artifact invalidation or precomputation before QC updates."""
         return
-
-    def artifact_root_dir(
-        self,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-    ) -> Path:
-        """Return the artifact root directory for an entity QC status."""
-        pattern = dataloader.path_scheme.get("qc_entity_artifacts_dir", "qc/{entity_type}/{entity_id}/artifacts")
-        return dataloader.root_dir / pattern.format(
-            entity_type=entity_qc.entity_type,
-            entity_id=entity_qc.entity_id,
-        )
-
-    def artifact_dir(
-        self,
-        entity_qc: EntityQCStatus,
-        dataloader: UnifiedDataLoader,
-        artifact_key: str,
-    ) -> Path:
-        """Return a specific artifact directory for an entity QC status."""
-        return self.artifact_root_dir(entity_qc, dataloader) / Path(artifact_key)
-
-    def get_artifact_metadata(
-        self,
-        entity_qc: EntityQCStatus,
-        artifact_key: str,
-    ) -> dict[str, Any] | None:
-        """Return artifact metadata stored on the QC status, if present."""
-        metadata = entity_qc.artifacts.get(artifact_key)
-        if isinstance(metadata, dict):
-            return metadata
-        return None
-
-    def set_artifact_metadata(
-        self,
-        entity_qc: EntityQCStatus,
-        artifact_key: str,
-        metadata: Mapping[str, Any],
-    ) -> None:
-        """Persist lightweight artifact metadata on the QC status."""
-        entity_qc.artifacts[artifact_key] = dict(metadata)
-
-    def invalidate_artifact(
-        self,
-        entity_qc: EntityQCStatus,
-        artifact_key: str,
-    ) -> None:
-        """Remove lightweight artifact metadata from the QC status."""
-        entity_qc.artifacts.pop(artifact_key, None)
 
     @property
     def test_types(self) -> set[str]:
@@ -895,7 +846,7 @@ class EntityQCEvaluator(ABC):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> EntityQCStatus:
         if entity_qc is None:
             entity_qc = EntityQCStatus(
@@ -922,7 +873,7 @@ class EntityQCEvaluator(ABC):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Update the QC for a specific entity instance.
 
@@ -956,7 +907,7 @@ class EntityQCEvaluator(ABC):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """
         Update batch-level QC tests (run once across all samples).
@@ -974,7 +925,7 @@ class EntityQCEvaluator(ABC):
             Optional UnifiedDataLoader for loading sample data (AnnData, masks, etc.)
         dataloader_context : dict[str, Any] | None
             Optional context parameters for the dataloader (e.g., layer, sample_ids)
-        context : dict[str, Any]
+        context : dict[str, Any] | None
             Optional evaluation context
 
         Returns
@@ -1344,11 +1295,22 @@ class EntityQCEvaluator(ABC):
             try:
                 tester_class = tests[test.test_name]
             except KeyError:
-                valid_names = [key for key, val in tests.items() if val.test_type == table_type]
-                raise KeyError(
-                    f"Unknown test_name '{test.test_name}' for table_type '{table_type}'."
-                    f" Valid names are: {valid_names}"
-                )
+                # Some evaluators emit dynamically-named batch tests (e.g. scalar outlier
+                # testers with names like 'gate_X_outlier') that are not present in the
+                # static get_tests() mapping. Rather than failing, fall back to
+                # constructing a flattened record directly from the test record so
+                # generate_table can include these dynamically-created tests.
+                flat_record = {
+                    **(test.targets or {}),
+                    "test_type": test.test_type,
+                    "test_name": test.test_name,
+                    **(test.metadata or {}),
+                    "status": test.status,
+                }
+                # Add all metric fields as top-level columns
+                flat_record.update(test.metrics or {})
+                records.append(flat_record)
+                return
 
             # Create tester instance and use to_record to create the row record
             tester = tester_class.from_dict(test)

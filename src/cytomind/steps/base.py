@@ -1,5 +1,4 @@
 from __future__ import annotations
-from re import A
 from typing import Any, Callable, TypeVar, Sequence, Mapping, TYPE_CHECKING
 
 import numpy as np

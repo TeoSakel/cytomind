@@ -1203,7 +1203,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate compensation QC against a sample context.
 
@@ -1225,6 +1225,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
         None
         """
         # Default context to empty dict to avoid None checks
+        context = context or {}
         dataloader_context = dataloader_context or {}
 
         config = self.config.copy()

@@ -234,9 +234,8 @@ class AddGateStep(BaseStep):
                 "FitGate",
                 gate_batch.copy().fit,
                 events=adata,
-                mask=parent_dict,
                 reason_code_fail="GATE_FIT_ERROR"
-            ) # pyright: ignore[reportAssignmentType]
+            )
             if gate is None:
                 return {}, qc
         else:

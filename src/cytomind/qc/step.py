@@ -115,7 +115,7 @@ class StepQCEvaluator(EntityQCEvaluator):
     def generate_table(
         self,
         entity_qc: EntityQCStatus,
-        table_type: str = "per_sample_step",
+        table_type: str | None = "per_sample_step",
         test_name: str | None = None,
         sample_ids: Iterable[str] | None = None,
         table_path: PathLike | None = None,

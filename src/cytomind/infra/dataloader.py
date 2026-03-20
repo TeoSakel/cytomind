@@ -23,14 +23,12 @@ import json
 import numpy as np
 import anndata as ad
 
+from cytomind.domain.gates import GateNode
 from cytomind.domain.pipeline import NumpyEncoder
-from cytomind.domain.gates import GateNode, GatingStrategyRef
 from cytomind.utils import rlencode, rldecode, now_iso
 
 if TYPE_CHECKING:
-    from cytomind.domain.constants import PathLike, MaskLike
-    from numpy.typing import NDArray
-    BooleanArray = NDArray[np.bool_]
+    from cytomind.domain.constants import PathLike, MaskLike, BooleanArray
     BooleanMask = BooleanArray | Sequence[bool]
     JSONSerializable = dict[str, Any] | list | str | int | float | bool | None
     R = TypeVar("R")
@@ -278,57 +276,33 @@ class UnifiedDataLoader:
             **context
         )
 
-    def load_gating_strategy(
+    def get_entity_qc_artifact_path(
         self,
-        parse_func: Callable[[dict], GatingStrategyRef] = GatingStrategyRef.from_dict,
-        **context: Any
-    ) -> GatingStrategyRef:
+        entity_type: str,
+        entity_id: str,
+        artifact_key: str,
+    ) -> Path:
         """
-        Load gating strategy definition from JSON.
+        Get path for a specific artifact related to an entity's QC status.
 
         Parameters
         ----------
-        parse_func : Callable[[dict], GatingStrategyRef]
-            Function to parse the loaded dict to a GatingStrategyRef
-        **context : dict
-            Optional context
-
+        entity_type : str
+            Type of the entity (e.g., "sample", "gate_node")
+        entity_id : str
+            Identifier of the specific entity instance
+        artifact_key : str
+            Key identifying the specific artifact (e.g., "qc_report", "diagnostic_plot")
         Returns
         -------
-        GatingStrategyRef
-            Gating strategy definition (parsed via parse_func)
+        Path
+            Resolved path to the artifact file or directory
         """
-        return self.load_data(
-            entity="gating_strategy",
-            parse_func=parse_func,
-            **context
-        )
-
-    def save_gating_strategy(
-        self,
-        strategy: GatingStrategyRef,
-        serialize_func: Callable[[GatingStrategyRef], dict] = GatingStrategyRef.to_dict,
-        overwrite: bool = True,
-        **context: Any
-    ) -> None:
-        """
-        Save gating strategy definition to JSON.
-
-        Parameters
-        ----------
-        strategy : GatingStrategyRef
-            Gating strategy to save (will be serialized if serialize_func provided)
-        serialize_func : Callable[[GatingStrategyRef], dict], optional
-            Function to serialize strategy to dict. Defaults to GatingStrategyRef.to_dict.
-        **context : dict
-            Optional context (e.g., overwrite flags)
-        """
-        self.save_data(
-            pattern="gating_strategy",
-            data=strategy,
-            serialize_func=serialize_func,
-            overwrite=overwrite,
-            **context
+        return self._resolve_write_path(
+            self._pattern("qc_entity_artifact_dir"),
+            entity_type=entity_type,
+            entity_id=entity_id,
+            artifact_key=artifact_key
         )
 
     # ========== Generic Data I/O ==========
