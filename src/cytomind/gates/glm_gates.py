@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from math import e
 import warnings
 from typing import Any, Hashable, Sequence, Mapping, TYPE_CHECKING
 
@@ -50,39 +49,10 @@ def _warn_unused_plot_kwargs(gate_cls_name: str, kwargs: Mapping[str, Any]) -> N
     )
 
 
-def _resolve_plot_dimensions(
-    requested_dimensions: Sequence[str] | None,
-    gate_dimensions: Sequence[str],
-    *,
-    gate_cls_name: str,
-    min_dims: int = 1,
-    max_dims: int | None = None,
-) -> list[str]:
-    """Resolve and validate dimensions used for plotting."""
-    if requested_dimensions is None:
-        dims = list(gate_dimensions)
-    else:
-        dims = list(requested_dimensions)
+# Ratio computation is implemented on the Gate base class as `_compute_ratio`
 
-    if not dims:
-        raise ValueError(f"{gate_cls_name}.plot() requires at least one dimension")
 
-    unknown = [dim for dim in dims if dim not in gate_dimensions]
-    if unknown:
-        raise ValueError(
-            f"{gate_cls_name}.plot() received dimensions not in gate dimensions: {unknown}. "
-            f"Available dimensions: {list(gate_dimensions)}"
-        )
-
-    if len(set(dims)) != len(dims):
-        raise ValueError(f"{gate_cls_name}.plot() dimensions must be unique")
-
-    if len(dims) < min_dims:
-        raise ValueError(f"{gate_cls_name}.plot() requires at least {min_dims} dimensions")
-    if max_dims is not None and len(dims) > max_dims:
-        raise ValueError(f"{gate_cls_name}.plot() supports at most {max_dims} dimensions")
-
-    return dims
+# Dimension resolution moved into Gate._resolve_plot_dimensions
 
 
 @GateRegistry.register("Root")
@@ -130,42 +100,28 @@ class RootGate(Gate):
         mask = np.ones(len(events_slice), dtype=np.bool_)
         return {self.gate_name: mask}
 
-    def apply(self, events: ad.AnnData, mask: dict[str, BooleanArray] = {}) -> dict[str, BooleanArray]:
-        """
-        Apply root gate - passes all events through.
-
-        Parameters
-        ----------
-        events : ad.AnnData
-            Event data
-        mask : dict[str, BooleanArray], default {}
-            Parent gate masks (ignored for Root gate, can be empty)
-
-        Returns
-        -------
-        dict[str, BooleanArray]
-            Dictionary mapping root gate name to boolean mask of all True
-        """
-        if events.isbacked:
-            events = events.to_memory()
-
-        # Root gate passes all events through
-        all_mask = np.ones(events.n_obs, dtype=np.bool_)
-        return {self.gate_name: all_mask}
-
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
+        mask: dict[str, BooleanArray] | None = None,
         dimensions: Sequence[str] | None = None,
+        *,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Root gate has no meaningful visualization."""
         if dimensions is not None:
-            _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+            self._resolve_plot_dimensions(dimensions)
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
         fig = go.Figure()
         fig.add_annotation(text="Root Gate - passes all events through")
+        try:
+            if show_ratio:
+                ratio = self._compute_ratio(events, mask)
+                if ratio is not None:
+                    fig.add_annotation(x=0.5, y=0.5, xref="paper", yref="paper", text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
         return fig
 
 
@@ -317,7 +273,7 @@ class RectangleGate(Gate):
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
+        mask: dict[str, BooleanArray] | None = None,
         dimensions: Sequence[str] | None = None,
         marginals: bool = False,
         *,
@@ -337,6 +293,7 @@ class RectangleGate(Gate):
         title: str | None = None,
         width: int | None = None,
         height: int | None = None,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Plot events with rectangular gate boundaries.
@@ -367,7 +324,7 @@ class RectangleGate(Gate):
         >>> fig.show()
         """
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
-        plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        plot_dims = self._resolve_plot_dimensions(dimensions)
         n_dims = len(plot_dims)
         plot_kwargs: dict[str, Any] = {
             "hist_nbins": hist_nbins,
@@ -387,6 +344,8 @@ class RectangleGate(Gate):
             "title": title,
             "width": width,
             "height": height,
+            "show_ratio": show_ratio,
+            "mask": mask,
         }
         plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
         return plot_fn(events, plot_dims, **plot_kwargs)
@@ -439,6 +398,22 @@ class RectangleGate(Gate):
         yaxis_title = histnorm.title() if histnorm else "Count"
         fig.update_xaxes(title=dim)
         fig.update_yaxes(title=yaxis_title)
+        # optional ratio annotation
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    # place near the top of the plot centered on gate region when possible
+                    if min_val is not None or max_val is not None:
+                        start = data.min() if min_val is None else float(min_val)
+                        end = data.max() if max_val is None else float(max_val)
+                        x_pos = (start + end) / 2.0
+                    else:
+                        x_pos = float(np.mean(data))
+                    fig.add_annotation(x=x_pos, y=0.95, yref="paper", text=f"{ratio*100:.1f}%", showarrow=False)
+        except Exception:
+            pass
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_2D(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
@@ -507,6 +482,26 @@ class RectangleGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        # optional ratio annotation centered in rectangle
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    cx = x_min if x_min is not None else float(np.mean(x_data))
+                    cy = y_min if y_min is not None else float(np.mean(y_data))
+                    if x_max is not None and x_min is not None:
+                        cx = (x_min + x_max) / 2.0
+                    else:
+                        cx = float(np.mean(x_data))
+                    if y_max is not None and y_min is not None:
+                        cy = (y_min + y_max) / 2.0
+                    else:
+                        cy = float(np.mean(y_data))
+                    fig.add_annotation(x=cx, y=cy, text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
+
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_2D_marginals(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
@@ -671,6 +666,26 @@ class RectangleGate(Gate):
         fig.update_xaxes(showticklabels=False, row=1, col=1)
         fig.update_yaxes(showticklabels=False, row=2, col=2)
 
+        # optional ratio annotation centered in rectangle
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    cx = x_min if x_min is not None else float(np.mean(x_data))
+                    cy = y_min if y_min is not None else float(np.mean(y_data))
+                    if x_max is not None and x_min is not None:
+                        cx = (x_min + x_max) / 2.0
+                    else:
+                        cx = float(np.mean(x_data))
+                    if y_max is not None and y_min is not None:
+                        cy = (y_min + y_max) / 2.0
+                    else:
+                        cy = float(np.mean(y_data))
+                    fig.add_annotation(x=cx, y=cy, xref="x", yref="y", text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
+
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
@@ -750,6 +765,16 @@ class RectangleGate(Gate):
         height = kwargs.get("height")
         plot_height = int(height) if height is not None else 400 * n_rows
         plot_width = int(width) if width is not None else 400 * n_cols
+
+        # optional ratio annotation (place in figure paper coordinates)
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    fig.add_annotation(x=0.5, y=0.95, xref="paper", yref="paper", text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
 
         return _format_gate_plot(
             fig,
@@ -872,7 +897,7 @@ class PolygonGate(Gate):
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
+        mask: dict[str, BooleanArray] | None = None,
         dimensions: Sequence[str] | None = None,
         *,
         density_nbins: int = 50,
@@ -889,6 +914,7 @@ class PolygonGate(Gate):
         title: str | None = None,
         width: int = 800,
         height: int = 600,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Plot events with polygon gate boundary.
@@ -914,13 +940,7 @@ class PolygonGate(Gate):
         >>> fig = gate.plot(events, {"root": root_mask})
         >>> fig.show()
         """
-        plot_dims = _resolve_plot_dimensions(
-            dimensions,
-            self.dimensions,
-            gate_cls_name=self.__class__.__name__,
-            min_dims=2,
-            max_dims=2,
-        )
+        plot_dims = self._resolve_plot_dimensions(dimensions, min_dims=2, max_dims=2)
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
         x_dim, y_dim = plot_dims
         x_data = np.asarray(events[:, x_dim].X).ravel()
@@ -967,6 +987,18 @@ class PolygonGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        # optional ratio annotation centered in polygon
+        try:
+            if bool(kwargs.get("show_ratio", True)) or show_ratio:
+                ratio = self._compute_ratio(events, mask)
+                if ratio is not None:
+                    verts = np.asarray(vertices_for_dims)
+                    cx = float(verts[:, 0].mean())
+                    cy = float(verts[:, 1].mean())
+                    fig.add_annotation(x=cx, y=cy, text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
+
         return _format_gate_plot(fig, title=plot_title, width=width, height=height)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1160,7 +1192,7 @@ class EllipsoidGate(Gate):
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
+        mask: dict[str, BooleanArray] | None = None,
         dimensions: Sequence[str] | None = None,
         *,
         density_nbins: int = 50,
@@ -1177,6 +1209,7 @@ class EllipsoidGate(Gate):
         title: str | None = None,
         width: int | None = None,
         height: int | None = None,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Plot events with ellipsoid gate boundary.
@@ -1188,7 +1221,7 @@ class EllipsoidGate(Gate):
         ----------
         events : ad.AnnData
             Event data (pre-filtered by parent mask)
-        mask : dict[str, BooleanArray]
+        mask : dict[str, BooleanArray] | None
             Parent gate mask (required but not used for plotting)
 
         Returns
@@ -1204,12 +1237,7 @@ class EllipsoidGate(Gate):
         >>> fig.show()
         """
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
-        plot_dims = _resolve_plot_dimensions(
-            dimensions,
-            self.dimensions,
-            gate_cls_name=self.__class__.__name__,
-            min_dims=2,
-        )
+        plot_dims = self._resolve_plot_dimensions(dimensions, min_dims=2)
         plot_kwargs: dict[str, Any] = {
             "density_nbins": density_nbins,
             "density_log_scale": density_log_scale,
@@ -1225,6 +1253,8 @@ class EllipsoidGate(Gate):
             "title": title,
             "width": width,
             "height": height,
+            "show_ratio": show_ratio,
+            "mask": mask,
         }
         plot_fn = self._plot_2D if len(plot_dims) == 2 else self._plot_nD
         return plot_fn(events, plot_dims, **plot_kwargs)
@@ -1284,6 +1314,20 @@ class EllipsoidGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        # optional ratio annotation at ellipse center
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    idx_x = list(self.dimensions).index(x_dim)
+                    idx_y = list(self.dimensions).index(y_dim)
+                    cx = float(self.center[idx_x])
+                    cy = float(self.center[idx_y])
+                    fig.add_annotation(x=cx, y=cy, text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
+
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_nD(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
@@ -1358,6 +1402,16 @@ class EllipsoidGate(Gate):
         height = kwargs.get("height")
         plot_height = int(height) if height is not None else 400 * n_rows
         plot_width = int(width) if width is not None else 400 * n_cols
+
+        # optional ratio annotation (figure-level)
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = self._compute_ratio(events, kwargs.get("mask"))
+                if ratio is not None:
+                    fig.add_annotation(x=0.5, y=0.95, xref="paper", yref="paper", text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
 
         return _format_gate_plot(
             fig,
@@ -1590,7 +1644,7 @@ class QuadrantGate(Gate):
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
+        mask: dict[str, BooleanArray] | None = None,
         dimensions: Sequence[str] | None = None,
         *,
         hist_nbins: int = 100,
@@ -1613,6 +1667,7 @@ class QuadrantGate(Gate):
         title: str | None = None,
         width: int | None = None,
         height: int | None = None,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Plot events with quadrant divider lines.
@@ -1624,7 +1679,7 @@ class QuadrantGate(Gate):
         ----------
         events : ad.AnnData
             Event data (pre-filtered by parent mask)
-        mask : dict[str, BooleanArray]
+        mask : dict[str, BooleanArray] | None
             Parent gate mask (required but not used for plotting)
 
         Returns
@@ -1640,7 +1695,7 @@ class QuadrantGate(Gate):
         >>> fig.show()
         """
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
-        plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+        plot_dims = self._resolve_plot_dimensions(dimensions)
         label_color = gate_line_color if quadrant_label_color is None else quadrant_label_color
         n_dims = len(plot_dims)
         plot_kwargs: dict[str, Any] = {
@@ -1664,6 +1719,8 @@ class QuadrantGate(Gate):
             "title": title,
             "width": width,
             "height": height,
+            "show_ratio": show_ratio,
+            "mask": mask,
         }
         plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
         return plot_fn(events, plot_dims, **plot_kwargs)
@@ -1715,11 +1772,27 @@ class QuadrantGate(Gate):
             dim_end = dim_max if dim_upper is None else float(dim_upper)
             dim_center = (dim_start + dim_end) / 2.0
 
+            # optionally compute per-quadrant ratios
+            annotation_text = quad_id
+            try:
+                if bool(kwargs.get("show_ratio", True)):
+                    res = kwargs.get("_quadrant_cache")
+                    if res is None:
+                        # compute quadrant masks on the fly
+                        res = self._apply_gate(events[:, self.dimensions].to_df())
+                        kwargs["_quadrant_cache"] = res
+                    if quad_id in res:
+                        qarr = np.asarray(res[quad_id])
+                        if qarr.size:
+                            annotation_text = f"{quad_id} {qarr.mean()*100:.1f}%"
+            except Exception:
+                pass
+
             annotation_kwargs: dict[str, Any] = {
                 "x": dim_center,
                 "y": 0.5,
                 "yref": "paper",
-                "text": quad_id,
+                "text": annotation_text,
                 "showarrow": False,
                 "font": {"size": label_font_size, "color": label_font_color},
                 "opacity": label_opacity,
@@ -1806,10 +1879,24 @@ class QuadrantGate(Gate):
             x_center = (x_start + x_end) / 2.0
             y_center = (y_start + y_end) / 2.0
 
+            annotation_text = quad_id
+            try:
+                if bool(kwargs.get("show_ratio", True)):
+                    res = kwargs.get("_quadrant_cache")
+                    if res is None:
+                        res = self._apply_gate(events[:, self.dimensions].to_df())
+                        kwargs["_quadrant_cache"] = res
+                    if quad_id in res:
+                        qarr = np.asarray(res[quad_id])
+                        if qarr.size:
+                            annotation_text = f"{quad_id} {qarr.mean()*100:.1f}%"
+            except Exception:
+                pass
+
             annotation_kwargs: dict[str, Any] = {
                 "x": x_center,
                 "y": y_center,
-                "text": quad_id,
+                "text": annotation_text,
                 "showarrow": False,
                 "font": {"size": label_font_size, "color": label_font_color},
                 "opacity": label_opacity,
@@ -2202,7 +2289,7 @@ class BooleanGate(Gate):
     def _fit_gate(self, events_slice: pd.DataFrame) -> None:
         return
 
-    def apply(self, events: ad.AnnData, mask: dict[str, BooleanArray]) -> dict[str, BooleanArray]:
+    def apply(self, events: ad.AnnData, mask: dict[str, BooleanArray] | None = None) -> dict[str, BooleanArray]:
         """
         Apply boolean expression to masks from parent gates.
 
@@ -2223,6 +2310,9 @@ class BooleanGate(Gate):
             Dictionary with single key self.gate_name containing the result of the expression.
             Mask size equals the size of the input mask arrays.
         """
+        if mask is None:
+            raise ValueError("BooleanGate requires a mask dictionary with parent gate masks for evaluation.")
+
         # Ensure we have all needed variables
         provided_vars = set(mask.keys())
         missing_vars = self.variables - provided_vars
@@ -2253,8 +2343,8 @@ class BooleanGate(Gate):
     def plot(
         self,
         events: ad.AnnData,
-        mask: dict[str, BooleanArray],
-        dimensions: list[str] | None = None,
+        mask: dict[str, BooleanArray] | None = None,
+        dimensions: Sequence[str] | None = None,
         *,
         hist_nbins: int = 100,
         histnorm: str = "probability",
@@ -2267,6 +2357,7 @@ class BooleanGate(Gate):
         title: str | None = None,
         width: int | None = None,
         height: int | None = None,
+        show_ratio: bool = True,
         **kwargs: Any,
     ) -> go.Figure:
         """Plot events colored by boolean gate result.
@@ -2277,11 +2368,11 @@ class BooleanGate(Gate):
         """
         _warn_unused_plot_kwargs(self.__class__.__name__, kwargs)
         if self.dimensions:
-            plot_dims = _resolve_plot_dimensions(dimensions, self.dimensions, gate_cls_name=self.__class__.__name__)
+            plot_dims = self._resolve_plot_dimensions(dimensions)
         else:
             event_dims = [str(name) for name in events.var_names]
             if dimensions is not None:
-                plot_dims = _resolve_plot_dimensions(dimensions, event_dims, gate_cls_name=self.__class__.__name__)
+                plot_dims = self._resolve_plot_dimensions(dimensions, available_dimensions=event_dims)
             else:
                 if events.n_vars == 0:
                     raise ValueError("BooleanGate plot requires at least one dimension")
@@ -2305,6 +2396,8 @@ class BooleanGate(Gate):
             "title": title,
             "width": width,
             "height": height,
+            "show_ratio": show_ratio,
+            "mask": mask,
         }
         plot_fn = self._plot_1D if n_dims == 1 else self._plot_2D if n_dims == 2 else self._plot_nD
         return plot_fn(events, plot_dims, gate_result, **plot_kwargs)
@@ -2357,6 +2450,14 @@ class BooleanGate(Gate):
         fig.update_layout(barmode="overlay")
         fig.update_xaxes(title=dim)
         fig.update_yaxes(title=histnorm.title() if histnorm else "Count")
+        # optional ratio annotation (pass fraction)
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = float(pass_mask.mean())
+                fig.add_annotation(x=0.95, y=0.95, xref="paper", yref="paper", text=f"{ratio*100:.1f}% pass", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_2D(self, events: ad.AnnData, dimensions: list[str], gate_result: np.ndarray, **kwargs: Any) -> go.Figure:
@@ -2411,6 +2512,22 @@ class BooleanGate(Gate):
 
         fig.update_xaxes(title=x_dim)
         fig.update_yaxes(title=y_dim)
+        # optional ratio annotation (pass fraction)
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                if pass_mask.any():
+                    cx = float(x_data[pass_mask].mean())
+                    cy = float(y_data[pass_mask].mean())
+                else:
+                    cx, cy = 0.95, 0.95
+                    # place in paper coords when no pass points
+                    fig.add_annotation(x=0.95, y=0.95, xref="paper", yref="paper", text=f"{pass_mask.mean()*100:.1f}% pass", showarrow=False, bgcolor="white", opacity=0.8)
+                if pass_mask.any():
+                    fig.add_annotation(x=cx, y=cy, text=f"{pass_mask.mean()*100:.1f}% pass", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
+
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
     def _plot_nD(self, events: ad.AnnData, dimensions: list[str], gate_result: np.ndarray, **kwargs: Any) -> go.Figure:
@@ -2482,6 +2599,15 @@ class BooleanGate(Gate):
         height = kwargs.get("height")
         plot_height = int(height) if height is not None else 400 * n_rows
         plot_width = int(width) if width is not None else 400 * n_cols
+
+        # optional overall ratio annotation
+        try:
+            show_ratio = bool(kwargs.get("show_ratio", True))
+            if show_ratio:
+                ratio = float(gate_result.mean())
+                fig.add_annotation(x=0.5, y=0.95, xref="paper", yref="paper", text=f"{ratio*100:.1f}% pass", showarrow=False, bgcolor="white", opacity=0.8)
+        except Exception:
+            pass
 
         return _format_gate_plot(
             fig,
