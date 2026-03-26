@@ -118,6 +118,10 @@ class UnifiedDataLoader:
             return getattr(self.path_scheme, name)
         raise ValueError(f"Pattern {name!r} not found in path_scheme mapping or attributes")
 
+    def get_write_path(self, name: str, **kwargs) -> Path:
+        relative_path = self._pattern(name).format(**kwargs)
+        return self.root_dir / relative_path
+
     def _resolve_read_path(self, pattern: str, **kwargs) -> Path:
         """Resolve a read path with workspace-first fallback if configured."""
         relative_path = pattern.format(**kwargs)

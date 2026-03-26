@@ -4,7 +4,6 @@ Entity QC evaluators and registry.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
-from pathlib import Path
 from typing import Any, Hashable, Mapping, Iterator, Iterable, TYPE_CHECKING
 import math
 import warnings
@@ -17,11 +16,9 @@ from cytomind.utils import now_iso
 from . import EntityQCEvaluatorRegistry
 
 if TYPE_CHECKING:
-    from cytomind.domain.constants import PathLike
     from cytomind.domain.pipeline import StepRun
     from cytomind.infra.repo import ProjectRepository
     from cytomind.infra.dataloader import UnifiedDataLoader
-    from pandas import DataFrame
     from plotly.graph_objects import Figure
 else:
     StepRun = object
@@ -29,10 +26,9 @@ else:
     UnifiedDataLoader = object
     ProjectRepository = object
     Figure = object
-    DataFrame = object
 
 
-class QCTester(ABC):
+class QCTester:
     """
     Base class for QC test with fit-classify-plot pipeline.
 
@@ -62,18 +58,18 @@ class QCTester(ABC):
     - Use **kwargs for entity-specific dimensions (donors, parents, receivers, etc.)
     """
 
-    test_type: str                           # Evaluator type
-    test_name: str                           # name of the test
-    target_keys: tuple[str, ...] = ()        # Fields from targets that identify tested entity instance(s)
-    meta_keys: tuple[str, ...] = ()          # Fields from metadata that identify tested dimensions
+    test_type: str                            # to group related tests. Suggested format: "{entity}_{level}_{scope}"
+    test_name: str                            # name of the test
+    target_keys: tuple[str, ...] = ()         # Fields from targets that identify tested entity instance(s)
+    meta_keys: tuple[str, ...] = ()           # Fields from metadata that identify tested dimensions
     meta_fields: list[tuple[str, str]] = []   # [(name, description)] for metadata keys in QCTestRecord.metadata
     metric_fields: list[tuple[str, str]] = [] # [(name, description)] for metric keys in QCTestRecord.metrics
-    default_config: dict[str, Any] = {}      # Default config parameters for the tester
-    default_thresholds: dict[str, Any] = {}  # Default thresholds for classifying test results
-                                             # Format: {metric_name: {"warn": (low, high), "severe": (low, high)}}
-                                             # where low/high can be None if no threshold in that direction
-    plot_type: str = ""                      # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
-    plot_description: str = ""               # Human-readable description for frontend UI
+    default_config: dict[str, Any] = {}       # Default config parameters for the tester
+    default_thresholds: dict[str, Any] = {}   # Default thresholds for classifying test results
+                                              # Format: {metric_name: {"warn": (low, high), "severe": (low, high)}}
+                                              # where low/high can be None if no threshold in that direction
+    plot_type: str = ""                       # Category of plot (e.g., "histogram", "scatter", "heatmap"). Empty if no plot.
+    plot_description: str = ""                # Human-readable description for frontend UI
 
     def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}):
         # Validate threshold format
@@ -81,7 +77,7 @@ class QCTester(ABC):
 
         # Keep a concrete, instance-level tuple for downstream code paths.
         cfg = dict(self.default_config)
-        for key in cfg:
+        for key in tuple(cfg) + self.target_keys + self.meta_keys:
             if key in config:
                 cfg[key] = config[key]
         self.metadata = cfg
@@ -151,9 +147,9 @@ class QCTester(ABC):
                         f"high bound ({high})"
                     )
 
-    @property
-    def key_fields(self) -> tuple[str, ...]:
-        return self.target_keys + ("test_type", "test_name") + self.meta_keys
+    @classmethod
+    def key_fields(cls) -> tuple[str, ...]:
+        return cls.target_keys + ("test_type", "test_name") + cls.meta_keys
 
     @classmethod
     def _meta_field_names(cls) -> tuple[str, ...]:
@@ -333,41 +329,19 @@ class QCTester(ABC):
         """
         raise NotImplementedError("This tester does not support plotting.")
 
-    def key_dict(
-        self,
+    @classmethod
+    def make_key(
+        cls,
+        key_dict: Mapping[str, Any] | None = None,
         targets: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-
-        targets = targets or {}
-        metadata = metadata or {}
-        common = {**targets, **metadata}
-
-
-        missing = [key for key in self.target_keys if key not in common]
-        if missing:
-            raise KeyError(f"Missing target keys: {missing}")
-        missing = [key for key in self.meta_keys if key not in common]
-        if missing:
-            raise KeyError(f"Missing metadata keys: {missing}")
-
-        d: dict[str, Any] = {
-            "test_type": self.test_type,
-            "test_name": self.test_name
-        }
-        keys = self.target_keys + self.meta_keys
-        for key in keys: d[key] = common[key]
-
-        return d
-
-    def make_key(
-        self,
-        targets: Mapping[str, Any] | None = None,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> tuple:
-        keys =  self.target_keys + ("test_type", "test_name") + self.meta_keys
-        key_dict = self.key_dict(targets=targets, metadata=metadata)
-        return tuple(key_dict[key] for key in keys)
+        key_dict = dict(key_dict) if key_dict else {}
+        key_dict["test_type"] = cls.test_type
+        key_dict["test_name"] = cls.test_name
+        key_dict.update(targets or {})
+        key_dict.update(metadata or {})
+        return {key: key_dict[key] for key in cls.key_fields()}
 
     def to_record(self, test: QCTestRecord) -> dict[str, Any]:
         """
@@ -388,18 +362,9 @@ class QCTester(ABC):
         dict[str, Any]
             Record dict with keys from key_dict, 'status', and all metrics
         """
-        # Build key_dict with targets and test metadata
-        key_dict = self.key_dict(test.targets, test.metadata)
-
-        # Build record starting with key_dict and status
-        record = {
-            **key_dict,
-            "status": test.status,
-        }
-
-        # Add all metrics
+        key_dict = self.make_key({**test.targets, **test.metadata})
+        record = {**key_dict, "status": test.status}
         record.update(test.metrics)
-
         return record
 
     @classmethod
@@ -443,44 +408,40 @@ class QCTester(ABC):
 # ---------------------------------------------------------------------------
 
 class _ScalarOutlierTester(QCTester):
-    """
-    Concrete QCTester produced by `make_scalar_outlier_tester`.
 
-    Scores per-sample scalar values for outliers using either IQR or Z-score.
-    Keys: (entity_id, metric_type, sample_id, metric_name)
-    Metadata additionally carries `metric_value` (not a key).
-    """
-    # Class attributes overwritten per-instance by make_scalar_outlier_tester.
-    test_type: str = "outlier_scalar"
-    test_name: str = "scalar_outlier"
-    target_keys: tuple = ("entity_id", "metric_type")
-    meta_keys: tuple = ("sample_id", "metric_name")
-    metric_fields = [("outlier_score", "Outlier score (IQR or Z-score)")]
-    meta_fields = [
-        ("metric_name",   "Metric being tested"),
-        ("metric_value",  "Raw metric value for this sample"),
-        ("sample_id",     "Sample ID"),
-        ("outlier_method","Method used (iqr or zscore)"),
+    test_type: str = "scalar_batch_outlier"
+    test_name: str = "scalar_metric_outlier"
+    target_keys: tuple[str, ...] = ("entity_id", "metric_type", "metric_name")
+    meta_keys: tuple[str, ...] = ("sample_id", )
+    meta_fields: list[tuple[str, str]] = [
+        ("metric_value", "Raw value of the metric for the sample"),
+        ("outlier_method", "Method used for outlier scoring (iqr or zscore)"),
+        ("min_samples", "Minimum number of samples required for outlier detection"),
+        ("use_mad", "Whether MAD was used instead of std for z-score scaling"),
+    ]
+    metric_fields: list[tuple[str, str]] = [
+        ("outlier_score", "Computed outlier score for the sample (distance to median if outside the IQR or z-score)"),
     ]
     default_config = {
-        "min_samples":    6,
-        "outlier_method": "iqr",
-        "use_mad":        True,
+        "min_samples": 5,          # Minimum number of samples required to perform outlier detection
+        "outlier_method": "iqr",   # Method for outlier scoring: "iqr" or "zscore"
+        "use_mad": False,          # Whether to use MAD instead of std for z-score scaling
     }
-    default_thresholds = {
-        "outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)},
-    }
-    plot_type = "box"
-    plot_description = "Box plot of scalar metric outlier scores per sample"
+    default_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
 
-    # Set at factory time
-    _extra_static_meta: dict
+    plot_type: str = "histogram"
+    plot_description: str = "Histogram of sample values with outlier scores"
+
+    def __init__(self, config: Mapping[str, Any] = {}, thresholds: Mapping[str, Any] = {}, **kwargs):
+        super().__init__(config=config, thresholds=thresholds)
+        method = self.metadata.get("outlier_method")
+        if method not in ("iqr", "zscore"):
+            raise ValueError(f"Invalid outlier_method '{method}' in config. Must be 'iqr' or 'zscore'.")
 
     def fit(
         self,
         targets: dict,
         sample_values: dict[str, float],
-        metric_name: str,
         *,
         sample_meta: dict[str, dict] | None = None,
         **kwargs,
@@ -490,7 +451,6 @@ class _ScalarOutlierTester(QCTester):
         ----------
         targets       : must contain the target_keys (entity_id, metric_type)
         sample_values : sample_id → scalar value
-        metric_name   : name of the metric being scored
         sample_meta   : optional per-sample extra metadata to embed in the record
         """
         from cytomind.qc.utils import dict_iqr_score, dict_zscore  # local import avoids circular
@@ -500,9 +460,8 @@ class _ScalarOutlierTester(QCTester):
         min_n   = int(self.metadata["min_samples"])
         thresholds = {"outlier_score": self.thresholds["outlier_score"]}
         targets = dict(targets)
+        base_meta = dict(self.metadata)
         sample_meta = sample_meta or {}
-
-        base_meta = {**self._extra_static_meta, "metric_name": metric_name}
 
         if len(sample_values) < min_n:
             for sid, val in sample_values.items():
@@ -510,11 +469,14 @@ class _ScalarOutlierTester(QCTester):
                     safe_val = float(val)
                 except (TypeError, ValueError):
                     safe_val = float("nan")
-                meta = {**base_meta, "sample_id": sid,
-                        "metric_value": safe_val, "outlier_method": method,
-                        **sample_meta.get(sid, {})}
+                meta = base_meta.copy()
+                meta.update({
+                    "metric_value": safe_val,
+                    "sample_id": sid,
+                    **sample_meta.get(sid, {})
+                })
                 yield QCTestRecord(
-                    id=self.make_key(targets, meta),
+                    id=self.make_key({**targets, **meta}),
                     test_type=self.test_type,
                     test_name=self.test_name,
                     targets=targets,
@@ -543,12 +505,14 @@ class _ScalarOutlierTester(QCTester):
                     mv = float(val)
                 except (TypeError, ValueError):
                     mv = float("nan")
-                meta = {**base_meta, "sample_id": sid,
-                        "metric_value": mv,
-                        "outlier_method": method,
-                        **sample_meta.get(sid, {})}
+                meta = base_meta.copy()
+                meta.update({
+                    "metric_value": mv,
+                    "sample_id": sid,
+                    **sample_meta.get(sid, {})
+                })
                 yield QCTestRecord(
-                    id=self.make_key(targets, meta),
+                    id=self.make_key({**targets, **meta}),
                     test_type=self.test_type,
                     test_name=self.test_name,
                     targets=targets,
@@ -569,16 +533,15 @@ class _ScalarOutlierTester(QCTester):
                     metric_value = float(raw_val)
                 except (TypeError, ValueError):
                     metric_value = float("nan")
-            meta = {
-                **base_meta,
-                "sample_id": sid,
+            meta = base_meta.copy()
+            meta.update({
                 "metric_value": metric_value,
-                "outlier_method": method,
+                "sample_id": sid,
                 **score_stats,
                 **sample_meta.get(sid, {}),
-            }
+            })
             yield QCTestRecord(
-                id=self.make_key(targets, meta),
+                id=self.make_key({**targets, **meta}),
                 test_type=self.test_type,
                 test_name=self.test_name,
                 targets=targets,
@@ -588,74 +551,202 @@ class _ScalarOutlierTester(QCTester):
                 status="PENDING",
             )
 
+    def plot(
+        self,
+        test: QCTestRecord,
+        *,
+        sample_values: dict[str, float],
+        metric_name: str,
+        nbins: int = 32,
+        marginal: str | None = None,
+        color: str = "#1f77b4",
+        width: int = 700,
+        height: int = 500,
+        **kwargs,
+    ):
+        """
+        Plot histogram of sample values with marginal (box or violin) and highlight the test sample.
+        - marginal: None (auto), 'box', or 'violin'.
+        """
+        import numpy as np
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
 
-def make_scalar_outlier_tester(
-    entity: Any,
-    *,
-    test_name: str,
-    test_type: str | None = None,
-    config: Mapping[str, Any] | None = None,
-    thresholds: Mapping[str, Any] | None = None,
-    extra_meta_fields: list[tuple[str, str]] | None = None,
-    extra_static_meta: dict[str, Any] | None = None,
-    plot_description: str = "",
-) -> "_ScalarOutlierTester":
-    """
-    Factory that returns a configured `_ScalarOutlierTester`.
+        self._check_test_record(test)
+        method = test.metadata.get("outlier_method", self.metadata.get("outlier_method", "iqr"))
+        sid = test.id["sample_id"]
+        val = test.metadata["metric_value"]
 
-    Parameters
-    ----------
-    entity           : domain entity being scored (e.g. GateNode).  Used to
-                       derive `test_type` and `entity_id`.
-    test_name        : short snake_case identifier for this test.
-        test_type        : explicit test_type string; defaults to
-                           ``f"outlier_scalar_{type(entity).__name__}"``.
-    config           : overrides for default_config (min_samples, outlier_method, use_mad).
-    thresholds       : overrides for default_thresholds (outlier_score warn/severe).
-    extra_meta_fields: additional (name, description) metadata field declarations.
-    extra_static_meta: values embedded verbatim into every record's metadata.
-    plot_description : human-readable description for the frontend.
-    """
-    entity_type = type(entity).__name__
-    entity_id   = getattr(entity, "id", str(entity))
+        # Marginal type logic
+        if marginal is None:
+            marginal = "box" if method == "iqr" else "violin"
 
-    # --- build config -------------------------------------------------
-    base_cfg = dict(_ScalarOutlierTester.default_config)
-    if config:
-        base_cfg.update(config)
+        # Prepare data
+        x = np.array(list(sample_values.values()), dtype=float)
+        sample_ids = list(sample_values.keys())
+        highlight_idx = sample_ids.index(sid) if sid in sample_ids else None
 
-    # --- build thresholds ---------------------------------------------
-    method = base_cfg.get("outlier_method", "iqr")
-    if method == "iqr":
-        base_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
-    elif method == "zscore":
-        base_thresholds = {"outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)}}
-    else:
-        raise ValueError(f"outlier_method must be 'iqr' or 'zscore', got '{method}'")
-    if thresholds:
-        for k, v in thresholds.items():
-            existing = base_thresholds.get(k, {})
-            merged = {**existing, **{lv: tv for lv, tv in v.items()}} if isinstance(v, dict) else v
-            base_thresholds[k] = merged
+        # Main histogram
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.8, 0.2],
+            vertical_spacing=0.05,
+        )
+        # Histogram
+        hist = go.Histogram(
+            x=x,
+            nbinsx=nbins,
+            marker=dict(color=color, line=dict(color="black", width=1)),
+            name="All samples",
+            showlegend=False,
+        )
+        fig.add_trace(hist, row=1, col=1)
 
-    # --- instantiate --------------------------------------------------
-    # Set instance-level overrides BEFORE __init__ so validation and
-    # self.metadata / self.thresholds are built from the factory-provided values.
-    tester = _ScalarOutlierTester.__new__(_ScalarOutlierTester)
+        # Marginal
+        if marginal == "box":
+            marginal_trace = go.Box(
+                x=x,
+                boxpoints=False,
+                marker=dict(color=color),
+                line=dict(color="black"),
+                name="Distribution",
+                showlegend=False,
+                orientation="h",
+            )
+        elif marginal == "violin":
+            marginal_trace = go.Violin(
+                x=x,
+                box_visible=False,
+                meanline_visible=True,
+                line_color="black",
+                fillcolor=color,
+                name="Distribution",
+                showlegend=False,
+                orientation="h",
+            )
+        else:
+            marginal_trace = None
+        if marginal_trace:
+            fig.add_trace(marginal_trace, row=2, col=1)
 
-    tester.test_type       = test_type or f"outlier_scalar_{entity_type}"
-    tester.test_name       = test_name
-    tester.default_config     = base_cfg
-    tester.default_thresholds = base_thresholds
-    tester._extra_static_meta = dict(extra_static_meta) if extra_static_meta else {}
-    tester.meta_fields = list(_ScalarOutlierTester.meta_fields) + (extra_meta_fields or [])
-    tester.plot_description = (
-        plot_description or f"Scalar outlier scores for {test_name} on {entity_type}"
-    )
-    # Run through __init__ so _validate_thresholds_format is exercised and
-    # self.metadata / self.thresholds are set via the standard path.
-    _ScalarOutlierTester.__init__(tester)
-    return tester
+        # Highlight the test sample as a point
+        if highlight_idx is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[val],
+                    y=[0],
+                    mode="markers",
+                    marker=dict(color="red", size=14, symbol="diamond"),
+                    name="Test sample",
+                    showlegend=True,
+                    hovertext=[f"Sample: {sid}<br>Value: {val:.3g}"],
+                ),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=[val],
+                    y=[0],
+                    mode="markers",
+                    marker=dict(color="red", size=14, symbol="diamond"),
+                    name="Test sample",
+                    showlegend=False,
+                    hovertext=[f"Sample: {sid}<br>Value: {val:.3g}"],
+                ),
+                row=2, col=1
+            )
+
+        fig.update_layout(
+            title=f"Outlier scores for {metric_name} (method: {method})",
+            xaxis_title=metric_name,
+            yaxis_title="Frequency",
+            width=width,
+            height=height,
+        )
+        fig.update_xaxes(title_text=metric_name, row=2, col=1)
+        fig.update_yaxes(title_text="", row=2, col=1, showticklabels=False)
+        return fig
+
+    @classmethod
+    def from_defaults(
+        cls,
+        *,
+        entity: Any,
+        metric_type: str = "metric",
+        test_type: str | None = None,
+        test_name: str | None = None,
+        extra_target_keys: tuple[str, ...] = (),
+        extra_meta_keys: tuple[str, ...] = (),
+        extra_meta_fields: list[tuple[str, str]] | None = None,
+        config: Mapping[str, Any] | None = None,
+        thresholds: Mapping[str, tuple[float, float]] | None = None,
+    ) -> type["_ScalarOutlierTester"]:
+        """Create an instance with sensible defaults for a given entity.
+
+        - Merges provided `config` into `default_config`.
+        - Merges provided `thresholds` into `default_thresholds`.
+        - If `thresholds` is not provided and the resulting
+          `outlier_method` is "zscore", use a tighter default of (-3.0, 3.0)
+          for the `outlier_score` threshold.
+        - Sets `test_type` and `test_name` on the returned instance.
+        """
+        entity_type: str = entity.__class__.__name__
+        # Merge configs (shallow copy is sufficient for simple config dicts)
+        merged_config: dict = dict(cls.default_config)
+        if config:
+            merged_config.update(dict(config))
+
+        # Check configs
+        method = str(merged_config.get("outlier_method", "iqr")).lower()
+        if method not in {"iqr", "zscore"}:
+            raise ValueError(f"Invalid outlier_method '{method}' in config. Must be 'iqr' or 'zscore'.")
+
+        # Start from class defaults for thresholds and overlay provided ones
+        merged_thresholds: dict = dict(cls.default_thresholds)
+        if thresholds is not None:
+            merged_thresholds["outlier_score"] = dict(thresholds)
+        elif method == "zscore":
+            merged_thresholds = {"outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)}}
+        elif method == "iqr":
+            merged_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
+
+        new_cls = type(
+            f"{entity_type}{metric_type.capitalize()}OutlierTester",
+            (cls,),
+            {
+                "test_type": test_type or f"{entity_type.lower()}_batch_outlier",
+                "test_name": test_name or f"{entity_type.lower()}_{metric_type}_outlier",
+                "target_keys": cls.target_keys + extra_target_keys,
+                "meta_keys": cls.meta_keys + extra_meta_keys,
+                "meta_fields": cls.meta_fields + (extra_meta_fields or []),
+                "default_config": merged_config,
+                "default_thresholds": merged_thresholds,
+            }
+        )
+        return new_cls
+
+    @classmethod
+    def from_dict(cls, test: QCTestRecord | Mapping[str, Any]) -> QCTester:
+        test = test if isinstance(test, QCTestRecord) else QCTestRecord.from_dict(test)
+        required_targets = cls.target_keys
+        for key in required_targets:
+            if key not in test.targets:
+                raise ValueError(f"Missing required target key '{key}' for {cls.__name__}")
+        required_meta = cls.meta_keys + tuple(k for k, _ in cls.meta_fields)
+        for key in required_meta:
+            if key not in test.metadata:
+                raise ValueError(f"Missing required metadata key '{key}' for {cls.__name__}")
+        required_metrics = cls._metric_field_names()
+        for key in required_metrics:
+            if key not in test.metrics:
+                raise ValueError(f"Missing required metric field '{key}' for {cls.__name__}")
+        inst = cls(config=test.metadata, thresholds=test.thresholds)
+        inst.test_type = test.test_type
+        inst.test_name = test.test_name
+        inst.target_keys = tuple(k for k in test.targets.keys() if k in inst.target_keys)
+        inst.meta_keys = tuple(k for k in test.metadata.keys() if k in inst.meta_keys)
+        return inst
 
 
 class EntityQCEvaluator(ABC):
@@ -724,11 +815,6 @@ class EntityQCEvaluator(ABC):
         """Optional hook for artifact invalidation or precomputation before QC updates."""
         return
 
-    @property
-    def test_types(self) -> set[str]:
-        """Return the set of test types for this evaluator."""
-        return self.get_test_types()
-
     @classmethod
     def get_test_types(cls, entity: Any = None) -> set[str]:
         """Return the set of test types for this evaluator.
@@ -792,7 +878,7 @@ class EntityQCEvaluator(ABC):
         dict[str, list[dict[str, Any]]]
             Dictionary with "tables" and "figures" keys, each mapping to a list of artifact specs.
             Each artifact spec is a dict with at minimum:
-            - "type": str - identifier for the artifact (e.g., "compensation_channel")
+            - "type": str - identifier for the artifact (e.g., "compensation_sample_channel")
             - "description": str - human-readable description
             - For test plots, also includes: "test_name", "test_type", "plot_type"
 
@@ -801,8 +887,8 @@ class EntityQCEvaluator(ABC):
         >>> evaluator = CompensationQCEvaluator()
         >>> artifacts = evaluator.list_artifacts()
         >>> artifacts["tables"]
-        [{"type": "compensation_channel", "description": "..."},
-         {"type": "compensation_pair", "description": "..."}]
+        [{"type": "compensation_sample_channel", "description": "..."},
+         {"type": "compensation_sample_pair", "description": "..."}]
         >>> artifacts["figures"]  # Includes test plots
         [{"type": "qc_test_plot", "test_name": "NegativeFluorescence", ...},
          ...]
@@ -1092,7 +1178,7 @@ class EntityQCEvaluator(ABC):
         # Build test summary by counting status for each test_name
         test_summary: dict[str, dict[tuple, dict[str, int]]] = {}
         for sample_id in entity_qc.sample_qc:
-            for step_name, test_key, test in entity_qc.iter_sample_tests(sample_id):
+            for (step_name, test_key), test in entity_qc.iter_sample_tests(sample_id):
                 if step_name not in test_summary:
                     test_summary[step_name] = {
                         test_key: {"PASS": 0, "WARN": 0, "SEVERE": 0, "FAIL": 0, "SKIP": 0}
@@ -1117,221 +1203,6 @@ class EntityQCEvaluator(ABC):
                 },
             }
         }
-
-    def generate_table(
-        self,
-        entity_qc: EntityQCStatus,
-        table_type: str | None = None,
-        test_name: str | None = None,
-        sample_ids: Iterable[str] | None = None,
-        table_path: PathLike | None = None,
-    ) -> DataFrame:
-        """Generate a table from EntityQCStatus in long (melted) format.
-
-        This is a generic implementation that extracts all tests for a given type,
-        converts them to a DataFrame, and melts metrics to name/value columns.
-
-        Subclasses can override this method to provide entity-specific table formats
-        by calling super().generate_table() and then reshaping the result as needed.
-
-        Parameters
-        ----------
-        entity_qc : EntityQCStatus
-            The QC status object containing test records.
-        table_type : str
-            Type of tests to extract/table to generate (entity-specific).
-        sample_ids : Iterable[str] | None
-            Optional list of sample IDs to filter the table.
-        table_path : PathLike | None
-            Optional output path to save the table CSV.
-        test_name : str | None
-            Optional specific test name to filter by. If provided, takes precedence over table_type.
-
-        Returns
-        -------
-        DataFrame
-            Table in long (melted) format with columns:
-            - Key fields from tester.key_fields (targets, test_type, test_name, metadata keys)
-            - status
-            - Tester configuration metadata (if any)
-            - Melted metrics as 'metric' and 'value' columns
-
-        Examples
-        --------
-        >>> # In a subclass override:
-        >>> df_long = super().generate_table(entity_qc, table_type, ...)
-        >>> df_wide = df_long.pivot_table(...)  # Reshape as needed
-        >>> return df_wide
-        """
-        # Identify key columns from the first test of this type's target/meta keys
-        tests = self.get_tests(entity=None)
-        id_vars = []
-        tester_instance = None
-
-        # Get key fields from the appropriate test
-        if test_name is not None:
-            if test_name not in tests:
-                raise ValueError(
-                    f"Invalid test_name '{test_name}'. Must be one of {sorted(tests.keys())}."
-                )
-            tester_instance = tests[test_name]()
-            id_vars = list(tester_instance.key_fields)
-            table_type = table_type or tester_instance.test_type
-            if table_type != tester_instance.test_type:
-                raise ValueError(
-                    f"test_name '{test_name}' does not match table_type '{table_type}'. "
-                    f"Test '{test_name}' has type '{tester_instance.test_type}'."
-                )
-        elif table_type is not None:
-            # Otherwise use the first test of the requested table_type
-            for tester_class in tests.values():
-                if tester_class.test_type == table_type:
-                    id_vars = list(tester_class().key_fields)
-                    break
-        else:
-            raise ValueError("Must specify either table_type or test_name to determine which tests to include in the table.")
-
-        if not id_vars:
-            raise ValueError(
-                f"No tests found for table_type '{table_type}'"
-                + (f" with test_name '{test_name}'" if test_name else "")
-                + ". Cannot determine id_vars for table generation."
-            )
-        id_vars += ["status"]  # Always include status as an id_var for melting
-
-        # Extract records using helper method
-        records = self._extract_table_records(entity_qc, table_type, sample_ids=sample_ids, test_name=test_name)
-
-        if not records:
-            # Return empty DataFrame with correct column structure
-            final_columns = id_vars + ["metric", "value"]
-            return pd.DataFrame(columns=final_columns)
-
-        df = pd.DataFrame.from_records(records)
-        df = df.melt(id_vars=id_vars, var_name="metric", value_name="value").dropna(subset=["value"])
-
-        # Save to file if output path provided
-        if table_path is not None:
-            output_path = Path(table_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            if output_path.exists():
-                warnings.warn(
-                    f"Output path {output_path} already exists "
-                    "and will be updated with new samples."
-                )
-                old = pd.read_csv(output_path, index_col=False)
-                # Use base class method to update the table
-                updated = self._update_qc_table(old, df)
-                updated.to_csv(output_path, index=False)
-            else:
-                df.to_csv(output_path, index=False)
-
-        return df
-
-    def _extract_table_records(
-        self,
-        entity_qc: EntityQCStatus,
-        table_type: str,
-        sample_ids: Iterable[str] | None = None,
-        test_name: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Extract test records across all samples and steps into a flattened list.
-
-        This is a generalized helper method that iterates through all tests in the
-        EntityQCStatus and extracts their data into records containing sample_id,
-        status, test metadata, and metrics.
-
-        Parameters
-        ----------
-        entity_qc : EntityQCStatus
-            The QC status object containing test records.
-        table_type : str
-            Type of tests to extract (matches test_type field).
-        sample_ids : Iterable[str] | None
-            Optional list of sample IDs to filter which samples to include.
-        test_name : str | None
-            Optional specific test name to filter by. If provided, takes precedence over table_type
-            and only tests matching this name will be included. Must be a valid test name from get_tests().
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            List of records, one per test, where each record contains:
-            - Key fields from tester.key_dict() (test_type, test_name, targets, metadata keys)
-            - "status": str
-            - All test metrics flattened as individual columns
-        """
-        # Use sample_ids from argument if provided, otherwise use all samples
-        sample_filter = set(sample_ids or entity_qc.sample_qc.keys())
-
-        # Get all available tests and validate parameters
-        tests = self.get_tests(entity=None)
-
-        # Validate test_name against available test keys if specified
-        if test_name is not None:
-            if test_name not in tests:
-                valid_names = sorted(tests.keys())
-                raise ValueError(
-                    f"Invalid test_name '{test_name}'. Must be one of {valid_names}."
-                )
-        else:
-            # Validate table_type
-            test_types = self.get_test_types()
-            if table_type not in test_types:
-                raise ValueError(f"Invalid table_type '{table_type}'. Must be one of {test_types}.")
-
-        records = []
-
-        def append_test_record(test: QCTestRecord) -> None:
-            # If test_name is specified, filter by that; otherwise filter by table_type
-            if test_name is not None:
-                if test.test_name != test_name:
-                    return
-            else:
-                if test.test_type != table_type:
-                    return
-
-            # Get tester class and validate test_name
-            try:
-                tester_class = tests[test.test_name]
-            except KeyError:
-                # Some evaluators emit dynamically-named batch tests (e.g. scalar outlier
-                # testers with names like 'gate_X_outlier') that are not present in the
-                # static get_tests() mapping. Rather than failing, fall back to
-                # constructing a flattened record directly from the test record so
-                # generate_table can include these dynamically-created tests.
-                flat_record = {
-                    **(test.targets or {}),
-                    "test_type": test.test_type,
-                    "test_name": test.test_name,
-                    **(test.metadata or {}),
-                    "status": test.status,
-                }
-                # Add all metric fields as top-level columns
-                flat_record.update(test.metrics or {})
-                records.append(flat_record)
-                return
-
-            # Create tester instance and use to_record to create the row record
-            tester = tester_class.from_dict(test)
-            record = tester.to_record(test)
-            records.append(record)
-
-        # Iterate through sample-level tests
-        for sample_id, sample_run in entity_qc.sample_qc.items():
-            if sample_id not in sample_filter:
-                continue
-
-            for step in sample_run.steps.values():
-                for test in step.tests.values():
-                    append_test_record(test)
-
-        # Iterate through batch-level tests as well
-        for step in entity_qc.batch_qc.steps.values():
-            for test in step.tests.values():
-                append_test_record(test)
-
-        return records
 
     @staticmethod
     def _update_qc_table(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
@@ -1470,6 +1341,7 @@ class EntityQCEvaluator(ABC):
     def _parse_test_key(
         self,
         test_key: tuple | Mapping[str, str],
+        entity: Any | None = None,
     ) -> tuple[type[QCTester], dict[str, Any]]:
         """Parse and validate a test_key, extracting tester_class and normalizing the key.
 
@@ -1510,22 +1382,33 @@ class EntityQCEvaluator(ABC):
             )
 
         # Validate test_type
-        if test_type not in self.get_test_types():
+        type_tests = self.get_test_types(entity=entity)
+        if test_type not in type_tests:
             raise ValueError(
                 f"Unsupported test_type '{test_type}'. "
-                f"Expected one of: {self.get_test_types()}"
+                f"Expected one of: {type_tests}"
             )
 
         # Look up tester_class from get_tests()
-        tests = self.get_tests(entity=None)
+        tests = self.get_tests(entity=entity)
         try:
             tester_class = tests[test_name]
         except KeyError:
             raise ValueError(f"Unknown test name '{test_name}'. Available: {list(tests.keys())}")
 
         # Normalize test_key to dict if it was a tuple
+        key_fields = ("test_type", "test_name") + tester_class.target_keys + tester_class.meta_keys
         if test_key_dict is None:
-            key_fields = tester_class.target_keys + tester_class.meta_keys
-            test_key_dict = dict(zip(("test_type", "test_name") + key_fields, test_key))
+            test_key_dict = dict(zip(key_fields, test_key))
+        else:
+            # Ensure all required fields are present in the dict
+            missing_fields = [field for field in key_fields if field not in test_key_dict]
+            if missing_fields:
+                raise ValueError(
+                    f"test_key mapping is missing required fields: {missing_fields}. "
+                    f"Expected fields: {key_fields}"
+                )
+            # Optionally filter test_key_dict to only include relevant fields for this tester
+            test_key_dict = {field: test_key_dict[field] for field in key_fields}
 
         return tester_class, test_key_dict

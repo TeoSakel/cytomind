@@ -560,13 +560,14 @@ class CompensationRevisionHandler(BaseRevisionHandler):
             )
             self.save_entity_qc_cache(comp_id_resolved, qc_status)
 
-        # Generate table using the evaluator
-        df = self.qc_evaluator.generate_table(
-            qc_status,
-            table_type=table_type,
-            sample_ids=sample_ids,
-        )
-
+        # Generate table using the evaluator (returns DataFrame)
+        df = pd.DataFrame.from_records(
+            qc_status.iter_test_records(
+                filter_by={"test_type": table_type},
+                sample_ids=sample_ids,
+                with_metadata=False,
+                with_thresholds=False,
+        ))
         return df
 
     def table_compensation_channel(self, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
@@ -578,7 +579,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
           sample_ids: str or Iterable[str] | None | Sample ID(s) to retrieve channel test results for
           comp_id: str | "current" | Which compensation to evaluate: "current" (mapped in workspace), "parent" (parent of current), "active" (from sample metadata), or "raw" (identity matrix)
         """
-        return self._table_tests(table_type="compensation_channel", sample_ids=sample_ids, comp_id=comp_id)
+        return self._table_tests(table_type="compensation_sample_channel", sample_ids=sample_ids, comp_id=comp_id)
 
     def table_compensation_pair(self, sample_ids: str | Iterable[str], comp_id: str = "current") -> pd.DataFrame:
         """Pairwise channel QC test results under a specific compensation.
@@ -589,7 +590,7 @@ class CompensationRevisionHandler(BaseRevisionHandler):
           sample_ids: str or Iterable[str] | None | Sample ID(s) to retrieve pairwise test results for
           comp_id: str | "current" | Which compensation to evaluate: "current" (mapped in workspace), "parent" (parent of current), "active" (from sample metadata), or "raw" (identity matrix)
         """
-        return self._table_tests(table_type="compensation_pair", sample_ids=sample_ids, comp_id=comp_id)
+        return self._table_tests(table_type="compensation_sample_pair", sample_ids=sample_ids, comp_id=comp_id)
 
     def table_spillover(self, sample_id: str | None = None, comp_id: str = "current") -> pd.DataFrame:
         """Spillover matrix for a sample's compensation.

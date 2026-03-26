@@ -1,13 +1,14 @@
 from __future__ import annotations
+from datetime import datetime
 from typing import Iterable, Sequence, Mapping, Any, TYPE_CHECKING
-import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from cytomind.domain.pipeline import StepRun, BatchRef, SampleRef, Project
+from cytomind.domain.pipeline import RevisionSession, StepRun, BatchRef, SampleRef, Project
 from cytomind.domain.flow import DimensionDef
+from cytomind.domain.qc import EntityQCStatus, QCFlag
 from .repo import ProjectRepository
 from cytomind.gates import GateRegistry
 from cytomind.steps import StepRegistry
@@ -37,11 +38,17 @@ class InteractivePipeline:
         """
         self.repo = ProjectRepository(project_root, name=name)
 
+    @property
+    def project(self) -> Project:
+        """Load the current project state from the repository."""
+        return self.repo.load_project()
+
     # ---- Step lifecycle ----
 
-    def run_step(self, step_type: str, config: dict, inputs: dict) -> StepRun:
+    def run_step(self, step_type: str, config: dict, inputs: dict, id: str | None = None) -> StepRun:
         """
-        Execute complete step lifecycle: compute → evaluate QC → persist.
+        Thin wrapper to run a step by type with config and inputs, handling the full lifecycle.
+        It adds step_id and created_at metadata, then calls the `_execute_step` method to perform the computation and persist results.
 
         Parameters
         ----------
@@ -51,6 +58,9 @@ class InteractivePipeline:
             Configuration dictionary passed to the step implementation.
         inputs : dict
             Inputs dictionary passed to the step implementation.
+
+        id: str | None
+            Optional step identifier. If None, a new sequential ID will be generated.
 
         Returns
         -------
@@ -64,18 +74,17 @@ class InteractivePipeline:
         """
         # 1. Create step run
         step_run = StepRun(
-            id=self._next_step_id(),
+            id=id or self._next_step_id(),
             step_type=step_type,
             config=config,
             inputs=inputs,
             created_at=now_iso(),
         )
 
-        step_run = self._execute_step(step_run)
-        return step_run
+        return self._execute_step(step_run)
 
     def _execute_step(self, step_run: StepRun) -> StepRun:
-        """Execute step computation (computation phase only)."""
+        """Execute step computation handling the full lifecycle, including validation, execution, and persistence."""
         if step_run.status != "pending":
             raise ValueError(
                 f"Cannot run step {step_run.id!r} with status {step_run.status!r}, must be 'pending'."
@@ -90,14 +99,19 @@ class InteractivePipeline:
         self.repo.save_step_run(step_run)
         return step_run
 
+    def _next_step_id(self) -> str:
+        """Generate the next sequential step identifier."""
+        n_steps = self.repo.step_counter + 1
+        return f"step_{n_steps:04d}"
+
     # ---- Review & Revision ----
 
     def start_revision(
         self,
         entity_type: str,
+        entity_id: str,
+        input_spec: Mapping[str, Any] | None = None,
         session_id: str | None = None,
-        entity_id: str | None = None,
-        input_spec: Mapping[str, Any] = {},
     ) -> BaseRevisionHandler:
         """
         Initialize revision workspace for entity refinement.
@@ -106,12 +120,12 @@ class InteractivePipeline:
         ----------
         entity_type : str
             Type of entity to revise (e.g., "compensation", "gating_strategy")
-        session_id : str | None
-            Optional specific session identifier to load or create (e.g., "comp_001", "step_0003").
-        entity_id : str | None
+        entity_id : str
             Entity identifier (e.g., "comp_001")
-        input_spec : Mapping[str, Any]
+        input_spec : Mapping[str, Any] | None
             User input specification for the revision handler
+        session_id : str | None
+            Optional session identifier for the revision workspace
 
         Returns
         -------
@@ -128,9 +142,12 @@ class InteractivePipeline:
         if not revision_handler_class:
             raise ValueError(f"No revision handler registered for entity type '{entity_type}'")
 
-
         # Generate workspace directory
-        workspace = self.repo.generate_revision_workspace(entity_type=entity_type, session_id=entity_id)
+        workspace = self.repo.generate_revision_workspace(
+            entity_type=entity_type,
+            entity_id=entity_id,
+            session_id=session_id
+        )
 
         # Instantiate handler (it will set up workspace and session)
         handler = revision_handler_class(
@@ -140,11 +157,10 @@ class InteractivePipeline:
         )
 
         # Initialize session
-        session = handler.start_revision(input_spec)
-
+        handler.start_revision(input_spec or {})
         return handler
 
-    def load_revision_handler(self, entity_type: str, session_id: str) -> BaseRevisionHandler:
+    def load_revision_handler(self, entity_type: str, entity_id: str, session_id: str | None = None) -> BaseRevisionHandler:
         """
         Load an existing revision handler from the repository.
 
@@ -152,8 +168,10 @@ class InteractivePipeline:
         ----------
         entity_type : str
             Type of entity being revised
-        session_id : str
-            Session identifier
+        entity_id : str
+            Identifier of the specific entity being revised
+        session_id : str | None
+            Session identifier. If None the latest session for the entity will be loaded.
 
         Returns
         -------
@@ -169,26 +187,52 @@ class InteractivePipeline:
         if not handler_class:
             raise ValueError(f"No revision handler registered for entity type '{entity_type}'")
 
-        # Calculate workspace path
+        if session_id is None:
+            # Retrieve all sessions for the entity and find the latest non-committed one
+            entity_revision_dir = self.repo.get_path(
+                "revision_entity_dir",
+                entity_type=entity_type,
+                entity_id=entity_id,
+            )
+            live_sessions = []
+            for session_dir in entity_revision_dir.iterdir():
+                try:
+                    session: RevisionSession = self.repo.load_project_metadata(
+                        "revision_session",
+                        entity_type=entity_type,
+                        entity_id=entity_id,
+                        session_id=session_dir.name
+                    )
+                except FileNotFoundError:
+                    continue
+                if session.status in {"commited", "canceled"}:
+                    continue
+                live_sessions.append((datetime.fromisoformat(session.updated_at), session.id))
+
+            if not live_sessions:
+                raise FileNotFoundError(
+                    f"No active revision sessions found for entity '{entity_type}::{entity_id}'."
+                )
+            _, session_id = max(live_sessions)
+
         try:
             workspace_path: Path = self.repo.load_project_metadata(
                 "revision_workspace",
                 entity_type=entity_type,
+                entity_id=entity_id,
                 session_id=session_id
             )
         except FileNotFoundError:
             raise FileNotFoundError(
                 "No revision session found for entity_type "
-                f"'{entity_type}' with session_id '{session_id}'."
+                f"'{entity_type}::{entity_id}' with session_id '{session_id}'."
             )
 
         # Create handler
-        handler = handler_class(
+        return handler_class(
             main_repo=self.repo,
             workspace_root=workspace_path,
         )
-
-        return handler
 
     def commit_revision(self, handler: BaseRevisionHandler) -> StepRun | None:
         """
@@ -221,28 +265,36 @@ class InteractivePipeline:
 
     def get_entity_qc_table(
         self,
-        entity_type: str,
-        entity_id: str,
-        table_type: str | None = None,
+        *,
+        entity_qc: EntityQCStatus | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        filter_by: Mapping[str, Any] | None = None,
         sample_ids: Sequence[str] | None = None,
-        test_name: str | None = None,
-    ) -> Any:
+        with_thresholds: bool = True,
+        with_metadata: bool | None = None,
+    ) -> pd.DataFrame:
         """
         Generate a QC table for an entity from its cached QC status.
 
         Parameters
         ----------
-        entity_type : str
-            Type of entity (e.g., "compensation", "gating_strategy")
-        entity_id : str
-            Entity identifier (e.g., "comp_001")
-        table_type : str | None
-            Type of table to generate (entity-specific)
+        entity_qc : EntityQCStatus | None
+            Cached QC status for the entity. If None, entity_type and entity_id must be provided.
+        entity_type : str | None
+            Type of entity (e.g., "compensation", "gating_strategy"). Ignored if entity_qc is provided.
+        entity_id : str | None
+            Entity identifier (e.g., "comp_001"). Ignored if entity_qc is provided.
+        filter_by : Mapping[str, Any] | None
+            Optional dictionary to filter tests by their id fields (e.g., {"test_type": "compensation_sample_channel"})
+            Values can be either single values or iterables of values for matching multiple options.
         sample_ids : Sequence[str] | None
             Optional list of sample IDs to include. If None, includes all samples.
-        test_name : str | None
-            Optional specific test name to filter by. If provided, takes precedence over table_type
-            and only tests matching this name will be included in the table.
+        with_thresholds : bool
+            Whether to include threshold values in the output (default: True).
+        with_metadata : bool | None
+            Whether to include metadata fields in the output
+            (default: None, which means True if filtering by a single test, False if multiple tests).
 
         Returns
         -------
@@ -256,26 +308,189 @@ class InteractivePipeline:
         FileNotFoundError
             If QC status file not found for the entity
         """
-        if table_type is None and test_name is None:
-            raise ValueError("Must specify either table_type or test_name to generate QC table.")
 
-        # Get evaluator
-        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
-        if qc_evaluator_class is None:
-            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
+        if entity_qc is None:
+            if entity_type is None or entity_id is None:
+                raise ValueError("Either entity_qc or both entity_type and entity_id must be provided.")
+            entity_qc = self.repo.load_qc_entity_status(entity_type, entity_id)
 
-        qc_evaluator = qc_evaluator_class()
+        filter_by = filter_by or {}
+        if with_metadata is None:
+            # default = True for a single test (otherwise they likely vary)
+            test_name = filter_by.get("test_name", [])
+            with_metadata = not isinstance(test_name, (list, set, tuple)) or len(test_name) == 1
 
-        # Load QC status from repository
-        qc_status = self.repo.load_qc_entity_status(entity_type, entity_id)
-
-        # Generate table
-        return qc_evaluator.generate_table(
-            entity_qc=qc_status,
-            table_type=table_type,
-            sample_ids=sample_ids,
-            test_name=test_name
+        return pd.DataFrame.from_records(
+            entity_qc.iter_test_records(
+                filter_by=filter_by,
+                sample_ids=sample_ids,
+                with_thresholds=with_thresholds,
+                with_metadata=with_metadata,
+            )
         )
+
+    def collect_qc_metrics(
+        self,
+        entity_type: str,
+        entity_ids: Sequence[str] | None = None,
+        **kwargs
+    ) -> pd.DataFrame:
+        """
+        Aggregate QC metrics across samples by generating tables for each sample's active entity.
+
+        - "compensation": Loops over each sample's active compensation reference, generates the specified QC table for each, and concatenates results.
+        - other entity types: Loops over specified entities (or all if entity_ids is None),
+        """
+
+        # Compensation entities are sample specific so we dispatch to a dedicated method
+        if entity_type == "compensation":
+            return self._collect_compensation_qc_metrics(entity_ids=entity_ids, **kwargs)
+
+        # Discover entity ids if not provided
+        if entity_ids is None:
+            iter_qc_entities = self.repo.iter_qc_entities(entity_type)
+        else:
+            iter_qc_entities = ((ent_id, self.repo.load_qc_entity_status(entity_type, ent_id)) for ent_id in entity_ids)
+
+        records: list[dict[str, Any]] = []
+        for ent_id, entity_qc in iter_qc_entities:
+            for rec in entity_qc.iter_test_records(**kwargs):
+                records.append(rec)
+
+        if not records:
+            return pd.DataFrame()
+
+        return pd.DataFrame.from_records(records)
+
+    def _collect_compensation_qc_metrics(
+        self,
+        entity_ids: Sequence[str] | None = None,
+        sample_ids: Sequence[str] | None = None,
+        **kwargs
+    ) -> pd.DataFrame:
+
+        sample_refs = self.project.samples
+        sample_ids = list(sample_ids) if sample_ids is not None else list(sample_refs.keys())
+
+        comp_map: dict[str, list[str]] = {}
+        for sid in sample_ids:
+            sref = sample_refs[sid]
+            if sref.compensation is not None:
+                comp_map.setdefault(sref.compensation, []).append(sid)
+
+        comp_set = list(entity_ids) if entity_ids is not None else list(comp_map.keys())
+        comp_dfs = []
+        for comp_id in comp_set:
+            df = self.get_entity_qc_table(
+                entity_type="compensation",
+                entity_id=comp_id,
+                sample_ids=comp_map.get(comp_id),
+                **kwargs
+            )
+            comp_dfs.append(df)
+        return pd.concat(comp_dfs, ignore_index=True) if comp_dfs else pd.DataFrame()
+
+    def aggregate_qc_metrics(
+        self,
+        entity_type: str,
+        entity_ids: Sequence[str] | None = None,
+        sample_ids: Sequence[str] | None = None,
+        filter_by: Mapping[str, Any] | None = None,
+        group_by: str | Sequence[str] = "target",
+    ) -> pd.DataFrame:
+        """
+        Aggregate QC metrics across samples by collecting metrics and combining status flags.
+
+        This method calls collect_qc_metrics internally and then aggregates the result by
+        the specified grouping dimension(s). The `group_by` parameter determines which columns
+        to group by - it can be a predefined shortcut or any subset of target columns.
+        For each group, it combines the status values using QCFlag logic
+        (FAIL > SEVERE > WARN > PASS) and counts how many tests have each flag value.
+
+        Possible predefined shortcuts for `group_by`:
+
+        - "test": groups by test_type and test_name
+        - "target": groups by test targets (eg compensation_id, sample_id, mask). If the tests are not groupped by type it will probably create too granular groups, so "test" is usually a better option.
+        - "sample": groups by sample_id
+        - "entity": groups by the entity identifier for each test (specified as the 1st entry of the test target, e.g., compensation_id for compensation_sample_channel tests)
+        - other groupings have to be specified by passing a list of column names from the QC metrics table (e.g., ["compensation_id", "sample_id"] to group by both compensation and sample)
+        """
+        df = self.collect_qc_metrics(entity_type=entity_type, entity_ids=entity_ids, sample_ids=sample_ids, filter_by=filter_by)
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # That's very hacky at least I need to check that filter_by test is applied.
+        target_cols: list[str] = []
+        for c in df.columns:
+            if c in {"test_type", "test_name"}:
+                break
+            target_cols.append(c)
+
+        # Resolve group_by shortcuts
+        group_cols: list[str] = []
+        if isinstance(group_by, str):
+            if group_by == "test":
+                group_cols = [c for c in ["test_type", "test_name"] if c in df.columns]
+            elif group_by == "sample":
+                group_cols = ["sample_id"] if "sample_id" in df.columns else []
+            elif group_by == "entity":
+                # prefer explicit entity id column
+                et_col = f"{entity_type}_id"
+                if et_col in df.columns:
+                    group_cols = [et_col]
+                elif "entity_id" in df.columns:
+                    group_cols = ["entity_id"]
+                elif target_cols:
+                    group_cols = [target_cols[0]]
+                else:
+                    raise ValueError("No suitable entity identifier column found for 'entity' grouping.")
+            elif group_by == "target":
+                if not target_cols:
+                    raise ValueError("No target columns found for 'target' grouping.")
+                group_cols = target_cols
+        else:
+            missing = [c for c in group_by if c not in df.columns]
+            if missing:
+                raise ValueError(f"Invalid group_by columns: {missing} not found in QC metrics.")
+
+        if not group_cols:
+            raise ValueError("No valid grouping columns found for the provided `group_by` parameter.")
+
+        statuses = ["PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
+
+        def combine_flags(series: pd.Series) -> str:
+            vals = [s for s in series.dropna().unique()]
+            flags = [QCFlag.from_str(v) for v in vals if isinstance(v, str) and v.upper() in QCFlag.__members__]
+            if not flags:
+                return QCFlag.PASS.value
+            return QCFlag.combine(flags).value
+
+        grp = df.groupby(group_cols, dropna=False)
+
+        agg_rows = []
+        for key, sub in grp:
+            row = {}
+            if isinstance(key, tuple):
+                for kcol, kval in zip(group_cols, key):
+                    row[kcol] = kval
+            else:
+                row[group_cols[0]] = key
+
+            row["n_tests"] = len(sub)
+            for s in statuses:
+                row[f"n_{s.lower()}"] = int((sub.get("status") == s).sum())
+
+            row["combined_flag"] = combine_flags(sub.get("status", pd.Series(dtype=object)))
+            # percentages
+            for s in statuses:
+                row[f"pct_{s.lower()}"] = (row.get(f"n_{s.lower()}", 0) / row["n_tests"]) if row["n_tests"] else 0.0
+
+            agg_rows.append(row)
+
+        res = pd.DataFrame.from_records(agg_rows)
+        # ensure group columns first
+        res = res[[c for c in group_cols if c in res.columns] + [c for c in res.columns if c not in group_cols]]
+        return res
 
     def get_entity_qc_figure(
         self,
@@ -284,6 +499,7 @@ class InteractivePipeline:
         test_key: Any,
         sample_ids: Sequence[str] | None = None,
         step_id: str | None = None,
+        **kwargs
     ) -> Any:
         """
         Generate a QC diagnostic figure for an entity from its cached QC status.
@@ -337,510 +553,8 @@ class InteractivePipeline:
             dataloader=self.repo._dataloader,
             dataloader_context=dataloader_context if dataloader_context else None,
             step_id=step_id,
+            **kwargs
         )
-
-    def collect_qc_metrics(
-        self,
-        entity_type: str,
-        table_type: str,
-        sample_ids: Sequence[str] | None = None,
-        entity_ids: Sequence[str] | None = None,
-        test_name: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        Aggregate QC metrics across samples by generating tables for each sample's active entity.
-
-        This method generalizes EntityQCEvaluator.generate_table() across samples. For sample-based
-        entities like "compensation", it loops over each sample's active entity reference (specified
-        in the sample metadata), generates the QC table, and concatenates results.
-
-        For entity types that don't have sample-specific references (like "step" or "gate_node"), provide
-        explicit entity_ids to aggregate.
-
-        Parameters
-        ----------
-        entity_type : str
-            Type of entity to aggregate metrics for. Common values:
-            - "compensation": Aggregates compensation QC across samples' active compensations
-            - "gating_strategy": Aggregates gating strategy QC across samples' active strategies
-            - "gate_node": Aggregates gate node QC (requires entity_ids; strategy auto-discovered)
-            - "step": Aggregates step QC (requires entity_ids to be specified)
-        table_type : str
-            Type of table to generate for each entity (evaluator-specific).
-            For compensation: "compensation_channel", "pairwise_tests", etc.
-            For gating_strategy: "gate_event_counts", "gate_ratios"
-            For gate_node: "event_metrics", "fitting_quality", etc.
-            For step: "per_sample_step", "heatmap", "per_sample", etc.
-        sample_ids : Sequence[str] | None, default None
-            Sample IDs to include in aggregation. If None, includes all samples in the project.
-        entity_ids : Sequence[str] | None, default None
-            For sample-based entities (compensation, gating_strategy): ignored.
-            For non-sample-based entities (gate_node, step): required. List of entity IDs to aggregate across.
-        test_name : str | None, default None
-            Optional specific test name to filter by. If provided, only rows for this test are included
-            (overrides table_type filtering). Returns table with test-specific columns.
-
-        Returns
-        -------
-        pd.DataFrame
-            Concatenated table with all rows from individual entity tables.
-            For compensation example: Aggregates compensation_channel tables across all samples'
-            active compensations, with sample_id preserved in output.
-
-        Raises
-        ------
-        ValueError
-            If entity_type is not registered
-        ValueError
-            If any sample_ids are not found in project
-        ValueError
-            If entity_ids is required for entity_type but not provided
-
-        Examples
-        --------
-        Aggregate compensation QC metrics across all samples:
-
-        >>> pipeline = InteractivePipeline("/path/to/project")
-        >>> df = pipeline.aggregate_qc_metrics(
-        ...     entity_type="compensation",
-        ...     table_type="compensation_channel",
-        ... )
-        >>> # Returns table with compensation channel test results from all samples' active compensations
-        >>> print(df.columns)
-        # sample_id, compensation, channel, test_name, status, metric_name, metric_value, ...
-
-        Aggregate for specific samples:
-
-        >>> df = pipeline.aggregate_qc_metrics(
-        ...     entity_type="compensation",
-        ...     table_type="pairwise_tests",
-        ...     sample_ids=["sample_001", "sample_002"],
-        ... )
-
-        Aggregate step QC across specific step entities:
-
-        >>> df = pipeline.aggregate_qc_metrics(
-        ...     entity_type="step",
-        ...     table_type="per_sample_step",
-        ...     entity_ids=["step_0001", "step_0002"],
-        ... )
-        """
-        # Validate entity type
-        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
-        if qc_evaluator_class is None:
-            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
-
-        qc_evaluator = qc_evaluator_class()
-
-        # Load project metadata
-        project = self.repo.load_project()
-
-        # Determine sample IDs
-        if sample_ids is None:
-            sample_ids = list(project.samples.keys())
-        else:
-            sample_ids = list(sample_ids)
-            # Validate that all provided sample_ids exist in the project
-            missing_samples = set(sample_ids) - set(project.samples.keys())
-            if missing_samples:
-                raise ValueError(
-                    f"The following sample IDs were not found in the project: {sorted(missing_samples)}"
-                )
-
-        if entity_type == "compensation":
-            tables = self._aggregate_qc_metrics_compensation(
-                qc_evaluator=qc_evaluator,
-                table_type=table_type,
-                project=project,
-                sample_ids=sample_ids,
-                test_name=test_name,
-            )
-        elif entity_type == "gating_strategy":
-            tables = self._aggregate_qc_metrics_gating_strategy(
-                qc_evaluator=qc_evaluator,
-                table_type=table_type,
-                project=project,
-                sample_ids=sample_ids,
-                test_name=test_name,
-            )
-        else:
-            tables = self._aggregate_qc_metrics_by_entity_ids(
-                qc_evaluator=qc_evaluator,
-                entity_type=entity_type,
-                table_type=table_type,
-                sample_ids=sample_ids,
-                entity_ids=entity_ids,
-                test_name=test_name,
-            )
-
-        # Concatenate all tables
-        if not tables:
-            return pd.DataFrame()
-
-        return pd.concat(tables, ignore_index=True)
-
-    def aggregate_qc_metrics(
-        self,
-        entity_type: str,
-        table_type: str | Sequence[str] | None,
-        sample_ids: Sequence[str] | None = None,
-        entity_ids: Sequence[str] | None = None,
-        by: str | Sequence[str] = "target",
-        test_name: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        Aggregate QC metrics across samples by collecting metrics and combining status flags.
-
-        This method calls collect_qc_metrics internally and then aggregates the result by
-        the specified grouping dimension(s). The `by` parameter determines which columns
-        to group by - it can be a predefined shortcut or any subset of target columns.
-        For each group, it combines the status values using QCFlag logic
-        (FAIL > SEVERE > WARN > PASS) and counts how many tests have each flag value.
-
-        If table_type is "all" (or contains "all" when a sequence is provided), all test
-        table types are loaded using the evaluator class registered in
-        EntityQCEvaluatorRegistry for the given entity_type via evaluator_class.get_test_types().
-
-        Parameters
-        ----------
-        entity_type : str
-            Type of entity to aggregate metrics for. Common values:
-            - "compensation": Aggregates compensation QC across samples' active compensations
-            - "gating_strategy": Aggregates gating strategy QC across samples' active strategies
-            - "step": Aggregates step QC (requires entity_ids to be specified)
-        table_type : str | Sequence[str]
-            Type(s) of table(s) to generate for each entity (evaluator-specific).
-            For compensation: "compensation_channel", "pairwise_tests", etc.
-            For gating_strategy: "gate_event_counts", "gate_ratios"
-            For step: "per_sample_step", "heatmap", "per_sample", etc.
-            If set to "all" (or if "all" is included in a list), aggregates metrics
-            across all evaluator test table types.
-        sample_ids : Sequence[str] | None, default None
-            Sample IDs to include in aggregation. If None, includes all samples in the project.
-        entity_ids : Sequence[str] | None, default None
-            For sample-based entities (compensation, gating_strategy): ignored.
-            For non-sample-based entities (step): required. List of entity IDs to aggregate across.
-        by : str | Sequence[str], default "target"
-            Grouping dimension(s) for aggregation. Can be:
-            - "target": Groups by all target columns (entity_id, sample_id, etc.)
-            - "sample": Groups by sample_id only (if present in targets)
-            - "entity": Groups by entity identifier (first target column, or first 2 for gates)
-            - A sequence of column names: Groups by any subset of target columns
-
-            Target columns vary by entity type:
-        test_name : str | None, default None
-            Optional specific test name to filter by. If provided, only data from this test are aggregated
-            (takes precedence over table_type).
-            - compensation: ["compensation_id", "sample_id", "mask"]
-            - gating_strategy: ["sample_id", "gate_id"]
-            - step: ["step_id", "sample_id"]
-
-        Returns
-        -------
-        pd.DataFrame
-            Aggregated table with columns:
-            - All target columns (those before test_type, e.g., compensation_id, sample_id, mask)
-            - status: Combined QCFlag across all tests in the group
-            - n_tests: Total number of tests in the group
-            - n_pass, n_warn, n_severe, n_fail, n_skip: Count of tests with each flag status
-
-        Raises
-        ------
-        ValueError
-            If entity_type is not registered
-        ValueError
-            If any sample_ids are not found in project
-            If entity_ids is required for entity_type but not provided
-            If `by` is a string not in {"target", "sample", "entity"}
-            If `by` is a sequence containing columns not in target columns
-
-        Examples
-        --------
-        Aggregate compensation QC metrics across all samples (by all targets):
-
-        >>> pipeline = InteractivePipeline("/path/to/project")
-        >>> df_agg = pipeline.aggregate_qc_metrics(
-        ...     entity_type="compensation",
-        ...     table_type="compensation_channel",
-        ...     by="target",  # Groups by compensation_id, sample_id, mask
-        ... )
-
-        Aggregate by sample only:
-
-        >>> df_agg = pipeline.aggregate_qc_metrics(
-        ...     entity_type="compensation",
-        ...     table_type="compensation_channel",
-        ...     by="sample",  # Groups by sample_id only
-        ... )
-
-        Aggregate by custom columns:
-
-        >>> df_agg = pipeline.aggregate_qc_metrics(
-        ...     entity_type="compensation",
-        ...     table_type="compensation_channel",
-        ...     by=["compensation_id", "sample_id"],  # Custom grouping
-        ... )
-        """
-        # Validate entity type
-        qc_evaluator_class = EntityQCEvaluatorRegistry.get(entity_type)
-        if qc_evaluator_class is None:
-            raise ValueError(f"No QC evaluator registered for entity type '{entity_type}'")
-
-        qc_evaluator = qc_evaluator_class()
-
-        # Get target columns from evaluator
-        targets =  list(qc_evaluator_class.targets) + ["test_type", "test_name"]
-        all_types = sorted(qc_evaluator_class.get_test_types())
-
-        # Determine id_vars based on 'by' parameter
-        if isinstance(by, str):
-            if by == "target":
-                id_vars = targets[:-2] # All target columns except test_type and test_name
-            elif by == "test":
-                id_vars = ["test_type", "test_name"]
-            elif by == "sample":
-                if "sample_id" not in targets:
-                    raise ValueError(
-                        f"Cannot group by 'sample': 'sample_id' not in target columns {targets}"
-                    )
-                id_vars = ["sample_id"]
-            elif by == "entity":
-                # First target is the entity identifier for each evaluator.
-                id_vars = [targets[0]] if targets else []
-            else:
-                # Treat as a single column name
-                if by not in targets:
-                    raise ValueError(
-                        f"Column '{by}' not found in target columns {targets}. "
-                        f"Use one of: 'target', 'sample', 'entity', or a valid column name."
-                    )
-                id_vars = [by]
-        elif isinstance(by, (list, tuple)):
-            by_list = list(by)
-            invalid = set(by_list) - set(targets)
-            if invalid:
-                raise ValueError(
-                    f"Invalid columns in 'by': {sorted(invalid)}. "
-                    f"Must be a subset of target columns: {targets}"
-                )
-            id_vars = by_list
-        else:
-            raise ValueError(
-                f"'by' must be a string or sequence of strings, got {type(by).__name__}"
-            )
-
-        value_vars = ["TOTAL", "PASS", "WARN", "SEVERE", "FAIL", "SKIP"]
-        subset_vars = targets + ["status", "metric"]
-
-        cols = id_vars + ["status"] + value_vars
-
-        if table_type is None:
-            table_types = all_types
-        elif isinstance(table_type, str):
-            table_types = all_types if table_type == "all" else [table_type]
-        else:
-            table_types = list(table_type)
-        unknown_types = set(table_types) - set(all_types) - {"all"}
-        if unknown_types:
-            raise ValueError(
-                f"Unknown table_type(s) {sorted(unknown_types)} for entity_type '{entity_type}'. "
-                f"Known types are: {sorted(all_types)} or 'all'."
-            )
-
-        if not table_types:
-            return pd.DataFrame(columns=cols)
-
-        normalized_tables: list[pd.DataFrame] = []
-        for current_table_type in table_types:
-            current_df = self.collect_qc_metrics(
-                entity_type=entity_type,
-                table_type=current_table_type,
-                sample_ids=sample_ids,
-                entity_ids=entity_ids,
-                test_name=test_name,
-            )
-            if not current_df.empty:
-                normalized_tables.append(current_df[subset_vars])
-
-        if not normalized_tables:
-            return pd.DataFrame(columns=cols)
-
-        # Add Counts
-        combined = (pd.concat(normalized_tables, ignore_index=True, sort=False)
-                      .groupby(id_vars + ["status"], dropna=True)["metric"]
-                      .count()
-                      .reset_index()
-                      .pivot(index=id_vars, columns="status", values="metric")
-                      .fillna(0)
-                      .reset_index())
-        for var in value_vars:
-            if var not in combined.columns:
-                combined[var] = 0
-        combined = combined.astype({var: int for var in value_vars}, errors="ignore")
-        combined["TOTAL"] = combined[value_vars[1:]].sum(axis=1)
-
-        # Add Combined Status
-        def decide_status(row):
-            if row["FAIL"] > 0:
-                return "FAIL"
-            elif row["SEVERE"] > 0:
-                return "SEVERE"
-            elif row["WARN"] > 0:
-                return "WARN"
-            elif row["PASS"] > 0:
-                return "PASS"
-            else:
-                return "SKIP"
-        combined["status"] = combined.apply(decide_status, axis=1)
-        return combined[cols]
-
-    def _aggregate_qc_metrics_compensation(
-        self,
-        qc_evaluator: Any,
-        table_type: str,
-        project: Project,
-        sample_ids: Sequence[str],
-        test_name: str | None = None,
-    ) -> list[pd.DataFrame]:
-        """Aggregate QC tables for compensation entities, batched by active compensation."""
-
-        tables: list[pd.DataFrame] = []
-        sample_ids_by_comp: dict[str, list[str]] = {}
-        for sample_id in sample_ids:
-            comp_id = project.samples[sample_id].compensation
-            if comp_id is None:
-                continue
-            if comp_id not in sample_ids_by_comp:
-                sample_ids_by_comp[comp_id] = []
-            sample_ids_by_comp[comp_id].append(sample_id)
-
-        for comp_id, comp_sample_ids in sample_ids_by_comp.items():
-            try:
-                qc_status = self.repo.load_qc_entity_status("compensation", comp_id)
-            except FileNotFoundError:
-                raise FileNotFoundError(
-                    f"QC status for compensation {comp_id!r} not found. "
-                    f"Cannot aggregate QC metrics for samples {comp_sample_ids!r}."
-                )
-
-            try:
-                df = qc_evaluator.generate_table(
-                    entity_qc=qc_status,
-                    table_type=table_type,
-                    sample_ids=comp_sample_ids,
-                    test_name=test_name,
-                )
-                if not df.empty:
-                    tables.append(df)
-            except (ValueError, KeyError) as e:
-                warnings.warn(
-                    f"Failed to generate {table_type} table for compensation {comp_id!r} "
-                    f"(samples={comp_sample_ids!r}): {e}"
-                )
-        return tables
-
-    def _aggregate_qc_metrics_gating_strategy(
-        self,
-        qc_evaluator: Any,
-        project: Project,
-        sample_ids: Sequence[str],
-        table_type: str | None = None,
-        test_name: str | None = None,
-    ) -> list[pd.DataFrame]:
-        """Aggregate QC tables for the project gating strategy across selected samples."""
-
-        tables: list[pd.DataFrame] = []
-        gs = project.gating_strategy
-
-        try:
-            qc_status = self.repo.load_qc_entity_status("gating_strategy", gs.id)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"QC status for gating_strategy {gs.id!r} not found."
-            )
-
-        gs_samples = list(sample_ids)
-        try:
-            df = qc_evaluator.generate_table(
-                entity_qc=qc_status,
-                sample_ids=gs_samples,
-                table_type=table_type,
-                test_name=test_name,
-            )
-            if not df.empty:
-                tables.append(df)
-        except (ValueError, KeyError) as e:
-            warnings.warn(
-                f"Failed to generate table for samples {gs_samples!r}, "
-                f"gating_strategy {gs.id!r}: {e}"
-            )
-        return tables
-
-    def _aggregate_qc_metrics_by_entity_ids(
-        self,
-        qc_evaluator: Any,
-        entity_type: str,
-        table_type: str,
-        sample_ids: Sequence[str],
-        entity_ids: Sequence[str] | None,
-        test_name: str | None = None,
-    ) -> list[pd.DataFrame]:
-        """Aggregate QC tables for entity types that require explicit entity IDs.
-
-        For gate_node: validates gate IDs against the project gating strategy.
-        """
-
-        if entity_ids is None:
-            raise ValueError(
-                f"entity_ids must be specified for entity_type '{entity_type}' "
-                "(only 'compensation' and 'gating_strategy' support sample-based aggregation)"
-            )
-
-        tables: list[pd.DataFrame] = []
-
-        # For gate_node, validate gate IDs against the project strategy
-        if entity_type == "gate_node":
-            project = self.repo.load_project()
-            strategy = project.gating_strategy
-            if strategy is None:
-                warnings.warn("No gating strategy found in project, skipping gate_node QC aggregation.")
-                return tables
-            for gate_id in entity_ids:
-                try:
-                    strategy.get_node(gate_id)
-                except (KeyError, AttributeError):
-                    warnings.warn(f"Gate {gate_id!r} not found in project gating strategy, skipping.")
-
-        for entity_id in entity_ids:
-            try:
-                qc_status = self.repo.load_qc_entity_status(entity_type, entity_id)
-            except FileNotFoundError:
-                raise FileNotFoundError(
-                    f"QC status for entity {entity_id!r} not found. "
-                    f"Cannot aggregate QC metrics for samples {sample_ids!r}."
-                )
-
-            dataloader_context = {"sample_ids": [sid for sid in sample_ids if sid in qc_status.sample_qc]}
-
-            try:
-                df = qc_evaluator.generate_table(
-                    entity_qc=qc_status,
-                    table_type=table_type,
-                    sample_ids=dataloader_context["sample_ids"] if dataloader_context["sample_ids"] else None,
-                    test_name=test_name,
-                )
-                if not df.empty:
-                    tables.append(df)
-            except (ValueError, KeyError) as e:
-                warnings.warn(f"Failed to generate {table_type} table for entity {entity_id!r}: {e}")
-        return tables
-
-    # ---- Helpers ----
-
-    def _next_step_id(self) -> str:
-        """Generate the next sequential step identifier."""
-        n_steps = self.repo.step_counter + 1
-        return f"step_{n_steps:04d}"
 
     # --- Convenience Methods for Common Operations ----
 

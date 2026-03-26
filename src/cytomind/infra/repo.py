@@ -62,6 +62,7 @@ class ProjectRepository:
 
         # ---- QC I/O ----
         "qc_dir": "qc",
+        "qc_entity_type_dir": "qc/{entity_type}",
         "qc_entity_dir": "qc/{entity_type}/{entity_id}",
         "qc_entity_artifacts_dir": "qc/{entity_type}/{entity_id}/artifacts",
         "qc_entity_artifact_dir": "qc/{entity_type}/{entity_id}/artifacts/{artifact_key}",
@@ -70,8 +71,9 @@ class ProjectRepository:
         # ---- Revision Workspaces ----
         "workspaces_dir": "workspaces",
         "revision_type_dir": "workspaces/{entity_type}",
-        "revision_workspace": "workspaces/{entity_type}/{session_id}",
-        "revision_session": "workspaces/{entity_type}/{session_id}/session.json",
+        "revision_entity_dir": "workspaces/{entity_type}/{entity_id}",
+        "revision_workspace": "workspaces/{entity_type}/{entity_id}/{session_id}",
+        "revision_session": "workspaces/{entity_type}/{entity_id}/{session_id}/session.json",
     }
 
     def __init__(self, root: PathLike, name: str | None = None):
@@ -129,6 +131,13 @@ class ProjectRepository:
         }
 
     # -------------- Project I/O -------------
+
+    def get_path(self, name: str, relative: bool = False, **kwargs) -> Path:
+        """Get the absolute path for a given pattern name and parameters."""
+        path = self._dataloader.get_write_path(name, **kwargs)
+        if relative:
+            return path.relative_to(self._dataloader.root_dir)
+        return path
 
     def load_project_metadata(self, entity: str, **kwargs) -> Any:
         return self._dataloader.load_data(entity, **kwargs)
@@ -448,6 +457,17 @@ class ProjectRepository:
 
     # ---------- QC I/O ----------
 
+    def iter_qc_entities(self, entity_type: str) -> Iterable[tuple[str, EntityQCStatus]]:
+        """Iterate over all entities of a given type with their QC status."""
+        qc_dir = self.get_path("qc_entity_type_dir", entity_type=entity_type)
+        if not qc_dir.exists():
+            return
+        for entity_dir in qc_dir.iterdir():
+            if entity_dir.is_dir():
+                entity_id = entity_dir.name
+                qc_status = self.load_qc_entity_status(entity_type, entity_id)
+                yield entity_id, qc_status
+
     def qc_entity_dir(self, entity_type: str, entity_id: str) -> Path:
         """Path to a specific entity QC directory."""
         pattern = self.path_scheme["qc_entity_dir"]
@@ -639,7 +659,7 @@ class ProjectRepository:
 
     # ------------- Revision Session I/O -----------------
 
-    def generate_revision_workspace(self, entity_type: str, session_id: str | None) -> Path:
+    def generate_revision_workspace(self, entity_type: str, entity_id: str, session_id: str | None = None) -> Path:
         """
         Generate a new revision workspace directory for a given session.
 
@@ -656,18 +676,27 @@ class ProjectRepository:
             Absolute path to the created revision workspace.
         """
 
-        session_id = session_id or "session_001"
-        pattern = self.path_scheme["revision_session"].format(
-            entity_type=entity_type,
-            session_id=session_id
-        )
-        path = (self.root / pattern).parent
-        if not path.exists():
-            return path
+        def get_workspace_path(session_id: str) -> Path:
+            path = self._dataloader.load_data(
+                "revision_workspace",
+                entity_type=entity_type,
+                entity_id=entity_id,
+                session_id=session_id
+            )
+            return Path(path)
 
-        type_dir = self.root / self.path_scheme["revision_type_dir"].format(entity_type=entity_type)
-        session_id = "session" if session_id.startswith("session") else session_id
-        k = sum(1 for d in type_dir.iterdir() if d.is_dir() and d.name.startswith(session_id))
-        session_id = f"{session_id}_{k:03d}"
-        path = self.root / self.path_scheme["revision_session"].format(entity_type=entity_type, session_id=session_id)
-        return path.parent
+        final_session_id = session_id or "session_001"
+        session_path = get_workspace_path(final_session_id)
+        if not session_path.exists():
+            return session_path
+
+        if not session_id:  # Only auto-increment if session_id was not provided
+            raise FileExistsError(f"Revision session '{final_session_id}' already exists for entity '{entity_type}::{entity_id}'. "
+                                  "Please provide a unique session_id or allow auto-increment by passing None.")
+
+        entity_dir = Path(self._dataloader.load_data("revision_entity_dir", entity_type=entity_type, entity_id=entity_id))
+        entity_dir.mkdir(parents=True, exist_ok=True)
+        k = sum(1 for d in entity_dir.iterdir() if d.is_dir() and d.name.startswith("session_"))
+        final_session_id = f"session_{k:03d}"
+        session_path = get_workspace_path(final_session_id)
+        return session_path

@@ -256,10 +256,11 @@ class _BaseMatchTest(QCTester):
             return test
 
         # Get thresholds from nested structure
-        severe_bounds = test.thresholds.get("score", {}).get("severe", (0.60, None))
-        warn_bounds = test.thresholds.get("score", {}).get("warn", (0.80, None))
-        severe_threshold = severe_bounds[0] if isinstance(severe_bounds, (tuple, list)) and len(severe_bounds) > 0 else 0.60
-        warn_threshold = warn_bounds[0] if isinstance(warn_bounds, (tuple, list)) and len(warn_bounds) > 0 else 0.80
+        severe_bounds = test.thresholds["score"]["severe"]
+        warn_bounds = test.thresholds["score"]["warn"]
+        severe_threshold, warn_threshold = severe_bounds[0], warn_bounds[0]
+        if severe_threshold is None or warn_threshold is None:
+            raise ValueError("Thresholds for 'score' must be defined for both warn and severe levels.")
 
         if not has_eligible or score < severe_threshold:
             test.status = "SEVERE"
@@ -275,7 +276,7 @@ class _BaseMatchTest(QCTester):
 
         return test
 
-    def plot(self, adata: Any, test: QCTestRecord, output_path: PathLike | None = None, **kwargs: Any) -> Figure:
+    def plot(self, test: QCTestRecord, *, adata: Any, output_path: PathLike | None = None, **kwargs: Any) -> Figure:
         raise NotImplementedError("Match tests do not implement plotting.")
 
     @staticmethod
@@ -543,8 +544,10 @@ class PanelQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> EntityQCStatus:
+
+        context = context or {}
         # Panel QC is batch-level by design; per-sample QC remains empty.
         entity_qc.sample_qc = {}
         cfg = self.config.copy()
@@ -559,8 +562,9 @@ class PanelQCEvaluator(EntityQCEvaluator):
         dataloader: UnifiedDataLoader | None = None,
         dataloader_context: dict[str, Any] | None = None,
         *,
-        context: dict[str, Any] = {},
+        context: dict[str, Any] | None = None,
     ) -> EntityQCStatus:
+        context = context or {}
         cfg = self.config.copy()
         cfg.update(context or {})
         ref_panel_id = cfg.setdefault("ref_panel_id", "panel")

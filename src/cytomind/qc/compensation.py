@@ -40,7 +40,7 @@ else:
 class NegativeFluorescenceTest(QCTester):
     """Test for negative fluorescence in a single channel."""
 
-    test_type = "compensation_channel"
+    test_type = "compensation_sample_channel"
     test_name = "negative_fluorescence"
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("channel",)
@@ -208,7 +208,7 @@ class NegativeFluorescenceTest(QCTester):
 class VeryNegativeFluorescenceTest(QCTester):
     """Test for very negative fluorescence in a single channel."""
 
-    test_type = "compensation_channel"
+    test_type = "compensation_sample_channel"
     test_name = "very_negative_fluorescence"
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("channel",)
@@ -435,7 +435,7 @@ class VeryNegativeFluorescenceTest(QCTester):
 class NegativeEnrichmentTest(QCTester):
     """Test for negative receiver fluorescence when donor is high."""
 
-    test_type = "compensation_pair"
+    test_type = "compensation_sample_pair"
     test_name = "negative_enrichment"
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("donor_channel", "receiver_channel")
@@ -692,7 +692,7 @@ class NegativeEnrichmentTest(QCTester):
 class HighDonorCorrelationTest(QCTester):
     """Test for correlation between donor and receiver when donor is high."""
 
-    test_type = "compensation_pair"
+    test_type = "compensation_sample_pair"
     test_name = "high_donor_correlation"
     target_keys = ("compensation_id", "sample_id", "mask")
     meta_keys = ("donor_channel", "receiver_channel")
@@ -1132,11 +1132,11 @@ class CompensationQCEvaluator(EntityQCEvaluator):
     entity_type = "compensation"
     targets = ("compensation_id", "sample_id", "mask")
     _supported_tables = {
-        "compensation_channel": {
+        "compensation_sample_channel": {
             "description": "Per-channel negative fluorescence metrics across samples",
             "input_params": {}
         },
-        "compensation_pair": {
+        "compensation_sample_pair": {
             "description": "Pairwise spillover metrics (correlation, enrichment) across samples",
             "input_params": {}
         },
@@ -1300,7 +1300,7 @@ class CompensationQCEvaluator(EntityQCEvaluator):
 
         # Separate into channel and pairwise
         for test in tests:
-            if test.test_type == "compensation_channel":
+            if test.test_type == "compensation_sample_channel":
                 all_tests["channel"].append((sample_id, test))
             else:  # compensation_pair
                 all_tests["pairwise"].append((sample_id, test))

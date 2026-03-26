@@ -5,7 +5,6 @@ Performs QC analysis on individual gates within their gating strategy context.
 Evaluates event counts, ratios, fitting quality, and outlier detection for a single gate.
 """
 from __future__ import annotations
-from math import dist
 from typing import Any, Hashable, Iterable, Mapping, Sequence, TYPE_CHECKING, cast
 import warnings
 from pathlib import Path
@@ -17,11 +16,10 @@ import plotly.graph_objects as go
 
 from cytomind.domain.qc import EntityQCStatus, QCFlag, QCStepStatus, QCTestRecord
 from cytomind.gates import GateRegistry, Gate
-from cytomind.infra.dataloader import UnifiedDataLoader
 from cytomind.utils import now_iso
 
 from . import EntityQCEvaluatorRegistry
-from .base import EntityQCEvaluator, QCTester, make_scalar_outlier_tester
+from .base import EntityQCEvaluator, QCTester, _ScalarOutlierTester
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import BooleanArray, FloatArray, PathLike
@@ -56,7 +54,7 @@ class GateSpaceGeometry:
     """
 
     artifact_key = "gate_space_geometry"
-    _info_fields = ("gate_id", "gate_type", "glm_type", "layer", "dimensions", "lower_bounds", "upper_bounds", "resolution", "seed")
+    _info_fields = ("entity_id", "gate_type", "glm_type", "layer", "dimensions", "lower_bounds", "upper_bounds", "resolution", "seed")
     # Maximum number of random evaluation points for dims >= 3
     _MAX_RANDOM_EVAL_POINTS = 2 ** 20
 
@@ -93,7 +91,7 @@ class GateSpaceGeometry:
 
         n_dims = len(entity.dimensions)
         info = {
-            "gate_id": entity.id,
+            "entity_id": entity.id,
             "gate_type": entity.gate_type,
             "glm_type": entity.glm_type,
             "layer": entity.layer,
@@ -113,8 +111,8 @@ class GateSpaceGeometry:
 
     @classmethod
     def _validate_gate(cls, gate_node: GateNode, info: Mapping[str, Any]) -> None:
-        if gate_node.id != info["gate_id"]:
-            raise ValueError(f"Gate ID mismatch: expected {info['gate_id']}, got {gate_node.id}")
+        if gate_node.id != info["entity_id"]:
+            raise ValueError(f"Gate ID mismatch: expected {info['entity_id']}, got {gate_node.id}")
         if gate_node.gate_type != info["gate_type"]:
             raise ValueError(f"Gate type mismatch: expected {info['gate_type']}, got {gate_node.gate_type}")
         if gate_node.glm_type != info["glm_type"]:
@@ -646,6 +644,136 @@ class GateSpaceGeometry:
             gate_count[idx] += 1
         return gate_count
 
+    def plot(
+        self,
+        *,
+        dimensions: list[str] | None = None,
+        title: str | None = None,
+        overlay_gate: bool = False,
+        gate_sample_id: str | None = None,
+        output_path: Path | None = None,
+    ) -> go.Figure:
+        """Render a heatmap representation of the gate-space mean mask.
+
+        - 1D: simple bar plot with one bar per eval point (intensity = mean mask)
+        - 2D: heatmap with one box per eval grid cell (intensity = mean mask)
+        - >2D: scatter projection onto first two dims with color = mean mask
+
+        If ``overlay_gate`` is True and ``gate_sample_id`` is provided the
+        gate mask for that sample will be drawn on top of the heatmap.
+        """
+        dims = len(self.dimensions)
+        x = np.asarray(self.eval_points.X)
+        if x is None:
+            raise ValueError("Eval points X matrix is missing.")
+        mean = np.asarray(self.mean_mask)
+
+        fig = go.Figure()
+
+        if dims == 1:
+            xs = x[:, 0]
+            fig.add_trace(go.Bar(x=xs, y=mean, marker=dict(color=mean, colorscale="Viridis")))
+            fig.update_layout(xaxis_title=self.dimensions[0], yaxis_title="Mean mask")
+            if overlay_gate and gate_sample_id is not None:
+                try:
+                    mask = self.get_sample_mask(gate_sample_id)
+                    # find contiguous True segments
+                    m = np.asarray(mask, dtype=bool)
+                    if m.any():
+                        # determine half-step for x extents
+                        if len(xs) > 1:
+                            half = float((xs[1] - xs[0]) / 2.0)
+                        else:
+                            half = 0.0
+                        starts = np.where(np.logical_and(~np.concatenate([[False], m[:-1]]), m))[0]
+                        ends = np.where(np.logical_and(m, ~np.concatenate([m[1:], [False]])))[0]
+                        for s, e in zip(starts, ends):
+                            x0 = float(xs[s] - half)
+                            x1 = float(xs[e] + half)
+                            fig.add_shape(type="rect", x0=x0, x1=x1, y0=0.0, y1=1.0, xref="x", yref="y", line=dict(color="red", width=2), fillcolor="rgba(0,0,0,0)")
+                except Exception:
+                    pass
+
+        elif dims == 2:
+            # Pivot points into a regular grid for heatmap
+            df = pd.DataFrame({
+                "x": x[:, 0],
+                "y": x[:, 1],
+                "v": mean,
+            })
+            pivot = df.pivot(index="y", columns="x", values="v")
+            # Ensure axis order is increasing
+            pivot = pivot.sort_index(ascending=True)
+            pivot = pivot[pivot.columns.sort_values()]
+            z = np.asarray(pivot.values)
+            fig.add_trace(go.Heatmap(
+                x=list(pivot.columns),
+                y=list(pivot.index),
+                z=z,
+                colorscale="Viridis",
+                zmin=0.0,
+                zmax=1.0
+            ))
+            fig.update_layout(xaxis_title=self.dimensions[0], yaxis_title=self.dimensions[1])
+
+            if overlay_gate and gate_sample_id is not None:
+                mask = self.get_sample_mask(gate_sample_id).astype(float)
+                dfm = pd.DataFrame({"x": x[:, 0], "y": x[:, 1], "m": mask})
+                pm = dfm.pivot(index="y", columns="x", values="m")
+                pm = pm.sort_index(ascending=True)
+                pm = pm[pm.columns.sort_values()]
+                mz = np.asarray(pm.values)
+                # Draw only the contour line at 0.5 (no filled interior)
+                fig.add_trace(go.Contour(
+                    x=list(pm.columns),
+                    y=list(pm.index),
+                    z=mz,
+                    showscale=False,
+                    contours=dict(start=0.5, end=0.5, size=1, coloring="lines", type="constraint"),
+                    line=dict(color="red", width=2),
+                    hoverinfo="skip",
+                ))
+
+        else:
+            # For higher dims, project onto first two dims and scatter
+            xs = x[:, 0]
+            ys = x[:, 1] if x.shape[1] > 1 else np.zeros_like(xs)
+            fig.add_trace(go.Scattergl(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=dict(color=mean, colorscale="Viridis", size=4),
+                hoverinfo="skip"
+            ))
+            fig.update_layout(
+                xaxis_title=self.dimensions[0],
+                yaxis_title=(self.dimensions[1] if len(self.dimensions) > 1 else "dim2")
+            )
+            if overlay_gate and gate_sample_id is not None:
+                try:
+                    mask = self.get_sample_mask(gate_sample_id).astype(bool)
+                    # plot open markers for masked points so interior remains visually transparent
+                    fig.add_trace(go.Scattergl(
+                        x=xs[mask],
+                        y=ys[mask],
+                        mode="markers",
+                        marker=dict(color="red", size=3, symbol="circle-open", opacity=0.6),
+                        name="gate_mask"
+                    ))
+                except Exception:
+                    pass
+
+        if title:
+            fig.update_layout(title=title)
+
+        if output_path:
+            output_path = Path(output_path)
+            if output_path.suffix != ".html":
+                raise ValueError("Output path must have .html extension for Plotly figure.")
+            fig.write_html(output_path)
+
+        return fig
+
     # ------------------------------------------------------------------
     # Artifact I/O helpers
     # ------------------------------------------------------------------
@@ -659,7 +787,7 @@ class GateSpaceGeometry:
         """Persist all gate-space artifacts and update ``entity_qc.artifacts``."""
         artifact_dir = dataloader.get_entity_qc_artifact_path(
             entity_type="gate_node",
-            entity_id=self.info["gate_id"],
+            entity_id=self.info["entity_id"],
             artifact_key=self.artifact_key
         )
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -689,7 +817,7 @@ class GateSpaceGeometry:
 
         entity_qc.artifacts[self.artifact_key] = {
             "artifact_type": self.artifact_key,
-            "gate_id": info["gate_id"],
+            "entity_id": info["entity_id"],
             "schema_version": _GATE_SPACE_ARTIFACT_VERSION,
             "updated_at": now_iso(),
         }
@@ -840,9 +968,9 @@ class GateSpaceGeometry:
 class GateMaskRatioTest(QCTester):
     """Test for event counts and ratios in a gated region."""
 
-    test_type = "gate"
-    test_name = "gate_event_count"
-    target_keys = ("gate_id", "sample_id")
+    test_type = "gatenode"
+    test_name = "gatenode_event_count"
+    target_keys = ("entity_id", "sample_id")
     meta_keys = ("parent_id", )
     default_config = {}
     meta_fields = [
@@ -879,7 +1007,7 @@ class GateMaskRatioTest(QCTester):
         Parameters
         ----------
         targets : dict[str, Any]
-            Base target identifiers (gate_id, sample_id)
+            Base target identifiers (entity_id, sample_id)
         entity : GateNode
             Gate node entity for the test.
         masks : dict[str, BooleanArray]
@@ -890,8 +1018,8 @@ class GateMaskRatioTest(QCTester):
 
         metadata = self.metadata.copy()  # Start with default metadata
         # Calculate basic metrics
-        gate_id = entity.id
-        mask = masks[gate_id]
+        entity_id = entity.id
+        mask = masks[entity_id]
         n_passing = int(np.sum(mask))
         n_total = int(mask.shape[0])
 
@@ -902,7 +1030,7 @@ class GateMaskRatioTest(QCTester):
             parent_mask = np.logical_or.reduce([masks[parent] for parent in parent_ids])
             if parent_mask.shape[0] != n_total:
                 raise ValueError(
-                    f"Mask length mismatch for gate {targets['gate_id']}: "
+                    f"Mask length mismatch for gate {targets['entity_id']}: "
                     f"gate mask length={n_total}, parent mask length={parent_mask.shape[0]}"
                 )
         else:
@@ -916,7 +1044,7 @@ class GateMaskRatioTest(QCTester):
 
         if n_total == 0:
             yield QCTestRecord(
-                id=self.make_key(targets, metadata),
+                id=self.make_key(targets=targets, metadata=metadata),
                 test_type=self.test_type,
                 test_name=self.test_name,
                 targets=targets,
@@ -937,7 +1065,7 @@ class GateMaskRatioTest(QCTester):
         ratio_parent = n_passing_in_parent / n_parent if n_parent else float("nan")
 
         test = QCTestRecord(
-            id=self.make_key(targets, metadata),
+            id=self.make_key(targets=targets, metadata=metadata),
             test_type=self.test_type,
             test_name=self.test_name,
             targets=targets,
@@ -967,7 +1095,7 @@ class GateMaskRatioTest(QCTester):
 
         Both bars overlay their corresponding ratio thresholds.
         """
-        gate_id = test.targets.get("gate_id", "Unknown")
+        entity_id = test.targets.get("entity_id", "Unknown")
         parent_id = test.metadata.get("parent_id", "Unknown")
 
         n_total = test.metadata.get("n_events_total", 0)
@@ -1100,7 +1228,7 @@ class GateMaskRatioTest(QCTester):
                 )
 
         # Update layout
-        title = f"Gate: {gate_id} (parent: {parent_id})<br>" \
+        title = f"Gate: {entity_id} (parent: {parent_id})<br>" \
                 f"<sub>Total events: {n_total:,} | Parent events: {n_parent:,} | " \
                 f"Gate events: {n_passing_in_parent:,}</sub>"
 
@@ -1142,9 +1270,9 @@ class GateFitDiagnosticTest(QCTester):
     _get_gate_type_config().
     """
 
-    test_type = "gate"
-    test_name = "gate_fit_quality"
-    target_keys = ("gate_id", "sample_id")
+    test_type = "gatenode"
+    test_name = "gatenode_fit_quality"
+    target_keys = ("entity_id", "sample_id")
     meta_keys = ("parent_id", )
     default_config = {}
     meta_fields = [
@@ -1210,7 +1338,7 @@ class GateFitDiagnosticTest(QCTester):
         Parameters
         ----------
         targets : dict[str, Any]
-            Target identifiers (sample_id, gate_id)
+            Target identifiers (sample_id, entity_id)
         **kwargs
             Additional test-specific parameters (gate_node, sample_id, entity, etc.)
         """
@@ -1236,7 +1364,7 @@ class GateFitDiagnosticTest(QCTester):
                 continue
 
             yield QCTestRecord(
-                id=self.make_key(targets, metadata),
+                id=self.make_key(targets=targets, metadata=metadata),
                 test_type=self.test_type,
                 test_name=self.test_name,
                 targets=targets,
@@ -1245,45 +1373,6 @@ class GateFitDiagnosticTest(QCTester):
                 thresholds=thresholds,
                 status="PENDING",
             )
-
-
-# ---------------------------------------------------------------------------
-# Read-only proxy stubs for gate outlier tests (used by generate_table)
-# ---------------------------------------------------------------------------
-
-class _GateMetricOutlierProxy(QCTester):
-    """Table-generation proxy for gate_metric_outlier tests (no fit())."""
-    test_type = "gate_batch"
-    test_name = "gate_metric_outlier"
-    target_keys = ("entity_id", "metric_type")
-    meta_keys = ("sample_id", "metric_name")
-    metric_fields = [("outlier_score", "Outlier score")]
-    meta_fields = [
-        ("metric_name",    "Name of the metric"),
-        ("metric_value",   "Raw metric value"),
-        ("sample_id",      "Sample ID"),
-        ("outlier_method", "Outlier detection method"),
-    ]
-    default_config = {"min_samples": 6, "outlier_method": "iqr", "use_mad": True}
-    default_thresholds = {"outlier_score": {"warn": (-1.5, 1.5), "severe": (-3.0, 3.0)}}
-
-
-class _GateCoverageOutlierProxy(QCTester):
-    """Table-generation proxy for gate_coverage_outlier tests (no fit())."""
-    test_type = "gate_batch"
-    test_name = "gate_coverage_outlier"
-    target_keys = ("entity_id", "metric_type")
-    meta_keys = ("sample_id", "metric_name")
-    metric_fields = [("outlier_score", "Outlier score")]
-    meta_fields = [
-        ("metric_name",    "Name of the metric"),
-        ("metric_value",   "Raw centrality value"),
-        ("sample_id",      "Sample ID"),
-        ("glm_type",       "GLM gate type"),
-        ("n_eval_points",  "Evaluation points used"),
-    ]
-    default_config = {"min_samples": 6, "outlier_method": "zscore", "use_mad": True}
-    default_thresholds = {"outlier_score": {"warn": (-3.0, 3.0), "severe": (-5.0, 5.0)}}
 
 
 @EntityQCEvaluatorRegistry.register("gate_node")
@@ -1331,6 +1420,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         "use_mad": True,
         # Full-gate geometry outlier config
         "gate_space_min_samples": 6,
+        "gate_space_outlier_method": "zscore",
         "gate_space_resolution": 256,
         "gate_space_thresholds": {
             "warn": (-3.0, 3.0),
@@ -1381,14 +1471,53 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         dict[str, type[QCTester]]
             Mapping of test_name → QCTester subclass
         """
-        qc_testers: list[type[QCTester]] = [
-            GateMaskRatioTest,
-            GateFitDiagnosticTest,
-            _GateMetricOutlierProxy,
-            _GateCoverageOutlierProxy,
-        ]
-        return {tester.test_name: tester for tester in qc_testers}
 
+        if entity is None:
+            raise ValueError("Entity must be provided to get tests for gate node QC.")
+
+        # Base testers
+        testers = [GateMaskRatioTest, GateFitDiagnosticTest]
+
+        default_thresholds = cls._normalize_outlier_thresholds(cls.default_config.get("outlier_thresholds"))
+        extra_meta_keys = ("parent_id", )
+        extra_meta_fields = [("parent_id", "Parent gate ID(s)")]
+        default_config = {
+            "min_samples": cls.default_config["min_samples"],
+            "outlier_method": cls.default_config["outlier_method"],
+            "use_mad": cls.default_config["use_mad"],
+        }
+
+        for metric_type in ("masks", "diagnostics", "params"):
+            testers.append(
+                _ScalarOutlierTester.from_defaults(
+                    entity=entity,
+                    metric_type=metric_type,
+                    extra_meta_keys=extra_meta_keys,
+                    extra_meta_fields=extra_meta_fields,
+                    config=default_config,
+                    thresholds=default_thresholds,
+                )
+            )
+
+        if entity.gate_type not in {"Boolean", "Quadrant"}:
+            default_config = {
+                "min_samples": cls.default_config["gate_space_min_samples"],
+                "outlier_method": cls.default_config["gate_space_outlier_method"],
+                "use_mad": cls.default_config["use_mad"],
+                "glm_type": entity.glm_type,
+                "resolution": cls.default_config["gate_space_resolution"],
+            }
+            default_thresholds = cls._normalize_outlier_thresholds(cls.default_config["gate_space_thresholds"])
+            testers.append(_ScalarOutlierTester.from_defaults(
+                entity=entity,
+                metric_type="geometry",
+                extra_meta_keys=extra_meta_keys,
+                extra_meta_fields=extra_meta_fields,
+                config=default_config,
+                thresholds=default_thresholds,
+            ))
+
+        return {tester.test_name: tester for tester in testers}
 
     def required_layer(self, entity: GateNode | None = None) -> str | None:
         """Return the required AnnData layer for gate node QC."""
@@ -1527,7 +1656,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         diagnostics_step = sample_steps.get_step("GATE_QC_DIAGNOSTICS")
         gate_targets = {
             "sample_id": sample_id,
-            "gate_id": entity.id,
+            "entity_id": entity.id,
         }
 
         self._evaluate_gate_mask(
@@ -1556,7 +1685,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         gate_targets: dict[str, str],
     ) -> None:
         """Evaluate mask-derived gate metrics for a single sample."""
-        gate_id = gate_targets["gate_id"]
+        gate_id = gate_targets["entity_id"]
         masks_to_load = [pid for pid in entity.parent_ids if pid != "root"]
         masks_to_load.append(gate_id)
 
@@ -1653,11 +1782,11 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         # Get basic QC
         sample_ids = list(entity_qc.sample_qc.keys())
         batch_step = entity_qc.batch_qc.get_step("GATE_NODE_BATCH_QC")
-        param_metrics, diag_metrics = self._collect_sample_params(entity_qc, gate_node=entity)
+        param_metrics, diag_metrics = self._collect_sample_params(gate_node=entity, sample_ids=sample_ids)
         mask_metrics = self._collect_mask_metrics(entity_qc, gate_id=entity.id)
         sample_metrics: dict[str, dict[str, list[float]]] = {
             "diagnostics": diag_metrics,
-            "mask": mask_metrics,
+            "masks": mask_metrics,
         }
 
         if entity.custom_gates:
@@ -1672,26 +1801,24 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             "min_samples": config["min_samples"],
             "outlier_method": method,
             "use_mad": config["use_mad"],
+            "parent_id": "|".join(sorted(entity.parent_ids)) if entity.parent_ids else "root",
         }
+        testers = self.get_tests(entity)
         for metric_type, metrics_by_name in sample_metrics.items():
-            outlier_targets = {
-                "entity_id": entity.id,
-                "metric_type": metric_type,
-            }
+            test_name = f"gatenode_{metric_type}_outlier"
+            tester_class = testers.get(test_name)
+            if tester_class is None: continue  # No tester defined for this metric type
             for metric_name, metric_series in metrics_by_name.items():
-                outlier_tester = make_scalar_outlier_tester(
-                    entity,
-                    test_name="gate_metric_outlier",
-                    test_type="gate_batch",
-                    config=outlier_config,
-                    thresholds=outlier_thresholds,
-                )
+                outlier_tester = tester_class(outlier_config, thresholds=outlier_thresholds)
+                outlier_targets = {
+                    "entity_id": entity.id,
+                    "metric_type": metric_type,
+                    "metric_name": metric_name
+                }
                 sample_values = {sid: metric_series[idx] for idx, sid in enumerate(sample_ids)}
-                # Run outlier detection per metric
                 for classified_test in outlier_tester.fit_classify(
                     targets=outlier_targets,
                     sample_values=sample_values,
-                    metric_name=metric_name,
                 ):
                     # Add to batch step
                     if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
@@ -1708,43 +1835,31 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         if gate_space_geometry is None: return
 
         # Build Tester
-        gate_space_targets = {"entity_id": entity.id, "metric_type": "params"}
-        gate_space_min_samples = int(config["gate_space_min_samples"])
+        gate_space_targets = {
+            "entity_id": entity.id,
+            "metric_type": "geometry",
+            "metric_name": "centrality_score"
+        }
         gate_space_config = {
-            "min_samples": gate_space_min_samples,
-            "outlier_method": "zscore",
+            "min_samples": config["gate_space_min_samples"],
+            "outlier_method": config["gate_space_outlier_method"],
             "use_mad": config["use_mad"],
+            "parent_id": "|".join(sorted(entity.parent_ids)) if entity.parent_ids else "root",
+            "glm_type": entity.glm_type,
+            "resolution": config["gate_space_resolution"],
         }
         gate_space_thresholds = self._normalize_outlier_thresholds(
             config["gate_space_thresholds"]
         )
         centrality = gate_space_geometry.centrality_by_sample()
-        space_tester = make_scalar_outlier_tester(
-            entity,
-            test_name="gate_geometry_outlier",
-            test_type="gate_batch",
-            config=gate_space_config,
-            thresholds=gate_space_thresholds,
-            extra_meta_fields=[
-                ("glm_type",   "Type of GLM gate"),
-                ("resolution", "Resolution of the gate space geometry"),
-            ],
-            extra_static_meta={
-                "glm_type":   entity.glm_type or "",
-                "resolution": config.get("gate_space_resolution", 256),
-            },
-            plot_description="Gate-space centrality outlier score per sample",
-        )
-
-        # Run outlier detection on gate space centrality scores
+        space_tester = testers["gatenode_geometry_outlier"](gate_space_config, thresholds=gate_space_thresholds)
         for classified_test in space_tester.fit_classify(
             targets=gate_space_targets,
             sample_values=centrality,
-            metric_name="centrality_score",
         ):
             if classified_test.status in {"WARN", "SEVERE", "FAIL"}:
                 batch_step.add_reason(
-                    code=f"GATE_GLM_SPACE_OUTLIER_{classified_test.status}",
+                    code=f"GATE_GEOMETRY_OUTLIER_{classified_test.status}",
                     message=classified_test.message,
                     tests=[classified_test],
                 )
@@ -1769,10 +1884,10 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
         metrics_by_name: dict[str, list[float]] = {}
 
         for idx, sample_id in enumerate(sample_ids):
-            for step_name, test_key, test_record in entity_qc.iter_sample_tests(sample_id):
+            for (step_name, test_key), test_record in entity_qc.iter_sample_tests(sample_id):
                 if (test_record.test_type == GateMaskRatioTest.test_type and
                     test_record.test_name == GateMaskRatioTest.test_name and
-                    test_record.targets["gate_id"] == gate_id):
+                    test_record.targets["entity_id"] == gate_id):
 
                     for metric_key, metric_value in test_record.metrics.items():
                         metric_series = metrics_by_name.setdefault(
@@ -1786,11 +1901,11 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
 
         return metrics_by_name
 
+    @staticmethod
     def _collect_sample_params(
-        self,
-        entity_qc: EntityQCStatus,
-        gate_node: GateNode
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        gate_node: GateNode,
+        sample_ids: list[str] | None = None,
+    ) -> tuple[dict[str, list[float]], dict[str, Any]]:
         """Collect scalar gate metrics across samples in metric-centric format.
 
         Expected shape (by convention, not enforced by all gates):
@@ -1808,7 +1923,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             )
             Metric series are aligned with "sample_ids".
         """
-        sample_ids = list(entity_qc.sample_qc.keys())
+        sample_ids = sample_ids or list(gate_node.custom_gates.keys())
         n_samples = len(sample_ids)
 
         sample_params: dict[str, list[float]] = {}
@@ -1834,3 +1949,179 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                         continue
 
         return sample_params, sample_diagnostics
+
+    def _plot_gate_with_ratio(
+        self,
+        gate_node: GateNode,
+        dataloader: UnifiedDataLoader,
+        sample_id: str,
+        dimensions: list[str] | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
+        """Render a gate-level diagnostic plot using the Gate.plot API with
+        `show_ratio=True` enabled.
+
+        Parameters
+        ----------
+        entity_qc : EntityQCStatus
+            QC status for the gate node entity
+        dataloader : UnifiedDataLoader
+            Data loader used to fetch sample AnnData and gate node
+        sample_id : str
+            Sample identifier to render
+        test : QCTestRecord | None
+            Optional test record (unused, provided for symmetry)
+        **kwargs : Any
+            Forwarded to `Gate.plot`
+        """
+        if dataloader is None or sample_id is None:
+            raise ValueError("Dataloader and sample_id are required to generate gate plot")
+
+        layer = self.required_layer(gate_node)
+        events = dataloader.load_adata(sample_id=sample_id, layer=layer)
+        gate_cls = GateRegistry.get(gate_node.gate_type)
+        gate = gate_cls.from_node(gate_node, sample_id=sample_id)
+
+        return gate.plot(
+            events=events,
+            mask=None,
+            dimensions=dimensions,
+            show_ratio=True,
+            **kwargs
+        )
+
+    def generate_figure(
+        self,
+        entity_qc: EntityQCStatus,
+        test_key: Mapping[str, Any] | QCTestRecord,
+        dataloader: UnifiedDataLoader | None = None,
+        dataloader_context: dict[str, Any] | None = None,
+        step_id: str | None = None,
+        **kwargs: Any,
+    ) -> go.Figure:
+        """Generate plot for a gate-level test (sample or batch).
+
+        Looks up the `QCTestRecord` in `entity_qc` using `test_key`, instantiates
+        the corresponding `QCTester` from the record and delegates to its
+        `plot()` method. For batch outlier tests this collects the per-sample
+        metric series and passes `sample_values` + `metric_name` to the tester.
+        """
+        if dataloader is None:
+            raise ValueError("Dataloader is required to generate figures for gate node QC tests")
+        dataloader_context = dataloader_context or {}
+        entity = self.load_entity(dataloader, entity_qc.entity_id)
+
+        # Parse the test_key once up-front (supports QCTestRecord or mapping/tuple)
+        if isinstance(test_key, QCTestRecord):
+            tester_class, test_key_dict = self._parse_test_key(test_key.id, entity=entity)
+        else:
+            tester_class, test_key_dict = self._parse_test_key(test_key, entity=entity)
+
+        # Find stored QCTestRecord (prefer provided record)
+        tester: QCTester | type[QCTester]
+        if isinstance(test_key, QCTestRecord):
+            test = test_key
+            tester = tester_class.from_dict(test)
+        else:
+            test: QCTestRecord | None = None
+            if test_key_dict["test_type"] == "gatenode":
+                sid: str = test_key_dict["sample_id"]
+                try:
+                    qc = entity_qc.sample_qc[sid]
+                except KeyError:
+                    raise KeyError(f"Sample {sid} not found in "
+                                   f"QC status for entity {entity_qc.entity_id}")
+            elif test_key_dict["test_type"] == "gatenode_batch_outlier":
+                qc = entity_qc.batch_qc
+            else:
+                raise ValueError(f"Unsupported test_type '{test_key_dict['test_type']}'"
+                                 " for gate node QC figure generation")
+
+            test_key_tuple = tuple(tester_class.make_key(test_key_dict).values())
+            if step_id is not None:
+                step = qc.steps[step_id]
+                test = step.tests[test_key_tuple]
+            else:
+                for step in qc.steps.values():
+                    if test_key_tuple in step.tests:
+                        test = step.tests[test_key_tuple]
+                        break
+
+            if test is None:
+                raise KeyError(f"Test {test_key_tuple} not found in "
+                               f"QC status for entity {entity_qc.entity_id}")
+
+            tester = tester_class.from_dict(test)
+
+        if isinstance(tester, GateMaskRatioTest):
+            sample_id = test_key_dict["sample_id"]
+            return self._plot_gate_with_ratio(
+                gate_node=entity,
+                dataloader=dataloader,
+                sample_id=sample_id,
+                test=test,
+                **kwargs
+            )
+
+        if isinstance(tester, _ScalarOutlierTester):
+            metric_name = test_key_dict["metric_name"]
+            metric_type = test_key_dict.get("metric_type")
+            sample_values = self._collect_batch_sample_values(
+                entity_qc=entity_qc,
+                test=test,
+                gate_node=entity,
+                dataloader=dataloader
+            )
+            # Special-case: for geometry batch tests allow returning a gated heatmap
+            if metric_type == "geometry" and kwargs.get("plot_gate"):
+                gs = GateSpaceGeometry.load(entity_qc=entity_qc, dataloader=dataloader, entity=entity)
+                if gs is None:
+                    raise ValueError(f"Gate space geometry artifact not found for entity {entity_qc.entity_id}")
+                title = f"Gate-space mean mask: {entity.id}"
+                return gs.plot(title=title, overlay_gate=True, gate_sample_id=test_key_dict["sample_id"], output_path=kwargs.get("output_path"))
+
+            return tester.plot(test=test, sample_values=sample_values, metric_name=metric_name)
+
+        raise NotImplementedError("Figure generation for non-batch tests is not implemented yet")
+
+    def _collect_batch_sample_values(
+        self,
+        entity_qc: EntityQCStatus,
+        test: QCTestRecord,
+        gate_node: GateNode,
+        dataloader: UnifiedDataLoader,
+    ) -> dict[str, float]:
+        """Collect per-sample scalar values corresponding to a batch outlier test.
+
+        Attempts to reuse existing collectors:
+        - `mask` metrics via `_collect_mask_metrics`
+        - `params` / `diagnostics` via `_collect_sample_params` (requires `dataloader` to load gate node)
+
+        Falls back to scanning per-sample tests if the specialized collector can't be used.
+        """
+
+        # Get metric identifiers from test metadata/targets
+        try:
+            metric_name = test.id["metric_name"]
+            metric_type = test.id["metric_type"]
+        except (KeyError, TypeError):
+            raise ValueError("Invalid test key: missing 'metric_name' or 'metric_type' in test metadata")
+
+        # Use mask collector when available
+        if metric_type == "geometry":
+            gs = GateSpaceGeometry.load(entity_qc=entity_qc, dataloader=dataloader, entity=gate_node)
+            if gs is None:
+                raise ValueError(f"Gate space geometry artifact not found for entity {entity_qc.entity_id}")
+            return gs.centrality_by_sample()
+
+        if metric_type == "masks":
+            metrics_by_name = self._collect_mask_metrics(entity_qc=entity_qc, gate_id=entity_qc.entity_id)
+        elif metric_type in {"params", "diagnostics"}:
+            params, diags = self._collect_sample_params(gate_node, sample_ids=list(entity_qc.sample_qc.keys()))
+            metrics_by_name = params if metric_type == "params" else diags
+        else:
+            raise ValueError(f"Unsupported metric_type '{metric_type}' for batch outlier test")
+
+        series = metrics_by_name[metric_name]
+        sample_ids = list(entity_qc.sample_qc.keys())
+        return dict(zip(sample_ids, series))
