@@ -128,7 +128,8 @@ class AddGateStep(BaseStep):
             reason_code_fail="BUILD_BATCH_ADATA_ERROR",
             batch=batch_ref,
             gate_node=gate_node,
-            step_run=step_run,
+            seed=step_run.config["seed"],
+            n_events=step_run.config["n_events_per_sample"]
         )
         if batch_adata is None:
             return {}, qc
@@ -140,7 +141,6 @@ class AddGateStep(BaseStep):
             "FitGateOnBatch",
             gate.fit,
             events=batch_adata,
-            mask={},
             reason_code_fail="GATE_FIT_ERROR"
         )
         if gate is None:

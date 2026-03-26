@@ -504,6 +504,23 @@ class RectangleGate(Gate):
 
         return _format_gate_plot(fig, title=plot_title, width=plot_width, height=plot_height)
 
+    @staticmethod
+    def _marginal_axis_max(data: np.ndarray, nbins: int, histnorm: str) -> float | None:
+        """Compute a reasonable axis maximum for a marginal histogram.
+
+        Returns a float representing the maximum axis value (with a small headroom)
+        or None on error.
+        """
+        try:
+            counts, _ = np.histogram(data, bins=nbins, density=(histnorm in ("density", "probability density")))
+            if histnorm == "probability":
+                counts = counts / len(data)
+            elif histnorm == "percent":
+                counts = counts / len(data) * 100.0
+            return float(np.max(counts)) * 1.15 if counts.size > 0 else None
+        except Exception:
+            return None
+
     def _plot_2D_marginals(self, events: ad.AnnData, plot_dims: Sequence[str], **kwargs: Any) -> go.Figure:
         """2D scatter with marginal 1D plots on top and right side."""
         x_dim, y_dim = plot_dims
@@ -581,7 +598,7 @@ class RectangleGate(Gate):
             col=1,
         )
 
-        # Add x thresholds to top histogram
+        # Add x thresholds to top histogram (scoped to that subplot)
         if x_min is not None:
             fig.add_vline(
                 x=float(x_min),
@@ -589,7 +606,7 @@ class RectangleGate(Gate):
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
                 annotation_text="min",
-                row=1, col=1, # pyright: ignore[reportArgumentType]
+                row=1, col=1,  # pyright: ignore[reportArgumentType]
             )
         if x_max is not None:
             fig.add_vline(
@@ -598,8 +615,13 @@ class RectangleGate(Gate):
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
                 annotation_text="max",
-                row=1, col=1, # pyright: ignore[reportArgumentType]
+                row=1, col=1,  # pyright: ignore[reportArgumentType]
             )
+
+        # Compute top histogram extents using helper
+        top_y_max = self._marginal_axis_max(x_data, hist_nbins, histnorm)
+        if top_y_max is not None:
+            fig.update_yaxes(range=[0.0, top_y_max], row=1, col=1)
 
         # Y marginal (right, bottom-right) as horizontal histogram
         fig.add_trace(
@@ -611,8 +633,7 @@ class RectangleGate(Gate):
                 orientation="h",
                 showlegend=False,
             ),
-            row=2,
-            col=2,
+            row=2, col=2,
         )
 
         # Add y thresholds to right histogram (horizontal lines)
@@ -623,7 +644,7 @@ class RectangleGate(Gate):
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
                 annotation_text="min",
-                row=2, col=2, # pyright: ignore[reportArgumentType]
+                row=2, col=2,  # pyright: ignore[reportArgumentType]
             )
         if y_max is not None:
             fig.add_hline(
@@ -632,8 +653,12 @@ class RectangleGate(Gate):
                 line_width=gate_line_width,
                 line_dash=gate_line_dash,
                 annotation_text="max",
-                row=2, col=2, # pyright: ignore[reportArgumentType]
+                row=2, col=2,  # pyright: ignore[reportArgumentType]
             )
+        # Compute right histogram extents using helper
+        right_x_max = self._marginal_axis_max(y_data, hist_nbins, histnorm)
+        if right_x_max is not None:
+            fig.update_xaxes(range=[0.0, right_x_max], row=2, col=2)
 
         # Rectangle overlay on main scatter (reuse computed thresholds)
 

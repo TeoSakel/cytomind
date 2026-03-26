@@ -281,6 +281,7 @@ class BaseStep:
 
         # Evaluate and persist product QC
         for qc_status in step_evaluator.evaluate_step_products(self.repo, step_run):
+            # TODO: just add a  single QC step with overall flag?
             step_run.qc.update_batch_steps(qc_status.batch_qc, merge=True)
             for sid, qc in qc_status.sample_qc.items():
                 step_run.qc.update_sample_steps(sid, qc, merge=True)
