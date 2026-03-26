@@ -24,7 +24,6 @@ class NumpyEncoder(json.JSONEncoder):
     Converts numpy integers and floats to their Python native equivalents
     for JSON serialization. Arrays are converted to lists.
     """
-
     def default(self, o):
         """Convert numpy types to JSON-serializable Python types."""
         if isinstance(o, np.integer):
@@ -34,6 +33,56 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(o, np.ndarray):
             return o.tolist()
         return super().default(o)
+
+    def _canonicalize(self, obj):
+        """Recursively convert objects to JSON-serializable, deterministic primitives.
+
+        Rules:
+        - dict: convert keys to strings and canonicalize values
+        - tuple: convert to list
+        - set: convert to sorted list by repr()
+        - numpy types and arrays handled by `default` during encoding, but we
+          also convert arrays here to lists to ensure consistent structure.
+        - other objects: leave as-is (JSON encoder will call `default`)
+        """
+        # Primitives
+        if obj is None or isinstance(obj, (str, bool, int, float)):
+            return obj
+
+        # Numpy arrays -> lists (cover common cases earlier than default)
+        try:
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except Exception:
+            pass
+
+        # dict -> keys as strings and canonicalized values
+        if isinstance(obj, dict):
+            return {str(k): self._canonicalize(v) for k, v in obj.items()}
+
+        # tuple -> list
+        if isinstance(obj, tuple):
+            return [self._canonicalize(x) for x in obj]
+
+        # list -> canonicalize items
+        if isinstance(obj, list):
+            return [self._canonicalize(x) for x in obj]
+
+        # set -> sorted list for determinism
+        if isinstance(obj, set):
+            try:
+                sorted_items = sorted(obj, key=lambda x: repr(x))
+            except Exception:
+                sorted_items = list(obj)
+            return [self._canonicalize(x) for x in sorted_items]
+
+        # Fallback: return as-is and let default() handle it
+        return obj
+
+    def encode(self, o):
+        # Pre-canonicalize the object to ensure deterministic structure
+        canonical = self._canonicalize(o)
+        return super().encode(canonical)
 
 
 @dataclass

@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Hashable, Sequence, Mapping, TYPE_CHECKING
+import json
+import hashlib
+from cytomind.domain.pipeline import NumpyEncoder
 
 import numpy as np
 
@@ -498,7 +501,15 @@ class Gate(ABC):
         return self.fit(events).apply(events, mask)
 
     @abstractmethod
-    def plot(self, events: AnnData, mask: dict[str, BooleanArray] | None = None, **kwargs: Any) -> Any:
+    def plot(
+        self,
+        events: AnnData,
+        mask: dict[str, BooleanArray] | None = None,
+        dimensions: Sequence[str] | None = None,
+        *,
+        show_ratio: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         """
         Generate diagnostic plot for the gate.
 
@@ -508,6 +519,11 @@ class Gate(ABC):
             Event data with dimension IDs as var_names
         mask : dict[str, BooleanArray] | None, default None
             Dictionary of boolean masks from parent gates (default: None → treated as no mask, fit/apply on all events)
+        dimensions : Sequence[str] | None, default None
+            Optional list of dimensions to plot (gate implementations may accept/require it)
+        show_ratio : bool, default True
+            If True, annotate the plot with the ratio (fraction) of events included in the gate/mask.
+            Placement is best-effort and will be centered roughly on the geometric mask when possible.
         **kwargs : Any
             Optional plot configuration parameters passed through by callers.
 
@@ -535,5 +551,99 @@ class Gate(ABC):
         pass
 
     def __hash__(self) -> int:
+        """Deterministic hash for cross-process stability.
+
+        Uses a canonical JSON serialization of the gate-identifying fields
+        and returns an integer derived from SHA-256. This avoids Python's
+        per-process hash randomization and yields stable keys across runs.
+        """
         gate_type = self.glm_type or self.gate_type
-        return hash((gate_type, tuple(self.dimensions), self.use_as_complement, self._param_key()))
+
+        key_obj = (gate_type, list(self.dimensions), bool(self.use_as_complement), self._param_key())
+        json_s = json.dumps(key_obj, cls=NumpyEncoder, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(json_s.encode("utf-8")).hexdigest()
+        # Return a stable integer derived from the digest
+        return int(digest, 16)
+
+    def _compute_ratio(self, events: AnnData, mask: dict[str, Any] | None = None, region_id: str | None = None) -> float | None:
+        """Compute fraction of events included in this gate/region.
+
+        Strategy:
+        1) If `mask` is provided and contains this gate's `gate_name`, use that array.
+        2) Otherwise call `self.apply(events, mask=mask)` to obtain masks and compute the fraction.
+
+        Returns fraction in [0,1] or `None` on failure.
+        """
+        try:
+            # 1) mask directly provided for this gate
+            if mask is not None and self.gate_name in mask:
+                arr = np.asarray(mask[self.gate_name])
+                if arr.size == 0:
+                    return None
+                return float(arr.mean())
+        except Exception:
+            pass
+
+        # 2) Fallback: apply the gate to compute masks
+        try:
+            if events is None:
+                return None
+            if getattr(events, "isbacked", False):
+                events = events.to_memory()
+
+            res = self.apply(events, mask=mask)
+            if region_id is not None and region_id in res:
+                arr = np.asarray(res[region_id])
+            elif self.gate_name in res:
+                arr = np.asarray(res[self.gate_name])
+            else:
+                arr = np.asarray(next(iter(res.values())))
+
+            if arr.size == 0:
+                return None
+            return float(arr.mean())
+        except Exception:
+            return None
+
+    def _resolve_plot_dimensions(
+        self,
+        requested_dimensions: Sequence[str] | None,
+        available_dimensions: Sequence[str] | None = None,
+        *,
+        min_dims: int = 1,
+        max_dims: int | None = None,
+    ) -> list[str]:
+        """Resolve and validate dimensions used for plotting.
+
+        Parameters
+        - requested_dimensions: explicit dims requested by caller
+        - available_dimensions: list of valid dimension ids (defaults to this gate's dimensions)
+        - min_dims, max_dims: bounds on number of dimensions
+        """
+        gate_dims = list(available_dimensions) if available_dimensions is not None else list(self.dimensions)
+        gate_cls_name = self.__class__.__name__
+
+        if requested_dimensions is None:
+            dims = list(gate_dims)
+        else:
+            dims = list(requested_dimensions)
+
+        if not dims:
+            raise ValueError(f"{gate_cls_name}.plot() requires at least one dimension")
+
+        unknown = [dim for dim in dims if dim not in gate_dims]
+        if unknown:
+            raise ValueError(
+                f"{gate_cls_name}.plot() received dimensions not in available dimensions: {unknown}. "
+                f"Available dimensions: {list(gate_dims)}"
+            )
+
+        if len(set(dims)) != len(dims):
+            raise ValueError(f"{gate_cls_name}.plot() dimensions must be unique")
+
+        if len(dims) < min_dims:
+            raise ValueError(f"{gate_cls_name}.plot() requires at least {min_dims} dimensions")
+        if max_dims is not None and len(dims) > max_dims:
+            raise ValueError(f"{gate_cls_name}.plot() supports at most {max_dims} dimensions")
+
+        return dims
