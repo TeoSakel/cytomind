@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, TYPE_CHECKING, Sequence
+from typing import Any, TYPE_CHECKING, Sequence, Mapping
 from numpy.typing import NDArray
 
 import numpy as np
@@ -12,10 +12,8 @@ from cytomind.gates import GateRegistry
 if TYPE_CHECKING:
     from cytomind.domain.pipeline import BatchRef, SampleRef, StepRun
     from cytomind.gates.base import Gate
-    from cytomind.gates.glm_gates import QuadrantGate
 else:
     Gate = object
-    QuadrantGate = object
 
 from .base import BaseStep
 from . import register_step
@@ -34,7 +32,7 @@ class AddGateStep(BaseStep):
     5. Persists the updated strategy
 
     Handles special cases:
-    - QuadrantGate: returns multiple region masks
+    - Multi-offspring gates: may return multiple region masks and child gate specs
     - BooleanGate: requires all expression variable masks
     """
 
@@ -113,42 +111,65 @@ class AddGateStep(BaseStep):
 
         gate_node.dimensions = gate.dimensions  # Ensure dimensions are populated in node for downstream use
         gate_node.use_as_complement = gate.use_as_complement  # Ensure complement flag is in node for downstream use
-        gate_node.glm_type = gate.glm_type  # Ensure glm_type is in node for downstream use
         output["gate_node"] = gate_node
         output["gate"] = gate
+        output["fit_on_batch"] = False
+        output["batch_state"] = {}
 
-        if not (step_run.config.get("fit_on_batch", False) and gate.tunable):
-            return output, qc
+        if step_run.config.get("fit_on_batch", False) and gate.tunable:
+            # Build pooled batch AnnData for batch-level fitting
+            batch_adata, step = self.run_step(
+                qc,
+                "BuildBatchAnnData",
+                self._build_batch_adata,
+                reason_code_fail="BUILD_BATCH_ADATA_ERROR",
+                batch=batch_ref,
+                gate_node=gate_node,
+                seed=step_run.config["seed"],
+                n_events=step_run.config["n_events_per_sample"]
+            )
+            if batch_adata is None:
+                return {}, qc
 
-        # Build pooled batch AnnData for batch-level fitting
-        batch_adata, step = self.run_step(
-            qc,
-            "BuildBatchAnnData",
-            self._build_batch_adata,
-            reason_code_fail="BUILD_BATCH_ADATA_ERROR",
-            batch=batch_ref,
-            gate_node=gate_node,
-            seed=step_run.config["seed"],
-            n_events=step_run.config["n_events_per_sample"]
-        )
-        if batch_adata is None:
-            return {}, qc
+            # Fit gate on pooled batch data
+            # For batch fitting, pass empty mask dict since masks already applied
+            gate, step = self.run_step(
+                qc,
+                "FitGateOnBatch",
+                gate.fit,
+                events=batch_adata,
+                reason_code_fail="GATE_FIT_ERROR"
+            )
+            if gate is None:
+                return {}, qc
 
-        # Fit gate on pooled batch data
-        # For batch fitting, pass empty mask dict since masks already applied
-        gate, step = self.run_step(
-            qc,
-            "FitGateOnBatch",
-            gate.fit,
-            events=batch_adata,
-            reason_code_fail="GATE_FIT_ERROR"
-        )
-        if gate is None:
-            return {}, qc
+            # Store fitted gate for reuse in run_sample
+            output["gate"] = gate
+            output["fit_on_batch"] = True
 
-        # Store fitted gate for reuse in run_sample
-        output["gate"] = gate
-        output["fit_on_batch"] = True
+        should_persist_default_state = (not gate.tunable) or bool(output.get("fit_on_batch", False))
+        if should_persist_default_state:
+            batch_state, step = self.run_step(
+                qc,
+                "SaveBatchGateState",
+                self.repo.save_gate_state,
+                reason_code_fail="SAVE_GATE_STATE_ERROR",
+                gate_id=gate_node.id,
+                gate=gate,
+                sample_id="__all__",
+                overwrite=True,
+            )
+            if batch_state is None:
+                return {}, qc
+            output["batch_state"] = batch_state
+            gate_node.params = gate.to_node_params(state=batch_state)
+        elif gate.tunable:
+            gate_node.params = {
+                "hyperparams": dict(gate.hyperparams),
+                "params": {},
+                "diagnostics": {},
+                "state": {},
+            }
 
         return output, qc
 
@@ -239,11 +260,16 @@ class AddGateStep(BaseStep):
             if gate is None:
                 return {}, qc
         else:
-            if sample_id in gate_node.custom_gates:
-                params_to_use = gate_node.custom_gates[sample_id]
-            else:
-                params_to_use = gate_batch.to_node_params()
-            gate = gate_batch.update_params(params_to_use)
+            gate, step = self.run_step(
+                qc,
+                "LoadGateState",
+                self.repo.load_gate,
+                reason_code_fail="GATE_LOAD_ERROR",
+                gate_node=gate_node,
+                sample_id=sample_id,
+            )
+            if gate is None:
+                return {}, qc
 
         # Apply gate with required mask parameter
         mask, _ = self.run_step(
@@ -257,6 +283,14 @@ class AddGateStep(BaseStep):
         if mask is None:
             return {}, qc
 
+        generated_nodes = gate.generate_offsprings(parent_node=gate_node)
+        normalized_masks = self._normalize_gate_masks(
+            gate_node=gate_node,
+            gate=gate,
+            masks=mask,
+            generated_ids={node.id for node in generated_nodes},
+        )
+
         # Save masks
         _, step = self.run_step(
             qc,
@@ -264,21 +298,52 @@ class AddGateStep(BaseStep):
             self.repo.save_gating_masks,
             reason_code_fail="SAVE_MASKS_ERROR",
             sample=sample,
-            masks=mask,
+            masks=normalized_masks,
             overwrite=True  # Overwrite any existing masks for this gate (e.g., from previous batch fit or previous runs)
         )
         if step.flag == QCFlag.FAIL:
             return {}, qc
 
+        persisted_masks = dict(normalized_masks)
+        if generated_nodes:
+            factory_mask, step = self.run_step(
+                qc,
+                "SaveFactoryGateMask",
+                self._save_factory_gate_mask,
+                reason_code_fail="SAVE_MASKS_ERROR",
+                gate_node=gate_node,
+                sample_id=sample_id,
+                sample_n_events=sample.n_events,
+                parent_dict=parent_dict,
+            )
+            if factory_mask is None:
+                return {}, qc
+            persisted_masks[gate_node.id] = factory_mask
+
+        state_manifest: dict[str, Any] | None = {}
+        if should_fit:
+            state_manifest, step = self.run_step(
+                qc,
+                "SaveGateState",
+                self.repo.save_gate_state,
+                reason_code_fail="SAVE_GATE_STATE_ERROR",
+                gate_id=gate_node.id,
+                gate=gate,
+                sample_id=sample_id,
+                overwrite=True,
+            )
+            if state_manifest is None:
+                return {}, qc
+
         # Store counts in nested dict structure for easier access
         summary = {
             "root": sample.n_events,
             "parents": {pid: int(parent_mask.sum()) for pid, parent_mask in parent_dict.items()},
-            "gates": {mask_id: int(gate_mask.sum()) for mask_id, gate_mask in mask.items()}
+            "gates": {mask_id: int(gate_mask.sum()) for mask_id, gate_mask in persisted_masks.items()}
         }
         output_info = {
             "summary": summary,
-            "params": gate.to_node_params() if should_fit else None,
+            "params": gate.to_node_params(state=state_manifest) if should_fit else gate.to_node_params(),
         }
 
         return output_info, qc
@@ -313,7 +378,17 @@ class AddGateStep(BaseStep):
 
         # Create GateNode from config
         gate_node: GateNode = output_info["gate_node"]
-        gate_node.params = output_info["gate"].to_node_params()
+        gate = output_info["gate"]
+        batch_state = output_info.get("batch_state", {})
+        if batch_state or not gate.tunable:
+            gate_node.params = gate.to_node_params(state=batch_state)
+        else:
+            gate_node.params = {
+                "hyperparams": dict(gate.hyperparams),
+                "params": {},
+                "diagnostics": {},
+                "state": {},
+            }
 
         # Store sample-specific parameter overrides (only if sample was actually fitted)
         for sample_id, sample_info in step_run.sample_outputs.items():
@@ -333,40 +408,24 @@ class AddGateStep(BaseStep):
 
         gate_ids = [gate_node.id]
 
-        # For QuadrantGate, create individual GateNodes for each quadrant
-        if gate_node.glm_type == "QuadrantGate":
-            gate = output_info["gate"]
-            # Extract nested "params" dict which contains computed quadrants
-            quadrants = gate_node.params["params"]["quadrants"]
-            for qid, loc in gate.locations.items():  # type: ignore[attr-defined]
-                # Create a GateNode for this quadrant
-                quadrant_params = {"boundaries": quadrants[qid]}
-                quadrant_node = GateNode(
-                    id=qid,
-                    gate_type="Quadrant",
-                    glm_type="Quadrant",
-                    dimensions=list(loc.keys()),
-                    layer=gate_node.layer,
-                    name=qid,
-                    parent_ids=[gate_node.id],
-                    use_as_complement=False,
-                    params={"hyperparams": quadrant_params, "params": quadrant_params},
-                    custom_gates={
-                        sid: sample_info.get("params", {}).get(qid, {})
-                        for sid, sample_info in step_run.sample_outputs.items()
-                        if sample_info.get("params")
-                    }
-                )
-                # Add node with attributes to graph
-                try:
-                    strategy.add_node(quadrant_node)
-                except ValueError as e:
-                    step = qc.get_step("AddQuadrantNode")
-                    step.flag = QCFlag.FAIL
-                    step.add_reason("ADD_NODE_ERROR", str(e))
-                    return {}, qc
-
-                gate_ids.append(quadrant_node.id)
+        sample_overrides = {
+            sample_id: sample_info["params"]
+            for sample_id, sample_info in step_run.sample_outputs.items()
+            if sample_info.get("params")
+        }
+        generated_nodes = output_info["gate"].generate_offsprings(
+            parent_node=gate_node,
+            sample_overrides=sample_overrides,
+        )
+        for child_node in generated_nodes:
+            try:
+                strategy.add_node(child_node)
+            except ValueError as e:
+                step = qc.get_step("AddGeneratedGateNode")
+                step.flag = QCFlag.FAIL
+                step.add_reason("ADD_NODE_ERROR", str(e))
+                return {}, qc
+            gate_ids.append(child_node.id)
 
         step_run.project_updates.append({"gating_strategy": strategy})
 
@@ -449,7 +508,7 @@ class AddGateStep(BaseStep):
 
         # If gate_node has saved params (batch-fitted), reconstruct with them
         if gate_node.params:
-            return gate_class.from_node(gate_node)
+            return self.repo.load_gate(gate_node)
 
         # Otherwise, initialize fresh with just hyperparams
         hyperparams = gate_node.params.get("hyperparams", {})
@@ -573,6 +632,54 @@ class AddGateStep(BaseStep):
             mask_ids=parent_ids
         )
         return parent_dict[parent_ids[0]]
+
+    def _normalize_gate_masks(
+        self,
+        gate_node: GateNode,
+        gate: Gate,
+        masks: Mapping[str, NDArray[np.bool_]],
+        generated_ids: set[str],
+    ) -> dict[str, NDArray[np.bool_]]:
+        normalized: dict[str, NDArray[np.bool_]] = {}
+        primary_key = gate.gate_name if gate.gate_name in masks else (next(iter(masks)) if len(masks) == 1 else None)
+
+        for mask_id, gate_mask in masks.items():
+            if mask_id == primary_key:
+                if generated_ids:
+                    continue
+                normalized[gate_node.id] = gate_mask
+                continue
+            normalized[mask_id] = gate_mask
+
+        if not generated_ids and gate_node.id not in normalized and len(masks) == 1:
+            normalized[gate_node.id] = next(iter(masks.values()))
+        return normalized
+
+    def _save_factory_gate_mask(
+        self,
+        gate_node: GateNode,
+        sample_id: str,
+        sample_n_events: int,
+        parent_dict: Mapping[str, NDArray[np.bool_]],
+    ) -> NDArray[np.bool_]:
+        parent_ids = [pid for pid in gate_node.parent_ids if pid != "root"]
+        if parent_ids:
+            target_gate_id = parent_ids[0]
+            self.repo.link_gating_mask(
+                gate_id=gate_node.id,
+                sample_id=sample_id,
+                target_gate_id=target_gate_id,
+                overwrite=True,
+            )
+            return np.asarray(parent_dict[target_gate_id], dtype=bool)
+
+        root_mask = np.ones(sample_n_events, dtype=bool)
+        self.repo.save_gating_masks(
+            sample=sample_id,
+            masks={gate_node.id: root_mask},
+            overwrite=True,
+        )
+        return root_mask
 
     def _create_subsample_mask(
         self,

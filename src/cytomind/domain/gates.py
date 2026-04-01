@@ -9,6 +9,8 @@ from .constants import GML_VERSION
 
 __all__ = ["GatingStrategyRef", "GateNode"]
 
+_GATE_PAYLOAD_SECTIONS = ("hyperparams", "params", "diagnostics", "state")
+
 @dataclass
 class GateNode:
     """
@@ -25,7 +27,7 @@ class GateNode:
     -----------------
     Supports both batch-level and sample-specific parameter storage:
 
-    - **params**: Batch-level parameters (dict structure with 'hyperparams', 'params', 'diagnostics').
+    - **params**: Batch-level parameters (dict structure with 'hyperparams', 'params', 'diagnostics', 'state').
       Applied to all samples unless overridden by custom_gates.
 
     - **custom_gates[sample_id]**: Sample-specific parameter overrides (same dict structure).
@@ -41,11 +43,48 @@ class GateNode:
     dimensions: list[str]                 # Dimension IDs this gate operates on
     layer: str = "xf"                     # Data layer: "raw", "comp", or "xf"
     name: str | None = None               # Human-readable name
-    glm_type: str | None = None           # GatingML type (optional)
     parent_ids: list[str] = field(default_factory=list)  # Parent node IDs in hierarchy
     use_as_complement: bool = False       # Whether to use gate as complement
-    params: dict[str, Any] = field(default_factory=dict)  # Batch-level parameters (structure: {hyperparams, params, diagnostics})
+    params: dict[str, Any] = field(default_factory=dict)  # Batch-level parameters (structure: {hyperparams, params, diagnostics, state})
     custom_gates: dict[str, dict[str, Any]] = field(default_factory=dict)  # Sample-specific parameter overrides
+
+    @staticmethod
+    def _normalize_payload(data: Mapping[str, Any] | None) -> dict[str, Any]:
+        payload = dict(data or {})
+        normalized = {
+            "hyperparams": dict(payload.get("hyperparams", {})),
+            "params": dict(payload.get("params", {})),
+            "diagnostics": dict(payload.get("diagnostics", {})),
+            "state": dict(payload.get("state", {})),
+        }
+        for key, value in payload.items():
+            if key not in normalized:
+                normalized[key] = value
+        return normalized
+
+    @classmethod
+    def _merge_payloads(
+        cls,
+        base: Mapping[str, Any],
+        override: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = cls._normalize_payload(base)
+        override_norm = cls._normalize_payload(override)
+
+        for section in _GATE_PAYLOAD_SECTIONS:
+            base_value = merged.get(section, {})
+            override_value = override_norm.get(section, {})
+            if isinstance(base_value, Mapping) and isinstance(override_value, Mapping):
+                section_value = dict(base_value)
+                section_value.update(override_value)
+                merged[section] = section_value
+            elif override_value:
+                merged[section] = override_value
+
+        for key, value in override_norm.items():
+            if key not in merged:
+                merged[key] = value
+        return merged
 
     def __post_init__(self) -> None:
         pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
@@ -95,7 +134,14 @@ class GateNode:
                 "hyperparams": dict(data.get("hyperparams", {})),
                 "params": {},
                 "diagnostics": {},
+                "state": {},
             }
+        params = cls._normalize_payload(params)
+
+        custom_gates = {
+            sample_id: cls._normalize_payload(payload)
+            for sample_id, payload in data.get("custom_gates", {}).items()
+        }
 
         return GateNode(
             id=data["id"],
@@ -103,28 +149,27 @@ class GateNode:
             dimensions=data["dimensions"],
             layer=data.get("layer", "xf"),
             name=data.get("name"),
-            glm_type=data.get("glm_type"),
             parent_ids=data.get("parent_ids", []),
             use_as_complement=data.get("use_as_complement", False),
             params=params,
-            custom_gates=data.get("custom_gates", {}),
+            custom_gates=custom_gates,
         )
 
-    def get_params_for_sample(self, sample_id: str) -> dict[str, Any]:
+    def get_params_for_sample(self, sample_id: str | None = None) -> dict[str, Any]:
         """Get merged parameters for a specific sample.
 
         Implements parameter precedence: sample-specific overrides fall back to batch-level params.
 
         Parameters
         ----------
-        sample_id : str
-            Sample identifier to look up parameters for
+        sample_id : str | None
+            Sample identifier to look up parameters for. If None, returns batch-level params.
 
         Returns
         -------
         dict[str, Any]
-            Merged parameter structure ({"hyperparams": {...}, "params": {...}, "diagnostics": {...}}).
-            If sample_id is in custom_gates, returns that (with fallback).
+            Merged parameter structure ({"hyperparams": {...}, "params": {...}, "diagnostics": {...}, "state": {...}}).
+            If sample_id is in custom_gates, returns a section-wise merge over batch params.
             Otherwise returns batch-level params.
 
         Examples
@@ -133,10 +178,13 @@ class GateNode:
         >>> params = node.get_params_for_sample("sample_123")
         >>> # Returns custom_gates["sample_123"] if present, else params
         """
-        if sample_id in self.custom_gates:
-            return self.custom_gates[sample_id]
-        else:
-            return self.params
+        base = self._normalize_payload(self.params)
+        if sample_id is None:
+            return base
+        override = self.custom_gates.get(sample_id)
+        if override is None:
+            return base
+        return self._merge_payloads(base, override)
 
 @dataclass
 class GatingStrategyRef:

@@ -6,7 +6,7 @@ GatingML version can be overridden via the environment variable
 """
 
 import os
-from typing import Any, Final, Iterable, Protocol, Mapping, runtime_checkable
+from typing import Any, Final, Protocol, Mapping, runtime_checkable
 from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
@@ -17,7 +17,8 @@ GML_VERSION: Final[str] = os.getenv("CYTOMIND_GATINGML_VERSION", "2.0")
 PathLike = Path | str
 BooleanArray = NDArray[np.bool_]
 FloatArray = NDArray[np.floating]
-MaskLike = BooleanArray | NDArray[np.int_] | slice
+IntArray = NDArray[np.int_]
+MaskLike = BooleanArray | IntArray | slice
 
 @runtime_checkable
 class Serializable(Protocol):

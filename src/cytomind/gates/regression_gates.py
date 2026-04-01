@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 from abc import abstractmethod
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Sequence, Mapping, TYPE_CHECKING
+import pickle
 
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import OLSInfluence
 
-from cytomind.gates.glm_gates import PolygonGate
 from . import GateRegistry
+from .geometric_gates import PolygonGate
 
 if TYPE_CHECKING:
     from cytomind.domain.constants import FloatArray
@@ -33,7 +34,7 @@ class RegressionGate(PolygonGate):
     """
 
     gate_type = "regression"
-    tunable = True
+    default_tunable = True
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class RegressionGate(PolygonGate):
         subsample: float = 1.0,
         min_points: int = 50,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
         vertices = [[0, 0], [0, 1], [1, 0]]
     ) -> None:
         """
@@ -104,6 +106,7 @@ class RegressionGate(PolygonGate):
             vertices=vertices,
             use_as_complement=use_as_complement
         )
+        self.tunable = type(self).default_tunable if tunable is None else bool(tunable)
 
         self._hyperparams.update({
             "alpha": alpha,
@@ -242,6 +245,59 @@ class RegressionGate(PolygonGate):
         self.params["x_range_used"] = (float(x_low), float(x_high))
         self.params["y_range_fitted"] = (float(y.min()), float(y.max()))
 
+    def to_dict(self) -> dict[str, Any]:
+        base = super().to_dict()
+        base["hyperparams"].pop("vertices", None)
+        return base
+
+    def _export_json_state_payload(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in self.state.items()
+            if key not in self._binary_state_artifacts()
+        }
+
+    def _binary_state_artifacts(self) -> dict[str, str]:
+        """Map runtime-only state keys to artifact filenames."""
+        return {}
+
+    def export_state(self) -> dict[str, Any]:
+        bundle = super().export_state()
+        manifest = dict(bundle["manifest"])
+        artifact_map = dict(manifest.get("artifacts", {}))
+        artifacts = dict(bundle["artifacts"])
+
+        for state_key, filename in self._binary_state_artifacts().items():
+            obj = self.state[state_key]
+            artifact_map[state_key] = filename
+            artifacts[filename] = pickle.dumps(obj)
+
+        manifest["serializer"] = "hybrid"
+        manifest["artifacts"] = artifact_map
+        return {
+            "manifest": manifest,
+            "artifacts": artifacts,
+        }
+
+    def import_state(
+        self,
+        manifest: Mapping[str, Any],
+        artifacts: Mapping[str, Any],
+    ) -> None:
+        super().import_state(manifest, artifacts)
+        artifact_map = manifest.get("artifacts", {})
+        for state_key, filename in self._binary_state_artifacts().items():
+            if state_key not in artifact_map:
+                raise ValueError(f"Missing artifact for regression state key '{state_key}'. Expected artifact filename: '{filename}'")
+            raw = artifacts.get(str(artifact_map[state_key]))
+            if raw is None:
+                raw = artifacts.get(state_key)
+            if raw is None:
+                raise ValueError(f"Artifact file '{artifact_map[state_key]}' not found for regression state key '{state_key}'.")
+            if not isinstance(raw, (bytes, bytearray)):
+                raise ValueError(f"Regression state artifact '{artifact_map[state_key]}' must be binary.")
+            self.state[state_key] = pickle.loads(bytes(raw))
+
 
 @GateRegistry.register("linear_regression")
 class LinearRegressionGate(RegressionGate):
@@ -266,6 +322,7 @@ class LinearRegressionGate(RegressionGate):
         subsample: float = 1.0,
         min_points: int = 50,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
     ) -> None:
         """
         Initialize linear regression gate.
@@ -297,10 +354,22 @@ class LinearRegressionGate(RegressionGate):
             subsample=subsample,
             min_points=min_points,
             use_as_complement=use_as_complement,
+            tunable=tunable,
         )
 
         # Will store fitted model
         self._ols_fit = None
+
+    @property
+    def _ols_fit(self) -> Any:
+        return self.state.get("ols_fit")
+
+    @_ols_fit.setter
+    def _ols_fit(self, value: Any) -> None:
+        if value is None:
+            self.state.pop("ols_fit", None)
+            return
+        self.state["ols_fit"] = value
 
     def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit ordinary least squares linear regression."""
@@ -327,10 +396,13 @@ class LinearRegressionGate(RegressionGate):
         cook_pval = ols_inf.cooks_distance[1] * len(x)  # Adjust p-values for number of observations
         self.diagnostics["n_outliers"] = int(np.sum(cook_pval < 0.05))
 
+    def _binary_state_artifacts(self) -> dict[str, str]:
+        return {"ols_fit": "ols_fit.pkl"}
+
     def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Predict using OLS model with confidence intervals."""
         if self._ols_fit is None:
-            raise RuntimeError("Model not fitted. Call _fit_regression first.")
+            raise RuntimeError("Model not fitted. Call _fit_regression first or load a fitted model.")
 
         alpha = self.hyperparams["alpha"]
 
@@ -372,6 +444,7 @@ class RobustRegressionGate(RegressionGate):
         min_points: int = 50,
         huber_t: float = 2.01,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
         vertices = [[0, 0], [0, 1], [1, 0]]
     ) -> None:
         """
@@ -410,12 +483,35 @@ class RobustRegressionGate(RegressionGate):
             subsample=subsample,
             min_points=min_points,
             use_as_complement=use_as_complement,
+            tunable=tunable,
         )
         self._hyperparams["huber_t"] = huber_t
 
         # Will store fitted models
         self._rlm_fit = None
         self._wls_fit = None
+
+    @property
+    def _rlm_fit(self) -> Any:
+        return self.state.get("rlm_fit")
+
+    @_rlm_fit.setter
+    def _rlm_fit(self, value: Any) -> None:
+        if value is None:
+            self.state.pop("rlm_fit", None)
+            return
+        self.state["rlm_fit"] = value
+
+    @property
+    def _wls_fit(self) -> Any:
+        return self.state.get("wls_fit")
+
+    @_wls_fit.setter
+    def _wls_fit(self, value: Any) -> None:
+        if value is None:
+            self.state.pop("wls_fit", None)
+            return
+        self.state["wls_fit"] = value
 
     def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit Huber's robust regression and weighted least squares."""
@@ -431,10 +527,7 @@ class RobustRegressionGate(RegressionGate):
         self._wls_fit = sm.WLS(y, X, weights=self._rlm_fit.weights).fit()
 
         # Store model parameters required for vertex re-calculation (JSON serializable)
-        self.params["coefficients"] = {
-            "intercept": float(self._wls_fit.params[0]),
-            "slope": float(self._wls_fit.params[1])
-        }
+        self.params["coefficients"] = self._wls_fit.params
         self.params["scale"] = float(self._wls_fit.scale)
         self.params["mean_x"] = float(np.mean(x))
         self.params["var_x"] = float(np.var(x, ddof=1))  # Sample variance of x
@@ -444,10 +537,16 @@ class RobustRegressionGate(RegressionGate):
         self.diagnostics["resid_std"] = float(np.sqrt(self._wls_fit.mse_resid))
         self.diagnostics["n_outliers"] = int(np.sum(self._rlm_fit.weights < 0.9))
 
+    def _binary_state_artifacts(self) -> dict[str, str]:
+        return {
+            "rlm_fit": "rlm_fit.pkl",
+            "wls_fit": "wls_fit.pkl",
+        }
+
     def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Predict using WLS model with confidence intervals."""
         if self._wls_fit is None:
-            raise RuntimeError("Model not fitted. Call _fit_regression first.")
+            raise RuntimeError("Model not fitted. Call _fit_regression first or load a fitted model.")
 
         alpha = self.hyperparams["alpha"]
 
@@ -488,6 +587,7 @@ class LinearGAMGate(RegressionGate):
         df: int = 6,
         degree: int = 3,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
     ) -> None:
         """
         Initialize linear GAM gate.
@@ -527,14 +627,43 @@ class LinearGAMGate(RegressionGate):
             subsample=subsample,
             min_points=min_points,
             use_as_complement=use_as_complement,
+            tunable=tunable,
         )
         self._hyperparams.update({
             "df": df,
             "degree": degree,
         })
 
-        self._bs: Any = None
-        self._gam_fit: Any = None
+        self._bs = None
+        self._gam_fit = None
+
+    @property
+    def _bs(self) -> Any:
+        return self.state.get("bs")
+
+    @_bs.setter
+    def _bs(self, value: Any) -> None:
+        if value is None:
+            self.state.pop("bs", None)
+            return
+        self.state["bs"] = value
+
+    @property
+    def _gam_fit(self) -> Any:
+        return self.state.get("gam_fit")
+
+    @_gam_fit.setter
+    def _gam_fit(self, value: Any) -> None:
+        if value is None:
+            self.state.pop("gam_fit", None)
+            return
+        self.state["gam_fit"] = value
+
+    def _binary_state_artifacts(self) -> dict[str, str]:
+        return {
+            "bs": "bsplines.pkl",
+            "gam_fit": "gam_fit.pkl",
+        }
 
     def _fit_regression(self, x: FloatArray, y: FloatArray) -> None:
         """Fit a linear GAM using B-spline basis on x."""
@@ -550,15 +679,12 @@ class LinearGAMGate(RegressionGate):
         gam_model = GLMGam(y, smoother=self._bs)
         self._gam_fit = gam_model.fit()
 
-        # Store model parameters required by apply
-        self.params["scale"] = float(self._gam_fit.scale)
-        self.params["gam_edf"] = float(self._gam_fit.edf.mean())  # Effective degrees of freedom
-
         # Store fit quality diagnostics
         self.diagnostics.update({
-            "mean_edf": float(self._gam_fit.edf.mean()),
-            "cv": float(self._gam_fit.cv),
-            "aic": float(self._gam_fit.aic),
+            "scale": float(self._gam_fit.scale),
+            "mean_edf": float(self._gam_fit.edf.mean()), # pyright: ignore[reportAttributeAccessIssue]
+            "cv": float(self._gam_fit.cv), # pyright: ignore[reportAttributeAccessIssue]
+            "aic": float(self._gam_fit.aic), # pyright: ignore[reportAttributeAccessIssue]
         })
 
     def _predict_with_confidence(self, x: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:

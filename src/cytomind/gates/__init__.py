@@ -46,4 +46,4 @@ class GateRegistry:
 
 
 # Import concrete gates so their decorators run and populate registry
-from . import glm_gates, stat_gates, regression_gates, mindensity_gates
+from . import geometric_gates, stat_gates, regression_gates, mindensity_gates, cluster_gates

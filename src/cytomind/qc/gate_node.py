@@ -54,7 +54,7 @@ class GateSpaceGeometry:
     """
 
     artifact_key = "gate_space_geometry"
-    _info_fields = ("entity_id", "gate_type", "glm_type", "layer", "dimensions", "lower_bounds", "upper_bounds", "resolution", "seed")
+    _info_fields = ("entity_id", "gate_type", "layer", "dimensions", "lower_bounds", "upper_bounds", "resolution", "seed")
     # Maximum number of random evaluation points for dims >= 3
     _MAX_RANDOM_EVAL_POINTS = 2 ** 20
 
@@ -93,7 +93,6 @@ class GateSpaceGeometry:
         info = {
             "entity_id": entity.id,
             "gate_type": entity.gate_type,
-            "glm_type": entity.glm_type,
             "layer": entity.layer,
             "dimensions": entity.dimensions,
             "lower_bounds": low,
@@ -115,8 +114,6 @@ class GateSpaceGeometry:
             raise ValueError(f"Gate ID mismatch: expected {info['entity_id']}, got {gate_node.id}")
         if gate_node.gate_type != info["gate_type"]:
             raise ValueError(f"Gate type mismatch: expected {info['gate_type']}, got {gate_node.gate_type}")
-        if gate_node.glm_type != info["glm_type"]:
-            raise ValueError(f"GLM type mismatch: expected {info['glm_type']}, got {gate_node.glm_type}")
         if gate_node.layer != info["layer"]:
             raise ValueError(f"Layer mismatch: expected {info['layer']}, got {gate_node.layer}")
         if tuple(gate_node.dimensions) != tuple(info["dimensions"]):
@@ -922,12 +919,11 @@ class GateSpaceGeometry:
         # ``__init__`` after ``_validate_masks`` so we delegate to that
         # machinery by re-instantiating the object.
         artifact._add_missing_samples(sample_ids)
-        gate_cls = GateRegistry.get(entity.gate_type)
 
         # Ensure masks exist for any newly required gate configs
         for sample_id in sample_ids:
             try:
-                gate = gate_cls.from_node(entity, sample_id=sample_id)
+                gate = dataloader.load_gate(entity, sample_id=sample_id)
                 key = hex(hash(gate))
             except Exception:
                 key = None
@@ -939,7 +935,7 @@ class GateSpaceGeometry:
 
         # Default gate
         try:
-            default_gate = gate_cls.from_node(entity)
+            default_gate = dataloader.load_gate(entity)
             default_key = hex(hash(default_gate))
         except Exception:
             default_key = None
@@ -1276,7 +1272,7 @@ class GateFitDiagnosticTest(QCTester):
     meta_keys = ("parent_id", )
     default_config = {}
     meta_fields = [
-           ("glm_type", "Type of GLM model used"),
+           ("gate_type", "Gate type"),
            ("parent_id", "Parent gate ID(s)"),
        ]
     metric_fields = [
@@ -1345,7 +1341,7 @@ class GateFitDiagnosticTest(QCTester):
         sample_id: str = targets["sample_id"]
         thresholds = self.thresholds.copy()
         metadata = self.metadata.copy()
-        metadata["glm_type"] = entity.glm_type
+        metadata["gate_type"] = entity.gate_type
         # Add parent_id for comopatibility with older test records
         metadata["parent_id"] = "|".join(sorted(entity.parent_ids)) if entity.parent_ids else "root"
 
@@ -1504,7 +1500,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
                 "min_samples": cls.default_config["gate_space_min_samples"],
                 "outlier_method": cls.default_config["gate_space_outlier_method"],
                 "use_mad": cls.default_config["use_mad"],
-                "glm_type": entity.glm_type,
+                "gate_type": entity.gate_type,
                 "resolution": cls.default_config["gate_space_resolution"],
             }
             default_thresholds = cls._normalize_outlier_thresholds(cls.default_config["gate_space_thresholds"])
@@ -1845,7 +1841,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
             "outlier_method": config["gate_space_outlier_method"],
             "use_mad": config["use_mad"],
             "parent_id": "|".join(sorted(entity.parent_ids)) if entity.parent_ids else "root",
-            "glm_type": entity.glm_type,
+            "gate_type": entity.gate_type,
             "resolution": config["gate_space_resolution"],
         }
         gate_space_thresholds = self._normalize_outlier_thresholds(
@@ -1979,8 +1975,7 @@ class GateNodeQCEvaluator(EntityQCEvaluator):
 
         layer = self.required_layer(gate_node)
         events = dataloader.load_adata(sample_id=sample_id, layer=layer)
-        gate_cls = GateRegistry.get(gate_node.gate_type)
-        gate = gate_cls.from_node(gate_node, sample_id=sample_id)
+        gate = dataloader.load_gate(gate_node, sample_id=sample_id)
 
         return gate.plot(
             events=events,

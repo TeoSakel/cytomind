@@ -5,7 +5,7 @@ from typing import Any, Mapping, Sequence, TYPE_CHECKING
 import numpy as np
 
 from . import GateRegistry
-from .glm_gates import RectangleGate, QuadrantGate
+from .geometric_gates import RectangleGate, QuadrantGate
 
 if TYPE_CHECKING:
     from pandas import DataFrame
@@ -24,7 +24,7 @@ class PercentileRectangleGate(RectangleGate):
     """
 
     gate_type = "percentile_rectangle"
-    tunable = True
+    default_tunable = True
 
     def __init__(
         self,
@@ -33,6 +33,7 @@ class PercentileRectangleGate(RectangleGate):
         min_ranges: Mapping[str, float] | None = None,
         max_ranges: Mapping[str, float] | None = None,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
     ):
         if len(dimensions) < 1:
             raise ValueError("PercentileGate requires at least 1 dimension.")
@@ -57,6 +58,7 @@ class PercentileRectangleGate(RectangleGate):
                 raise ValueError(f"max_range percentile for dimension '{dim}' must be numeric in [0,1]")
 
         super().__init__(gate_name=gate_name, dimensions=dimensions, use_as_complement=use_as_complement)
+        self.tunable = type(self).default_tunable if tunable is None else bool(tunable)
         self._hyperparams = {
             "min_ranges": min_ranges,
             "max_ranges": max_ranges,
@@ -97,13 +99,14 @@ class PercentileQuadrantGate(QuadrantGate):
     """
 
     gate_type = "percentile_quadrant"
-    tunable = True
+    default_tunable = True
 
     def __init__(
         self,
         gate_name: str,
         dividers: Mapping[str, Sequence[float]],
         quadrants: Mapping[str, Sequence[tuple[str, float]]],
+        tunable: bool | None = None,
         **kwargs: Any,
     ) -> None:
         # Validate percentile dividers and quadrants (values must be numeric in [0,1])
@@ -128,6 +131,7 @@ class PercentileQuadrantGate(QuadrantGate):
         # create placeholder absolute dividers (QuadrantGate requires a dividers mapping at init)
         placeholder_dividers = {dim: [] for dim in dividers_pct}
         super().__init__(gate_name=gate_name, dividers=placeholder_dividers, quadrants={}, **kwargs)
+        self.tunable = type(self).default_tunable if tunable is None else bool(tunable)
 
         # store percentile hyperparams; actual absolute dividers/locations computed at fit
         self._hyperparams["dividers_percent"] = {dim: sorted(points) for dim, points in dividers_pct.items()}

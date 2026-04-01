@@ -3,7 +3,6 @@ from typing import Any, Callable, Iterable, Sequence, Mapping, Literal, TypeVar,
 from pathlib import Path
 import warnings
 
-from matplotlib.pyplot import flag
 import pandas as pd
 
 from cytomind.domain.flow import CompensationRef, ChannelRef, DimensionDef
@@ -15,7 +14,7 @@ from cytomind.infra.dataloader import UnifiedDataLoader
 
 if TYPE_CHECKING:
     from anndata import AnnData
-    from cytomind.domain.constants import PathLike, MaskLike, Serializable, ProjectMetadata
+    from cytomind.domain.constants import PathLike, MaskLike, ProjectMetadata
     import numpy as np
     from numpy.typing import NDArray
     BooleanArray = NDArray[np.bool_]
@@ -24,7 +23,6 @@ else:
     AnnData = object
     PathLike = object
     MaskLike = object
-    Serializable = object
     ProjectMetadata = object
     BooleanArray = object
     R = object
@@ -50,10 +48,12 @@ class ProjectRepository:
 
         # ---- Gating Strategy I/O ----
         "gating_strategy_dir": "gating_strategy",
+        "gating_strategy_gates_dir": "gating_strategy/gates",
         "gating_strategy": "gating_strategy/strategy.json",
         "gate_node": "gating_strategy/gates/{node_id}.json",
-        "gating_strategy_masks_dir": "gating_strategy/masks",
-        "gating_mask": "gating_strategy/masks/{mask_id}/{sample_id}.npy",
+        "gating_mask": "gating_strategy/gates/{gate_id}/mask/{sample_id}.npy",
+        "gate_state_dir": "gating_strategy/gates/{gate_id}/state/{sample_id}",
+        "gate_state_manifest": "gating_strategy/gates/{gate_id}/state/{sample_id}/manifest.json",
 
         # ---- Step/Pipeline I/O ----
         "steps_dir": "steps",
@@ -241,11 +241,6 @@ class ProjectRepository:
             if not isinstance(gating_strategy, GatingStrategyRef):
                 raise TypeError("gating_strategy must be a GatingStrategyRef instance.")
 
-            # Persist gate-node JSON files via dataloader for compatibility.
-            # TODO: allow partial updates to gating strategy without requiring full resave of all nodes.
-            for node in gating_strategy.iter_nodes():
-                self._dataloader.save_gate_node(node=node, overwrite=True)
-
             project.gating_strategy = gating_strategy
             update_needed = True
 
@@ -338,9 +333,15 @@ class ProjectRepository:
         self,
         sample_id: str,
         layer: str,
-        mask: MaskLike = slice(None),
+        mask: MaskLike | str = slice(None),
         select: Sequence[str] | slice = slice(None),
     ) -> AnnData:
+        if isinstance(mask, str):
+            if mask == "root":
+                mask = slice(None)
+            else:
+                mask = self.load_gating_masks(sample=sample_id, mask_ids=[mask])[mask]
+
         return self._dataloader.load_adata(
             sample_id=sample_id,
             layer=layer,
@@ -629,6 +630,22 @@ class ProjectRepository:
             overwrite=overwrite,
         )
 
+    def link_gating_mask(
+        self,
+        gate_id: str,
+        sample_id: str,
+        target_gate_id: str,
+        target_sample_id: str | None = None,
+        overwrite: bool = True,
+    ) -> Path:
+        return self._dataloader.link_mask(
+            gate_id=gate_id,
+            sample_id=sample_id,
+            target_gate_id=target_gate_id,
+            target_sample_id=target_sample_id,
+            overwrite=overwrite,
+        )
+
     def load_gating_masks(
         self,
         sample: str | SampleRef,
@@ -656,6 +673,28 @@ class ProjectRepository:
             sample_id=sample_id,
             gate_ids=mask_ids,  # Map 'mask_ids' to 'gate_ids' in dataloader
         )
+
+    def save_gate_state(
+        self,
+        gate_id: str,
+        gate: Any,
+        sample_id: str = "__all__",
+        overwrite: bool = True,
+    ) -> dict[str, Any]:
+        return self._dataloader.save_gate_state(
+            gate_id=gate_id,
+            sample_id=sample_id,
+            state_bundle=gate.export_state(),
+            overwrite=overwrite,
+        )
+
+    def load_gate(
+        self,
+        gate_node: str | GateNode,
+        sample_id: str | None = None,
+    ) -> Any:
+        node = gate_node if isinstance(gate_node, GateNode) else self.load_gate_node(node_id=gate_node)
+        return self._dataloader.load_gate(gate_node=node, sample_id=sample_id)
 
     # ------------- Revision Session I/O -----------------
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeVar, TYPE_CHECKING
 import warnings
 from pathlib import Path
-from shutil import rmtree
+from shutil import copy2, rmtree
 import json
 
 import numpy as np
@@ -30,6 +30,7 @@ from cytomind.utils import rlencode, rldecode, now_iso
 if TYPE_CHECKING:
     from cytomind.domain.constants import PathLike, MaskLike, BooleanArray
     BooleanMask = BooleanArray | Sequence[bool]
+    from cytomind.gates.base import Gate
     JSONSerializable = dict[str, Any] | list | str | int | float | bool | None
     R = TypeVar("R")
     HandlerDictType = Mapping[str, tuple[Callable[[Any], R], Callable[[R], dict | list] | None]]
@@ -37,6 +38,7 @@ else:
     PathLike = object
     MaskLike = object
     BooleanArray = object
+    Gate = object
     BooleanMask = BooleanArray | Sequence[bool]
     JSONSerializable = object
     HandlerDictType = object
@@ -195,7 +197,7 @@ class UnifiedDataLoader:
         for gate_id in gate_ids:
             path = self._resolve_read_path(
                 self._pattern("gating_mask"),
-                mask_id=gate_id,
+                gate_id=gate_id,
                 sample_id=sample_id,
             )
             masks[gate_id] = self._load_mask_array(path, parse_func=parse_func)
@@ -215,10 +217,160 @@ class UnifiedDataLoader:
         for gate_id, mask in masks.items():
             path = self._resolve_write_path(
                 self._pattern("gating_mask"),
-                mask_id=gate_id,
+                gate_id=gate_id,
                 sample_id=sample_id,
             )
             self._save_mask_array(path, mask, serialize_func=serialize_func, overwrite=overwrite)
+
+    def link_mask(
+        self,
+        gate_id: str,
+        sample_id: str,
+        target_gate_id: str,
+        target_sample_id: str | None = None,
+        overwrite: bool = True,
+        **context: Any,
+    ) -> Path:
+        """Materialize a gate mask as a filesystem link to another gate mask."""
+        del context
+        target_id = target_sample_id or sample_id
+        src_path = self._resolve_read_path(
+            self._pattern("gating_mask"),
+            gate_id=target_gate_id,
+            sample_id=target_id,
+        )
+        dst_path = self._resolve_write_path(
+            self._pattern("gating_mask"),
+            gate_id=gate_id,
+            sample_id=sample_id,
+        )
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if dst_path.exists() or dst_path.is_symlink():
+            if not overwrite:
+                raise FileExistsError(f"Mask already exists at {dst_path.as_posix()}. Use overwrite=True to replace.")
+            if dst_path.is_dir():
+                rmtree(dst_path)
+            else:
+                dst_path.unlink()
+
+        try:
+            dst_path.symlink_to(src_path)
+        except OSError:
+            copy2(src_path, dst_path)
+        return dst_path
+
+    # ========== Gate State I/O ==========
+
+    def save_gate_state(
+        self,
+        gate_id: str,
+        sample_id: str,
+        state_bundle: Mapping[str, Any],
+        overwrite: bool = True,
+    ) -> dict[str, Any]:
+        """Persist a gate state bundle produced by Gate.export_state()."""
+        state_dir = self._resolve_write_path(
+            self._pattern("gate_state_dir"),
+            gate_id=gate_id,
+            sample_id=sample_id,
+        )
+        manifest_path = self._resolve_write_path(
+            self._pattern("gate_state_manifest"),
+            gate_id=gate_id,
+            sample_id=sample_id,
+        )
+        manifest = dict(state_bundle.get("manifest", {}))
+        artifacts = dict(state_bundle.get("artifacts", {}))
+        if not manifest:
+            raise ValueError("Gate state bundle must contain a non-empty manifest.")
+
+        if state_dir.exists() and overwrite:
+            rmtree(state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        if manifest_path.exists() and not overwrite:
+            raise FileExistsError(f"Gate state manifest already exists at {manifest_path.as_posix()}. Use overwrite=True to replace.")
+
+        for artifact_name, payload in artifacts.items():
+            artifact_path = state_dir / artifact_name
+            if artifact_path.exists() and not overwrite:
+                raise FileExistsError(f"Gate state artifact already exists at {artifact_path.as_posix()}. Use overwrite=True to replace.")
+            self._save_artifact(artifact_path, payload)
+
+        self._save_json(manifest_path, manifest)
+        return manifest
+
+    def load_gate_state(
+        self,
+        gate_id: str,
+        sample_id: str | None = None,
+        default_sample_id: str = "__all__",
+    ) -> dict[str, Any]:
+        """Load a gate state bundle, falling back from a sample-specific state to ``__all__``."""
+        candidate_ids: list[str] = []
+        if sample_id:
+            candidate_ids.append(sample_id)
+        if default_sample_id not in candidate_ids:
+            candidate_ids.append(default_sample_id)
+
+        for candidate in candidate_ids:
+            try:
+                manifest_path = self._resolve_read_path(
+                    self._pattern("gate_state_manifest"),
+                    gate_id=gate_id,
+                    sample_id=candidate,
+                )
+            except FileNotFoundError:
+                continue
+
+            manifest = self._load_json(manifest_path)
+            if not isinstance(manifest, Mapping):
+                raise ValueError(f"Gate state manifest at {manifest_path.as_posix()} must be a mapping.")
+
+            state_dir = manifest_path.parent
+            artifacts = {
+                artifact: self._load_artifact(state_dir / filename)
+                for artifact, filename in manifest.get("artifacts", {}).items()
+            }
+
+            return {
+                "sample_id": candidate,
+                "manifest": dict(manifest),
+                "artifacts": artifacts,
+            }
+
+        raise FileNotFoundError(f"No gate state found for gate '{gate_id}' and sample '{sample_id or default_sample_id}'.")
+
+    def load_gate(
+        self,
+        gate_node: GateNode,
+        sample_id: str | None = None,
+    ) -> Gate:
+        """Hydrate a Gate instance from a GateNode plus persisted external state, if present."""
+        from cytomind.gates import GateRegistry
+
+        gate_class = GateRegistry.get(gate_node.gate_type)
+        payload = gate_node.get_params_for_sample(sample_id)
+        gate = gate_class.from_node(gate_node, sample_id=sample_id)
+        state_manifest = payload.get("state", {})
+        if not state_manifest:
+            return gate
+
+        try:
+            state_bundle = self.load_gate_state(gate_id=gate_node.id, sample_id=sample_id)
+        except FileNotFoundError:
+            return gate
+
+        gate.import_state(
+            manifest=state_bundle["manifest"],
+            artifacts=state_bundle["artifacts"],
+        )
+        params = payload.get("params", {})
+        diagnostics = payload.get("diagnostics", {})
+        if params and gate.validate_params(params):
+            gate.params = dict(params)
+        gate.diagnostics = dict(diagnostics)
+        return gate
 
     # ========== Gate Node I/O ==========
 
@@ -245,12 +397,12 @@ class UnifiedDataLoader:
         GateNode
             Gate node definition (parsed via parse_func)
         """
-        return self.load_data(
-            entity="gate_node",
-            parse_func=parse_func,
-            node_id=node_id,
-            **context
-        )
+        del context
+        project = self.load_data("project")
+        gating_strategy = getattr(project, "gating_strategy", None)
+        if gating_strategy is None:
+            raise KeyError("Gating strategy not found in project.")
+        return parse_func(gating_strategy.get_node(node_id).to_dict())
 
     def save_gate_node(
         self,
@@ -657,22 +809,9 @@ class UnifiedDataLoader:
         def _is_full_slice(indexer: Any) -> bool:
             return isinstance(indexer, slice) and indexer.start is None and indexer.stop is None and indexer.step is None
 
-        def _is_fancy_indexer(indexer: Any) -> bool:
-            if _is_full_slice(indexer) or isinstance(indexer, slice):
-                return False
-            return isinstance(indexer, (list, tuple, np.ndarray))
-
-        def _is_dual_fancy_index_error(exc: Exception) -> bool:
-            msg = str(exc)
-            return "Only one indexing vector or array is currently allowed for fancy indexing" in msg
-
-        def _is_repeated_backed_index_error(exc: Exception) -> bool:
-            msg = str(exc)
-            return "cannot index repeatedly into a backed AnnData" in msg
-
         def _subset_col_first_to_memory(adata_backed: ad.AnnData) -> ad.AnnData:
-            # Column selection is cheap on backed data (few vars); apply it first to narrow
-            # what gets materialised, then apply the expensive row mask in memory.
+            # Keep cheap var selection on disk, then apply row masking after the data
+            # has been materialized in memory.
             if not _is_full_slice(select):
                 col_subset = adata_backed[:, select].to_memory(copy=True)
                 if not _is_full_slice(mask):
@@ -725,11 +864,6 @@ class UnifiedDataLoader:
             select = slice(None)
 
         try:
-            # Prefer single-step slicing while file is backed.
-            return adata[mask, select].to_memory(copy=True)
-        except (TypeError, ValueError) as e:
-            if not _is_dual_fancy_index_error(e) and not _is_repeated_backed_index_error(e):
-                raise
             return _subset_col_first_to_memory(adata)
         finally:
             _close(adata)
@@ -784,15 +918,21 @@ class UnifiedDataLoader:
 
     def _get_all_gate_ids(self) -> Iterator[str]:
         """Get all gate IDs for a strategy (checks both root and fallback)."""
-        relative_masks_dir = self._pattern("gating_strategy_masks_dir")
-        root_masks_dir = self.root_dir / relative_masks_dir
-        if root_masks_dir.exists():
-            yield from  (d.name for d in root_masks_dir.iterdir() if d.is_dir())
+        relative_gates_dir = self._pattern("gating_strategy_gates_dir")
+        seen: set[str] = set()
 
-        if self.fallback_root:
-            fallback_masks_dir = self.fallback_root / relative_masks_dir
-            if fallback_masks_dir.exists():
-                yield from (d.name for d in fallback_masks_dir.iterdir() if d.is_dir())
+        for base_dir in (self.root_dir, self.fallback_root):
+            if base_dir is None:
+                continue
+            gates_dir = base_dir / relative_gates_dir
+            if not gates_dir.exists():
+                continue
+            for gate_dir in gates_dir.iterdir():
+                if not gate_dir.is_dir() or gate_dir.name in seen:
+                    continue
+                if (gate_dir / "mask").exists():
+                    seen.add(gate_dir.name)
+                    yield gate_dir.name
 
     # ========== Helper Methods ==========
 
@@ -820,3 +960,25 @@ class UnifiedDataLoader:
             return data
         else:
             raise TypeError(f"Data of type {type(data)} is not serializable by default. Provide a custom serialize_func.")
+
+    @staticmethod
+    def _save_artifact(path: PathLike, data: Any) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix == ".json":
+            UnifiedDataLoader._save_json(path, data)
+            return
+        if isinstance(data, str):
+            path.write_text(data)
+            return
+        if isinstance(data, (bytes, bytearray)):
+            path.write_bytes(bytes(data))
+            return
+        raise TypeError(f"Unsupported artifact payload type for {path.name}: {type(data)}")
+
+    @staticmethod
+    def _load_artifact(path: PathLike) -> Any:
+        path = Path(path)
+        if path.suffix == ".json":
+            return UnifiedDataLoader._load_json(path)
+        return path.read_bytes()

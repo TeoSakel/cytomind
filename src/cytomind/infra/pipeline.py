@@ -787,7 +787,7 @@ class InteractivePipeline:
         gate_node = self.repo.load_gate_node(node_id=gate_id)
 
         try:
-            gate_class = GateRegistry.get(gate_node.gate_type)
+            GateRegistry.get(gate_node.gate_type)
         except KeyError as e:
             available = sorted(GateRegistry.list_gates().keys())
             raise ValueError(
@@ -795,7 +795,7 @@ class InteractivePipeline:
                 f"Known gate types are: {available}"
             ) from e
 
-        gate = gate_class.from_node(gate_node, sample_id=sample_id)
+        gate = self.repo.load_gate(gate_node=gate_node, sample_id=sample_id)
 
         if select is None:
             selected_dims: Sequence[str] | slice = list(gate.dimensions) if gate.dimensions else slice(None)
@@ -839,7 +839,7 @@ class InteractivePipeline:
                     key: np.asarray(mask, dtype=bool)[event_mask]
                     for key, mask in parent_masks.items()
                 }
-        elif gate.glm_type == "BooleanGate":
+        elif gate.gate_type == "Boolean":
             parent_masks = self.repo.load_gating_masks(
                 sample=sample_id,
                 mask_ids=parent_ids,
@@ -1055,4 +1055,3 @@ class InteractivePipeline:
                 "flag": flag
             })
         return summary
-

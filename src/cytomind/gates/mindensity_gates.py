@@ -7,13 +7,16 @@ import numpy as np
 from scipy.stats import gaussian_kde
 from scipy.interpolate import UnivariateSpline
 
-
-from cytomind.gates.glm_gates import RectangleGate, QuadrantGate
+from .geometric_gates import RectangleGate, QuadrantGate
 from . import GateRegistry
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
+    from cytomind.domain.constants import FloatArray, IntArray
     from pandas import DataFrame
+else:
+    FloatArray = object
+    IntArray = object
+    DataFrame = object
 
 @GateRegistry.register("min_density")
 class MinDensityGate(RectangleGate):
@@ -31,7 +34,7 @@ class MinDensityGate(RectangleGate):
     """
 
     gate_type = "min_density"
-    tunable = True
+    default_tunable = True
 
     def __init__(
         self,
@@ -41,6 +44,7 @@ class MinDensityGate(RectangleGate):
         min_ranges: Mapping[str, float] | None = None,
         max_ranges: Mapping[str, float] | None = None,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
     ) -> None:
         """
         Parameters
@@ -93,6 +97,7 @@ class MinDensityGate(RectangleGate):
                 raise ValueError(f"directions[{i}] must be -1 or 1, got {val}")
 
         super().__init__(gate_name=gate_name, dimensions=dimensions, use_as_complement=use_as_complement)
+        self.tunable = type(self).default_tunable if tunable is None else bool(tunable)
         self._hyperparams = {
             "directions": directions,
             "min_ranges": min_ranges,
@@ -129,6 +134,59 @@ class MinDensityGate(RectangleGate):
             [max_vals.get(dim, None) for dim in self.dimensions]
         ]
 
+    def _add_plot_overlays_2d_marginals(
+        self,
+        fig,
+        plot_dims: Sequence[str],
+        x_data: FloatArray,
+        y_data: FloatArray,
+        **kwargs: Any,
+    ) -> None:
+        del x_data, y_data
+        min_vals = self.min_vals # pyright: ignore[reportAttributeAccessIssue]
+        max_vals = self.max_vals # pyright: ignore[reportAttributeAccessIssue]
+        x_dim, y_dim = plot_dims
+        gate_line_color = str(kwargs.get("gate_line_color", "red"))
+        gate_line_width = int(kwargs.get("gate_line_width", 2))
+        gate_line_dash = str(kwargs.get("gate_line_dash", "dash"))
+
+        if min_vals[x_dim] is not None:
+            fig.add_vline(
+                x=float(min_vals[x_dim]),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="min",
+                row=1, col=1  # pyright: ignore[reportArgumentType]
+            )
+        if max_vals[x_dim] is not None:
+            fig.add_vline(
+                x=float(max_vals[x_dim]),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="max",
+                row=1, col=1  # pyright: ignore[reportArgumentType]
+            )
+        if min_vals[y_dim] is not None:
+            fig.add_hline(
+                y=float(min_vals[y_dim]),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="min",
+                row=2, col=2  # pyright: ignore[reportArgumentType]
+            )
+        if max_vals[y_dim] is not None:
+            fig.add_hline(
+                y=float(max_vals[y_dim]),
+                line_color=gate_line_color,
+                line_width=gate_line_width,
+                line_dash=gate_line_dash,
+                annotation_text="max",
+                row=2, col=2  # pyright: ignore[reportArgumentType]
+            )
+
 
 @GateRegistry.register("min_density_quadrant")
 class MinDensityQuadrantGate(QuadrantGate):
@@ -140,7 +198,7 @@ class MinDensityQuadrantGate(QuadrantGate):
     """
 
     gate_type = "min_density_quadrant"
-    tunable = True
+    default_tunable = True
 
     def __init__(
         self,
@@ -149,6 +207,7 @@ class MinDensityQuadrantGate(QuadrantGate):
         min_ranges: Mapping[str, float] | None = None,
         max_ranges: Mapping[str, float] | None = None,
         use_as_complement: bool = False,
+        tunable: bool | None = None,
         **kwargs: Any,
     ) -> None:
         if len(dimensions) < 1:
@@ -179,6 +238,7 @@ class MinDensityQuadrantGate(QuadrantGate):
             quadrants={},
             **kwargs,
         )
+        self.tunable = type(self).default_tunable if tunable is None else bool(tunable)
 
         self._hyperparams["min_ranges"] = min_ranges
         self._hyperparams["max_ranges"] = max_ranges
@@ -227,13 +287,13 @@ class MinDensityQuadrantGate(QuadrantGate):
         return base
 
 
-def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, up_bd: float | None = None) -> dict[str, Any]:
+def improved_mindensity(vals: FloatArray, low_bd: float | None = None, up_bd: float | None = None) -> dict[str, Any]:
     """
     Determines a cutpoint as the minimum point of a kernel density estimate between two peaks.
     Based on R/Bioconductor package openCyto::gate_mindensity2 implementation.
 
     Args:
-        vals (NDArray[np.float64]): Input data values.
+        vals (FloatArray): Input data values.
         low_bd (float | None, optional): Lower bound for cut point search. Default (None) uses the minimum value in `vals`.
         up_bd (float | None, optional): Upper bound for cut point search. Default (None) uses the maximum value in `vals`.
 
@@ -246,7 +306,7 @@ def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, 
     """
 
     # Step 1: Parse extreme values
-    min_val, max_val = np.min(vals), np.max(vals)
+    min_val, max_val = float(np.min(vals)), float(np.max(vals))
     low_bd = max(low_bd, min_val) if low_bd is not None else min_val
     up_bd = min(up_bd, max_val) if up_bd is not None else max_val
     if low_bd > up_bd:
@@ -270,24 +330,26 @@ def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, 
     # Step 2: Fit Density Function
     kde = gaussian_kde(vals)
     x_vals = np.linspace(low_bd, up_bd, 512)
-    y_vals: NDArray[np.float64] = kde(x_vals)
+    y_vals: FloatArray = kde(x_vals)
     y_vals /= y_vals.max() # normalize to max of 1 for stability/interpretability
     sp = UnivariateSpline(x_vals, y_vals, s=1, k=3)
 
     # Step 3: Get Critical Points
-    def zero_crossings(y: NDArray[np.float64], direction=0) -> NDArray[np.int_]:
+    def zero_crossings(y: FloatArray, direction=0) -> IntArray:
         # direction: 0 all zero-crossings, -1 positive to negative, +1 negative to positive
         signs = np.sign(y)
         flips = np.where(signs[1:] * signs[:-1] < 0)[0] + 1
+        if direction == 0:
+            return flips
         return flips[signs[flips] * direction >= 0]
 
     # Get minima and maxima and shoulder points
-    d1: NDArray[np.float64] = sp.derivative(n=1)(x_vals) # pyright: ignore[reportAssignmentType]
+    d1: FloatArray = sp.derivative(n=1)(x_vals) # pyright: ignore[reportAssignmentType]
     zx = zero_crossings(d1)
     min_idx = zx[d1[zx] > 0]  # slope goes from negative to positive
     max_idx = zx[d1[zx] < 0]  # slope goes from positive to negative
 
-    d3: NDArray[np.float64] = sp.derivative(n=3)(x_vals) # pyright: ignore[reportAssignmentType]
+    d3: FloatArray = sp.derivative(n=3)(x_vals) # pyright: ignore[reportAssignmentType]
     sld_idx = zero_crossings(d3, direction=-1)  # maximum of the second derivative (shoulder points)
 
     # Step 4: Determine final cut point
@@ -299,7 +361,7 @@ def improved_mindensity(vals: NDArray[np.float64], low_bd: float | None = None, 
         # Case2: no minima but single peak -> try to find a point where the density starts falling
         peak = max_idx[0]
         post_sld = sld_idx[sld_idx > peak]
-        d2: NDArray[np.float64] = sp.derivative(n=2)(x_vals) # pyright: ignore[reportAssignmentType]
+        d2: FloatArray = sp.derivative(n=2)(x_vals) # pyright: ignore[reportAssignmentType]
         inf_idx = zero_crossings(-d2, direction=1)
         post_inf = inf_idx[inf_idx > peak]
         if post_sld.size > 0:
