@@ -1,8 +1,10 @@
 from __future__ import annotations
+from collections import deque
 from datetime import datetime
 from typing import Iterable, Sequence, Mapping, Any, TYPE_CHECKING
 from pathlib import Path
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 
@@ -11,16 +13,23 @@ from cytomind.domain.flow import DimensionDef
 from cytomind.domain.qc import EntityQCStatus, QCFlag
 from .repo import ProjectRepository
 from cytomind.gates import GateRegistry
+from cytomind.gates.base import Gate
 from cytomind.steps import StepRegistry
 from cytomind.qc import EntityQCEvaluatorRegistry
 from cytomind.revisions import RevisionHandlerRegistry
 from cytomind.utils import now_iso
+from cytomind.visualization import GenericPlotEngine
 
 if TYPE_CHECKING:
-    from cytomind.domain.constants import PathLike
+    from cytomind.domain.constants import PathLike, MaskLike
+    from cytomind.domain.gates import GateNode
+    from anndata import AnnData
     from cytomind.revisions.base import BaseRevisionHandler
 else:
     PathLike = object
+    MaskLike = object
+    GateNode = object
+    AnnData = object
     BaseRevisionHandler = object
 
 
@@ -745,13 +754,325 @@ class InteractivePipeline:
             },
         )
 
+    def _resolve_plot_sample_ids(self, sample_ids: str | Sequence[str]) -> list[str]:
+        project = self.project
+
+        if isinstance(sample_ids, str):
+            if sample_ids in project.batches:
+                return sorted(project.batches[sample_ids].sample_ids)
+            if sample_ids in project.samples:
+                return [sample_ids]
+            raise ValueError(f"Unknown batch or sample identifier {sample_ids!r}.")
+
+        resolved = [str(sample_id) for sample_id in sample_ids]
+        if not resolved:
+            raise ValueError("sample_ids must not be empty.")
+
+        missing = sorted(set(resolved) - set(project.samples))
+        if missing:
+            raise ValueError(f"Unknown sample_ids: {missing}")
+        return resolved
+
+    def _resolve_plot_layer(self, sample_id: str, layer: str | None, gate_node: GateNode | None = None) -> str:
+        if layer is not None:
+            return layer
+        if gate_node is not None:
+            return gate_node.layer
+        return self.repo.load_sample_meta(sample_id).default_layer
+
+    def _resolve_plot_mask_id(self, gate_node: GateNode | None, mask_id: str | MaskLike | None) -> str | MaskLike:
+        if isinstance(mask_id, str):
+            if mask_id:
+                return mask_id
+        elif isinstance(mask_id, (list, tuple)):
+            if not mask_id:
+                mask_id = None
+            elif all(isinstance(item, str) for item in mask_id):
+                raise ValueError(
+                    "mask_id must be a single stored mask id or a MaskLike filter, not multiple mask ids."
+                )
+        elif mask_id is not None:
+            return mask_id
+        if gate_node is None:
+            return "root"
+        return self._resolve_gate_plot_ancestor(gate_node.id)
+
+    def _resolve_gate_plot_ancestor(self, gate_id: str) -> str:
+        gate_node = self.repo.load_gate_node(node_id=gate_id)
+        parent_ids = sorted({parent_id for parent_id in gate_node.parent_ids if parent_id != "root"})
+        if not parent_ids:
+            return "root"
+        if len(parent_ids) == 1:
+            return parent_ids[0]
+
+        ancestor_maps = [self._ancestor_distances(parent_id) for parent_id in parent_ids]
+        common_ids = set.intersection(*(set(ancestor_map) for ancestor_map in ancestor_maps))
+        if not common_ids:
+            return "root"
+
+        _, best_id = min(
+            (
+                (
+                    max(ancestor_map[ancestor_id] for ancestor_map in ancestor_maps),
+                    sum(ancestor_map[ancestor_id] for ancestor_map in ancestor_maps),
+                    ancestor_id,
+                ),
+                ancestor_id,
+            )
+            for ancestor_id in common_ids
+        )
+        return best_id
+
+    def _ancestor_distances(self, node_id: str) -> dict[str, int]:
+        distances: dict[str, int] = {}
+        queue: deque[tuple[str, int]] = deque([(node_id, 0)])
+
+        while queue:
+            current_id, depth = queue.popleft()
+            if current_id in distances:
+                continue
+            distances[current_id] = depth
+
+            if current_id == "root":
+                continue
+
+            current_node = self.repo.load_gate_node(node_id=current_id)
+            parent_ids = list(dict.fromkeys(current_node.parent_ids or ["root"]))
+            if not parent_ids:
+                parent_ids = ["root"]
+            for parent_id in parent_ids:
+                queue.append((parent_id, depth + 1))
+
+        distances.setdefault("root", max(distances.values(), default=0) + 1)
+        return distances
+
+    def _resolve_event_filter(
+        self,
+        sample_id: str,
+        mask_id: str | MaskLike,
+    ) -> slice | np.ndarray:
+        if isinstance(mask_id, str):
+            if mask_id == "root":
+                return slice(None)
+            loaded_mask = self.repo.load_gating_masks(sample=sample_id, mask_ids=[mask_id])[mask_id]
+            return np.asarray(loaded_mask, dtype=bool).ravel()
+
+        if isinstance(mask_id, slice):
+            return mask_id
+
+        arr = np.asarray(mask_id, dtype=bool).ravel()
+        return arr
+
+    @staticmethod
+    def _subset_values(values: np.ndarray, event_mask: slice | np.ndarray) -> np.ndarray:
+        if isinstance(event_mask, slice):
+            return np.asarray(values)
+        return np.asarray(values)[event_mask]
+
+    def _validate_gate_type(self, gate_node: GateNode, gate_id: str) -> None:
+        try:
+            GateRegistry.get(gate_node.gate_type)
+        except KeyError as e:
+            available = sorted(GateRegistry.list_gates().keys())
+            raise ValueError(
+                f"Unknown gate type {gate_node.gate_type!r} for gate {gate_id!r}. "
+                f"Known gate types are: {available}"
+            ) from e
+
+    def _compute_gate_arrays(
+        self,
+        *,
+        gate: Gate,
+        gate_node: GateNode,
+        sample_id: str,
+        events: AnnData,
+        event_mask: slice | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if gate_node.gate_type == "Boolean":
+            variables = sorted(getattr(gate, "variables", set()))
+            parent_masks = self.repo.load_gating_masks(sample=sample_id, mask_ids=variables)
+            subset_masks = {
+                mask_name: self._subset_values(np.asarray(mask, dtype=bool).ravel(), event_mask)
+                for mask_name, mask in parent_masks.items()
+            }
+            applied = gate.apply(events, subset_masks)
+            scored = gate.score(events, subset_masks)
+        else:
+            root_mask = {"root": np.ones(events.n_obs, dtype=bool)}
+            applied = gate.apply(events, root_mask)
+            scored = gate.score(events, root_mask)
+
+        gate_mask = applied.get(gate.gate_name)
+        if gate_mask is None and applied:
+            gate_mask = next(iter(applied.values()))
+
+        gate_score = scored.get(gate.gate_name)
+        if gate_score is None and scored:
+            gate_score = next(iter(scored.values()))
+
+        if gate_mask is None or gate_score is None:
+            raise ValueError(f"Gate {gate.gate_name!r} did not return a primary mask/score output.")
+
+        return np.asarray(gate_mask, dtype=bool).ravel(), np.asarray(gate_score, dtype=float).ravel()
+
+    def plot(
+        self,
+        sample_ids: str | Sequence[str],
+        dimensions: Sequence[str] | None = None,
+        gate_id: str | None = None,
+        mask_id: str | MaskLike | None = None,
+        layer: str | None = None,
+        **plot_kwargs: Any,
+    ) -> Any:
+        """Build a generic exploratory plot for one or more samples."""
+        plot_kwargs = dict(plot_kwargs)
+        resolved_sample_ids = self._resolve_plot_sample_ids(sample_ids)
+        color_by = str(plot_kwargs.pop("color_by", "density"))
+        if color_by in {"mask", "score"} and gate_id is None:
+            raise ValueError(f"plot() requires gate_id when color_by={color_by!r}.")
+
+        gate_node: GateNode | None = None
+        if gate_id is not None:
+            gate_node = self.repo.load_gate_node(node_id=gate_id)
+            self._validate_gate_type(gate_node, gate_id)
+            if dimensions is None:
+                display_dims = list(gate_node.dimensions)
+            else:
+                display_dims = list(dimensions)
+                missing = sorted(set(gate_node.dimensions) - set(display_dims))
+                if missing:
+                    raise ValueError(
+                        f"dimensions is missing required gate dimensions for {gate_id!r}: {missing}"
+                    )
+        else:
+            if dimensions is None:
+                raise ValueError("plot() requires dimensions when gate_id is not provided.")
+            display_dims = list(dimensions)
+
+        if not display_dims:
+            raise ValueError("plot() requires at least one dimension.")
+        if len(resolved_sample_ids) > 1 and len(display_dims) > 2:
+            raise ValueError("plot() does not support more than 2 plot dimensions when multiple samples are selected.")
+
+        load_dims = list(display_dims)
+        effective_mask_id = mask_id
+        if gate_node is not None:
+            effective_mask_id = self._resolve_plot_mask_id(gate_node, mask_id)
+            load_dims = list(dict.fromkeys([*display_dims, *gate_node.dimensions]))
+        else:
+            effective_mask_id = self._resolve_plot_mask_id(None, mask_id)
+
+        if not isinstance(effective_mask_id, str) and len(resolved_sample_ids) > 1:
+            raise ValueError("Explicit MaskLike filters are only supported when plotting a single sample.")
+
+        layer_id = self._resolve_plot_layer(resolved_sample_ids[0], layer, gate_node)
+        sample_adatas: list[AnnData] = []
+        gate_masks: list[np.ndarray] = []
+        gate_scores: list[np.ndarray] = []
+
+        for sample_id in resolved_sample_ids:
+            event_mask = self._resolve_event_filter(sample_id, effective_mask_id)
+            sample_events = self.repo.load_sample_adata(
+                sample_id=sample_id,
+                layer=layer_id,
+                mask=event_mask,
+                select=load_dims,
+            )
+            sample_adatas.append(sample_events)
+
+            if gate_node is not None:
+                gate = self.repo.load_gate(gate_node=gate_node, sample_id=sample_id)
+                gate_mask, gate_score = self._compute_gate_arrays(
+                    gate=gate,
+                    gate_node=gate_node,
+                    sample_id=sample_id,
+                    events=sample_events,
+                    event_mask=event_mask,
+                )
+                gate_masks.append(gate_mask)
+                gate_scores.append(gate_score)
+
+        if len(sample_adatas) == 1:
+            plot_events = sample_adatas[0]
+            sample_mask_groups: dict[str, np.ndarray] | None = None
+        else:
+            plot_events = ad.concat(
+                sample_adatas,
+                axis=0,
+                join="inner",
+                label="sample_id",
+                keys=resolved_sample_ids,
+                index_unique="-",
+            )
+            sample_labels = np.asarray(plot_events.obs["sample_id"]).astype(str)
+            sample_mask_groups = {
+                sample_id: sample_labels == sample_id
+                for sample_id in resolved_sample_ids
+            }
+
+        gate_mask_values = np.concatenate(gate_masks) if gate_masks else None
+        gate_score_values = np.concatenate(gate_scores) if gate_scores else None
+
+        internal_color_by = color_by
+        plot_mask: dict[str, np.ndarray] | None = None
+        if color_by == "sample_id":
+            if len(resolved_sample_ids) < 2:
+                internal_color_by = "density"
+            else:
+                internal_color_by = "mask"
+                plot_mask = sample_mask_groups
+        elif color_by == "mask":
+            plot_mask = None if gate_mask_values is None or gate_id is None else {gate_id: gate_mask_values}
+        elif gate_mask_values is not None and gate_id is not None and "show_ratio" not in plot_kwargs:
+            plot_mask = {gate_id: gate_mask_values}
+
+        if "show_ratio" not in plot_kwargs:
+            plot_kwargs["show_ratio"] = gate_id is not None and color_by in {"mask", "score"}
+
+        if len(resolved_sample_ids) > 1 and color_by != "sample_id":
+            panels: list[dict[str, Any]] = []
+            for idx, (sample_id, sample_events) in enumerate(zip(resolved_sample_ids, sample_adatas, strict=False)):
+                sample_mask_values = gate_masks[idx] if gate_masks else None
+                sample_score_values = gate_scores[idx] if gate_scores else None
+                sample_plot_mask: dict[str, np.ndarray] | None = None
+                if internal_color_by == "mask":
+                    sample_plot_mask = None if sample_mask_values is None or gate_id is None else {gate_id: sample_mask_values}
+                elif sample_mask_values is not None and gate_id is not None and bool(plot_kwargs.get("show_ratio", False)):
+                    sample_plot_mask = {gate_id: sample_mask_values}
+                panels.append(
+                    {
+                        "title": sample_id,
+                        "events": sample_events,
+                        "mask": sample_plot_mask,
+                        "primary_mask_values": sample_mask_values,
+                        "score_values": sample_score_values,
+                        "color_by": internal_color_by,
+                    }
+                )
+            return GenericPlotEngine().plot_faceted(
+                panels=panels,
+                plot_dims=display_dims,
+                **plot_kwargs,
+            )
+
+        return GenericPlotEngine().plot(
+            events=plot_events,
+            plot_dims=display_dims,
+            mask=plot_mask,
+            primary_mask_values=gate_mask_values,
+            score_values=gate_score_values,
+            color_by=internal_color_by,
+            **plot_kwargs,
+        )
+
     def plot_gate(
         self,
         gate_id: str,
-        sample_id: str,
+        sample_ids: str | Sequence[str],
+        mask_id: str | MaskLike | None = None,
         plot_all_events: bool = False,
         layer: str | None = None,
-        select: Sequence[str] | None = None,
+        dimensions: Sequence[str] | None = None,
         **plot_kwargs: Any,
     ) -> Any:
         """Plot a gate for a specific sample context.
@@ -760,14 +1081,17 @@ class InteractivePipeline:
         ----------
         gate_id : str
             Gate node identifier within the strategy.
-        sample_id : str
-            Sample identifier used for per-sample gate parameters and masks.
+        sample_ids : str | Sequence[str]
+            Sample selector. A string is resolved as batch id first, then sample id.
+            Sequences are treated as explicit sample ids.
+        mask_id : str | MaskLike | None
+            Optional event filter. If omitted, defaults to the nearest shared
+            ancestor of the gate parents.
         plot_all_events : bool
-            If True, load all sample events. If False, parent masks are loaded,
-            collapsed with OR across parents, and used to filter loaded events.
+            If True, ignore mask_id and plot all events.
         layer : str | None
             Optional data layer override. If None, uses the gate node layer.
-        select : Sequence[str] | None
+        dimensions : Sequence[str] | None
             Optional dimensions to load for plotting. If None, loads gate
             dimensions; for gates without dimensions (e.g., Boolean), loads all.
         **plot_kwargs : Any
@@ -781,59 +1105,50 @@ class InteractivePipeline:
         Raises
         ------
         ValueError
-            If the gate type is unknown or required gate dimensions are missing
-            from ``select``.
+            If the gate type is unknown, multiple samples are requested, or
+            required gate dimensions are missing from ``dimensions``.
         """
+        resolved_sample_ids = self._resolve_plot_sample_ids(sample_ids)
+        if len(resolved_sample_ids) != 1:
+            raise ValueError("plot_gate() currently supports exactly one resolved sample.")
+        sample_id = resolved_sample_ids[0]
         gate_node = self.repo.load_gate_node(node_id=gate_id)
-
-        try:
-            GateRegistry.get(gate_node.gate_type)
-        except KeyError as e:
-            available = sorted(GateRegistry.list_gates().keys())
-            raise ValueError(
-                f"Unknown gate type {gate_node.gate_type!r} for gate {gate_id!r}. "
-                f"Known gate types are: {available}"
-            ) from e
-
+        self._validate_gate_type(gate_node, gate_id)
         gate = self.repo.load_gate(gate_node=gate_node, sample_id=sample_id)
 
-        if select is None:
+        if dimensions is None:
             selected_dims: Sequence[str] | slice = list(gate.dimensions) if gate.dimensions else slice(None)
         else:
-            selected_dims = list(select)
+            selected_dims = list(dimensions)
             if gate.dimensions:
                 missing = sorted(set(gate.dimensions) - set(selected_dims))
                 if missing:
                     raise ValueError(
-                        f"select is missing required gate dimensions for {gate_id!r}: {missing}"
+                        f"dimensions is missing required gate dimensions for {gate_id!r}: {missing}"
                     )
 
-        parent_ids = [parent_id for parent_id in gate_node.parent_ids if parent_id != "root"]
-        parent_masks: dict[str, Any] = {}
-
-        if plot_all_events:
-            event_mask = slice(None)
-        elif parent_ids:
-            parent_masks = self.repo.load_gating_masks(
-                sample=sample_id,
-                mask_ids=parent_ids,
-            )
-            parent_arrays = [np.asarray(mask, dtype=bool) for mask in parent_masks.values()]
-            event_mask = np.logical_or.reduce(parent_arrays)
-        else:
-            event_mask = slice(None)
-
-        plot_layer = layer or gate_node.layer
+        effective_mask_id: str | MaskLike = "root" if plot_all_events else self._resolve_plot_mask_id(gate_node, mask_id)
+        event_mask = self._resolve_event_filter(sample_id, effective_mask_id)
+        plot_layer = self._resolve_plot_layer(sample_id, layer, gate_node)
         events = self.repo.load_sample_adata(
             sample_id=sample_id,
             layer=plot_layer,
             mask=event_mask,
             select=selected_dims,
         )
-
-        plot_masks = self.repo.load_gating_masks(sample=sample_id, mask_ids=[gate_id] + parent_ids)
-        plot_masks = {mid: mask[event_mask] for mid, mask in plot_masks.items()}
-        return gate.plot(events=events, mask=plot_masks, **plot_kwargs)
+        gate_mask, _ = self._compute_gate_arrays(
+            gate=gate,
+            gate_node=gate_node,
+            sample_id=sample_id,
+            events=events,
+            event_mask=event_mask,
+        )
+        return gate.plot(
+            events=events,
+            mask={gate.gate_name: gate_mask},
+            dimensions=dimensions,
+            **plot_kwargs,
+        )
 
     def add_layer(
         self,

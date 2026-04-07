@@ -134,7 +134,7 @@ class MinDensityGate(RectangleGate):
             [max_vals.get(dim, None) for dim in self.dimensions]
         ]
 
-    def _add_plot_overlays_2d_marginals(
+    def decorate_plot_2d_marginals(
         self,
         fig,
         plot_dims: Sequence[str],

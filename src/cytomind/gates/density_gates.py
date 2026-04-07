@@ -2758,7 +2758,7 @@ class BaseDensityGate(Gate, ABC):
             return float(target.point[0]), float(target.point[1])
         return super()._plot_ratio_position_2d(plot_dims, x_data, y_data, **kwargs)
 
-    def _add_plot_overlays_1d(
+    def decorate_plot_1d(
         self,
         fig: go.Figure,
         dim: str,
@@ -2774,7 +2774,7 @@ class BaseDensityGate(Gate, ABC):
             self._single_region_overlay(fig, row=row, col=col, **kwargs)
             self._add_feature_markers(fig, row=row, col=col, showlegend=False if row is not None else True)
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
@@ -2829,7 +2829,7 @@ class BaseDensityGate(Gate, ABC):
                     line=dict(color="royalblue", width=2),
                 )
             )
-            self._add_plot_overlays_1d(fig, plot_dims[0], landscape.axis, plot_view="features", **kwargs)
+            self.decorate_plot_1d(fig, plot_dims[0], landscape.axis, plot_view="features", **kwargs)
             fig.update_xaxes(title=plot_dims[0])
             fig.update_yaxes(title="Density")
             fig.update_layout(title=title, width=width, height=height)
@@ -3147,7 +3147,7 @@ class DensitySegmentationGate(BaseDensityGate):
 
         return child_nodes
 
-    def _add_plot_overlays_1d(
+    def decorate_plot_1d(
         self,
         fig: go.Figure,
         dim: str,
@@ -3162,7 +3162,7 @@ class DensitySegmentationGate(BaseDensityGate):
             self._add_boundary_trace(fig, boundary, row=row, col=col, showlegend=False, name=region_id, **kwargs)
         self._add_feature_markers(fig, row=row, col=col, showlegend=False if row is not None else True)
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
@@ -3379,7 +3379,7 @@ class DensityRegionGate(Gate):
                 return float(point[0]), float(point[1])
         return None
 
-    def _add_plot_overlays_1d(
+    def decorate_plot_1d(
         self,
         fig: go.Figure,
         dim: str,
@@ -3405,7 +3405,7 @@ class DensityRegionGate(Gate):
                     col=col,  # pyright: ignore[reportArgumentType]
                 )
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],

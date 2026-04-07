@@ -231,5 +231,6 @@ def _format_gate_plot(
         height=height,
         template="plotly_white",
         hovermode="closest",
+        legend=dict(itemsizing="constant"),
     )
     return fig

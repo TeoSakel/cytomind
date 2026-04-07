@@ -320,7 +320,7 @@ class RectangleGate(Gate):
         cy = float(np.mean(y_data)) if y_min is None or y_max is None else (float(y_min) + float(y_max)) / 2.0
         return cx, cy
 
-    def _add_plot_overlays_1d(
+    def decorate_plot_1d(
         self,
         fig: go.Figure,
         dim: str,
@@ -354,7 +354,7 @@ class RectangleGate(Gate):
                 row=row, col=col # pyright: ignore[reportArgumentType]
             )
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
@@ -549,7 +549,7 @@ class PolygonGate(Gate):
         vertices_for_dims = self.vertices[:, base_indices]
         return float(vertices_for_dims[:, 0].mean()), float(vertices_for_dims[:, 1].mean())
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
@@ -816,7 +816,7 @@ class EllipsoidGate(Gate):
         idx_y = list(self.dimensions).index(plot_dims[1])
         return float(self.center[idx_x]), float(self.center[idx_y])
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
@@ -1170,7 +1170,7 @@ class QuadrantGate(Gate):
             return f"QuadrantGate: {self.gate_name} (Pair Plot)"
         return f"QuadrantGate: {self.gate_name}"
 
-    def _add_plot_overlays_1d(
+    def decorate_plot_1d(
         self,
         fig: go.Figure,
         dim: str,
@@ -1189,7 +1189,7 @@ class QuadrantGate(Gate):
                 row=row, col=col,  # pyright: ignore[reportArgumentType]
             )
 
-    def _add_plot_overlays_2d(
+    def decorate_plot_2d(
         self,
         fig: go.Figure,
         plot_dims: Sequence[str],
