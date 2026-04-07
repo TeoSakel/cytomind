@@ -831,29 +831,8 @@ class InteractivePipeline:
             select=selected_dims,
         )
 
-        if parent_masks:
-            if isinstance(event_mask, slice):
-                plot_masks = parent_masks
-            else:
-                plot_masks = {
-                    key: np.asarray(mask, dtype=bool)[event_mask]
-                    for key, mask in parent_masks.items()
-                }
-        elif gate.gate_type == "Boolean":
-            parent_masks = self.repo.load_gating_masks(
-                sample=sample_id,
-                mask_ids=parent_ids,
-            )
-            if isinstance(event_mask, slice):
-                plot_masks = parent_masks
-            else:
-                plot_masks = {
-                    key: np.asarray(mask, dtype=bool)[event_mask]
-                    for key, mask in parent_masks.items()
-                }
-        else:
-            plot_masks = {"root": np.ones(events.n_obs, dtype=bool)}
-
+        plot_masks = self.repo.load_gating_masks(sample=sample_id, mask_ids=[gate_id] + parent_ids)
+        plot_masks = {mid: mask[event_mask] for mid, mask in plot_masks.items()}
         return gate.plot(events=events, mask=plot_masks, **plot_kwargs)
 
     def add_layer(

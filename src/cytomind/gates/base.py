@@ -8,6 +8,7 @@ from cytomind.domain.pipeline import NumpyEncoder
 import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import get_colorscale, sample_colorscale
+from plotly.exceptions import PlotlyError
 from plotly.subplots import make_subplots
 from cytomind.visualization.gates import (
     _compute_density_colors,
@@ -222,7 +223,7 @@ class Gate(ABC):
         # Reconstruct gate with node's base properties and hyperparams
         # Note: Unpack hyperparams as **kwargs to match subclass __init__ signatures
         gate = cls(
-            gate_name=node.name or node.id,
+            gate_name=node.id,
             dimensions=node.dimensions,
             use_as_complement=node.use_as_complement,
             **hyperparams,
@@ -236,6 +237,46 @@ class Gate(ABC):
             gate.diagnostics = dict(diagnostics)
 
         return gate
+
+    @staticmethod
+    def externalize_numpy_arrays(
+        value: Any,
+        *,
+        prefix: str,
+        arrays: dict[str, np.ndarray],
+    ) -> Any:
+        if isinstance(value, np.ndarray):
+            arrays[prefix] = np.asarray(value)
+            return {"__npz__": prefix}
+        if isinstance(value, Mapping):
+            return {
+                str(key): Gate.externalize_numpy_arrays(val, prefix=f"{prefix}__{key}", arrays=arrays)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                Gate.externalize_numpy_arrays(item, prefix=f"{prefix}__{idx}", arrays=arrays)
+                for idx, item in enumerate(value)
+            ]
+        return value
+
+    @staticmethod
+    def restore_numpy_arrays(
+        value: Any,
+        *,
+        arrays: Mapping[str, np.ndarray],
+    ) -> Any:
+        if isinstance(value, Mapping):
+            if set(value.keys()) == {"__npz__"}:
+                key = str(value["__npz__"])
+                try:
+                    return np.asarray(arrays[key])
+                except KeyError as exc:
+                    raise ValueError(f"Missing array artifact entry {key!r}.") from exc
+            return {str(key): Gate.restore_numpy_arrays(val, arrays=arrays) for key, val in value.items()}
+        if isinstance(value, list):
+            return [Gate.restore_numpy_arrays(item, arrays=arrays) for item in value]
+        return value
 
     def _export_json_state_payload(self) -> dict[str, Any]:
         """Return the JSON-serializable subset of ``state`` for default persistence."""
@@ -699,6 +740,7 @@ class Gate(ABC):
         density_log_scale: bool = True,
         marker_size: int = 3,
         colorscale: str | Sequence[str] | None = None,
+        show_colorbar: bool = True,
         use_gl: bool = True,
         max_points: int = 50000,
         downsample_seed: int = 0,
@@ -734,7 +776,7 @@ class Gate(ABC):
         marginal_plot_type : str, default "histogram"
             Marginal plot style for 2D views. Supported by the base implementation: ``"histogram"`` or ``"density"``.
         color_by : str, default "density"
-            Scatter coloring mode. Supported by the base implementation: ``"density"`` or ``"score"``.
+            Scatter coloring mode. Supported by the base implementation: ``"density"``, ``"score"``, or ``"mask"``.
         hist_nbins, hist_color, histnorm, density_nbins, density_log_scale, marker_size, colorscale,
         use_gl, max_points, downsample_seed, gate_line_color, gate_line_width, gate_line_dash,
         gate_fill, gate_fill_color, fail_hist_color, pass_hist_color, margin_pad_scale, title,
@@ -774,6 +816,7 @@ class Gate(ABC):
             density_log_scale=density_log_scale,
             marker_size=marker_size,
             colorscale=colorscale,
+            show_colorbar=show_colorbar,
             use_gl=use_gl,
             max_points=max_points,
             downsample_seed=downsample_seed,
@@ -1023,11 +1066,12 @@ class Gate(ABC):
             return []
 
         if colorscale is None:
-            scale: str | Sequence[str] = "Plotly"
+            scale: str | Sequence[str] = "plotly3"
         else:
             scale = colorscale
 
         if isinstance(scale, str):
+            scale = self._resolve_named_colorscale(scale)
             if n_masks == 1:
                 return [sample_colorscale(get_colorscale(scale), [0.5])[0]] # pyright: ignore[reportReturnType]
             sample_points = np.linspace(0.0, 1.0, n_masks).tolist()
@@ -1039,6 +1083,23 @@ class Gate(ABC):
                 f"{self.__class__.__name__}.plot() expected {n_masks} mask colors, got {len(palette)}"
             )
         return palette
+
+    def _resolve_named_colorscale(self, colorscale: str) -> str:
+        scale = str(colorscale).strip()
+        if not scale:
+            raise ValueError(f"{self.__class__.__name__}.plot() received an empty colorscale name")
+
+        aliases = {
+            "plotly": "plotly3",
+        }
+        resolved = aliases.get(scale.casefold(), scale)
+        try:
+            get_colorscale(resolved)
+        except PlotlyError as exc:
+            raise ValueError(
+                f"{self.__class__.__name__}.plot() received unsupported colorscale {scale!r}"
+            ) from exc
+        return resolved
 
     def _resolve_histogram_bin_edges(self, values: FloatArray, hist_nbins: int | str) -> np.ndarray:
         arr = np.asarray(values, dtype=float)
@@ -1363,7 +1424,11 @@ class Gate(ABC):
         mask: dict[str, BooleanArray] | None,
     ) -> np.ndarray | None:
         score_events = events if downsample_idx is None else events[downsample_idx].copy()
-        score_mask = self._subset_plot_mask(mask, downsample_idx, events.n_obs)
+        # Plotting receives events already filtered to the parent context (pipeline.plot_gate).
+        # Gate.score expects a parent mask matching score_events.n_obs, so use a full-root mask
+        # instead of gate output masks (which would represent pass/fail and break this contract).
+        del mask
+        score_mask = {"root": np.ones(score_events.n_obs, dtype=bool)}
 
         scores = self.score(score_events, mask=score_mask)
         score_values = scores.get(self.gate_name)
@@ -1382,7 +1447,7 @@ class Gate(ABC):
     ) -> dict[str, Any]:
         resolved_colorscale = "balance" if color_by == "score" else "Viridis"
         if colorscale is not None:
-            resolved_colorscale = colorscale
+            resolved_colorscale = self._resolve_named_colorscale(colorscale)
         style: dict[str, Any] = {
             "colorscale": resolved_colorscale,
             "color_midpoint": None,
@@ -1450,10 +1515,12 @@ class Gate(ABC):
         downsample_seed = int(kwargs.get("downsample_seed", 0))
         downsample_idx = self._downsample_indices(data.shape[0], max_points, downsample_seed)
         mask_groups = self._resolve_plot_mask_groups(mask, events.n_obs, downsample_idx)
+        color_by = str(kwargs.get("color_by", "density"))
+        use_multi_mask_coloring = color_by == "mask" and len(mask_groups) > 1
         pass_mask: np.ndarray | None = None
         fail_mask: np.ndarray | None = None
 
-        if self._plot_has_pass_fail_split(mask):
+        if mask is not None and not use_multi_mask_coloring:
             full_mask = self._resolve_gate_plot_mask(events, mask)
             pass_mask = full_mask if downsample_idx is None else full_mask[downsample_idx]
             fail_mask = ~pass_mask
@@ -1473,7 +1540,7 @@ class Gate(ABC):
         plot_height = 600 if height is None else int(height)
 
         fig = go.Figure()
-        if len(mask_groups) > 1:
+        if use_multi_mask_coloring:
             mask_colors = self._resolve_discrete_mask_colors(len(mask_groups), kwargs.get("colorscale"))
             yaxis_title = self._add_multi_1d_distribution_traces(
                 fig,
@@ -1532,11 +1599,6 @@ class Gate(ABC):
             x_data = x_data[downsample_idx]
             y_data = y_data[downsample_idx]
 
-        if bool(kwargs.get("marginals", False)) and len(mask_groups) <= 1:
-            full_mask = self._resolve_gate_plot_mask(events, mask)
-            pass_mask = full_mask if downsample_idx is None else full_mask[downsample_idx]
-            fail_mask = ~pass_mask
-
         density_nbins = int(kwargs.get("density_nbins", 50))
         density_log_scale = bool(kwargs.get("density_log_scale", True))
         marker_size = int(kwargs.get("marker_size", 3))
@@ -1544,14 +1606,23 @@ class Gate(ABC):
         if colorscale is not None and isinstance(colorscale, str):
             colorscale = str(colorscale)
         color_by = str(kwargs.get("color_by", "density"))
+        use_multi_mask_coloring = color_by == "mask" and len(mask_groups) > 1
+        show_colorbar = bool(kwargs.get("show_colorbar", True))
         use_gl = bool(kwargs.get("use_gl", True))
         title = kwargs.get("title")
         width = kwargs.get("width")
         height = kwargs.get("height")
         plot_width = 900 if width is None else int(width)
         plot_height = 700 if height is None else int(height)
+        uses_marginal_subplots = False
 
-        if len(mask_groups) > 1 and bool(kwargs.get("marginals", False)):
+        if bool(kwargs.get("marginals", False)) and not use_multi_mask_coloring:
+            full_mask = self._resolve_gate_plot_mask(events, mask)
+            pass_mask = full_mask if downsample_idx is None else full_mask[downsample_idx]
+            fail_mask = ~pass_mask
+
+        if use_multi_mask_coloring and bool(kwargs.get("marginals", False)):
+            uses_marginal_subplots = True
             mask_colors = self._resolve_discrete_mask_colors(len(mask_groups), kwargs.get("colorscale"))
             fig = make_subplots(
                 rows=2,
@@ -1618,17 +1689,7 @@ class Gate(ABC):
             fig.update_yaxes(range=padded_range_y, row=2, col=2, showticklabels=False)
             self._add_plot_overlays_2d_marginals(fig, plot_dims, x_data, y_data, **kwargs)
         elif pass_mask is not None and fail_mask is not None:
-            colors = (
-                self._plot_score_color_values(events, downsample_idx=downsample_idx, mask=mask)
-                if color_by == "score"
-                else self._plot_scatter_color_values(
-                    x_data,
-                    y_data,
-                    density_nbins=density_nbins,
-                    density_log_scale=density_log_scale,
-                )
-            )
-            color_style = self._scatter_color_style(colors, color_by=color_by, colorscale=colorscale)
+            uses_marginal_subplots = True
             fig = make_subplots(
                 rows=2,
                 cols=2,
@@ -1640,12 +1701,63 @@ class Gate(ABC):
                 row_heights=[0.2, 0.8],
                 specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "xy"}, {"type": "xy"}]],
             )
-            fig.add_trace(_create_scatter_trace(x_data, y_data, colors, marker_size=marker_size, use_gl=use_gl, **color_style), row=2, col=1)
+            fail_color = str(kwargs.get("fail_hist_color", "rgba(255, 0, 0, 0.35)"))
+            pass_color = str(kwargs.get("pass_hist_color", "rgba(0, 255, 0, 0.45)"))
+
+            if color_by == "mask":
+                fail_trace = _create_scatter_trace(
+                    x_data[fail_mask],
+                    y_data[fail_mask],
+                    None,
+                    marker_size=marker_size,
+                    use_gl=use_gl,
+                    showlegend=True,
+                    name="Fail",
+                )
+                pass_trace = _create_scatter_trace(
+                    x_data[pass_mask],
+                    y_data[pass_mask],
+                    None,
+                    marker_size=marker_size,
+                    use_gl=use_gl,
+                    showlegend=True,
+                    name="Pass",
+                )
+                fail_trace.marker.color = fail_color # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                pass_trace.marker.color = pass_color # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                fig.add_trace(fail_trace, row=2, col=1)
+                fig.add_trace(pass_trace, row=2, col=1)
+            else:
+                colors = (
+                    self._plot_score_color_values(events, downsample_idx=downsample_idx, mask=mask)
+                    if color_by == "score"
+                    else self._plot_scatter_color_values(
+                        x_data,
+                        y_data,
+                        density_nbins=density_nbins,
+                        density_log_scale=density_log_scale,
+                    )
+                )
+                color_style = self._scatter_color_style(colors, color_by=color_by, colorscale=colorscale)
+                colorbar_title = "Score" if color_by == "score" else "Density"
+                fig.add_trace(
+                    _create_scatter_trace(
+                        x_data,
+                        y_data,
+                        colors,
+                        marker_size=marker_size,
+                        use_gl=use_gl,
+                        show_colorbar=show_colorbar,
+                        colorbar_title=colorbar_title,
+                        **color_style,
+                    ),
+                    row=2,
+                    col=1,
+                )
+
             self._add_plot_overlays_2d(fig, plot_dims, x_data, y_data, row=2, col=1, **kwargs)
 
             marginal_plot_type = str(kwargs.get("marginal_plot_type", "histogram"))
-            fail_color = str(kwargs.get("fail_hist_color", "rgba(255, 0, 0, 0.35)"))
-            pass_color = str(kwargs.get("pass_hist_color", "rgba(0, 255, 0, 0.45)"))
             hist_nbins = kwargs.get("hist_nbins", 100)
             histnorm = str(kwargs.get("histnorm", "probability"))
             if marginal_plot_type == "density":
@@ -1697,7 +1809,19 @@ class Gate(ABC):
                     )
                 )
                 color_style = self._scatter_color_style(colors, color_by=color_by, colorscale=colorscale)
-                fig.add_trace(_create_scatter_trace(x_data, y_data, colors, marker_size=marker_size, use_gl=use_gl, **color_style))
+                colorbar_title = "Score" if color_by == "score" else "Density"
+                fig.add_trace(
+                    _create_scatter_trace(
+                        x_data,
+                        y_data,
+                        colors,
+                        marker_size=marker_size,
+                        use_gl=use_gl,
+                        show_colorbar=show_colorbar,
+                        colorbar_title=colorbar_title,
+                        **color_style,
+                    )
+                )
             self._add_plot_overlays_2d(fig, plot_dims, x_data, y_data, **kwargs)
             fig.update_xaxes(title=x_dim)
             fig.update_yaxes(title=y_dim)
@@ -1707,7 +1831,18 @@ class Gate(ABC):
                 ratio = self._compute_ratio(events, mask)
                 ratio_xy = self._plot_ratio_position_2d(plot_dims, x_data, y_data, **kwargs)
                 if ratio is not None and ratio_xy is not None:
-                    fig.add_annotation(x=float(ratio_xy[0]), y=float(ratio_xy[1]), xref="x", yref="y", text=f"{ratio*100:.1f}%", showarrow=False, bgcolor="white", opacity=0.8)
+                    xref = "x3" if uses_marginal_subplots else "x"
+                    yref = "y3" if uses_marginal_subplots else "y"
+                    fig.add_annotation(
+                        x=float(ratio_xy[0]),
+                        y=float(ratio_xy[1]),
+                        xref=xref,
+                        yref=yref,
+                        text=f"{ratio*100:.1f}%",
+                        showarrow=False,
+                        bgcolor="white",
+                        opacity=0.8,
+                    )
         except Exception:
             pass
 
@@ -1743,7 +1878,14 @@ class Gate(ABC):
             vertical_spacing=vertical_spacing
         )
 
-        use_multi_mask_coloring = len(mask_groups) > 1
+        use_multi_mask_coloring = color_by == "mask" and len(mask_groups) > 1
+        nd_pass_mask: np.ndarray | None = None
+        nd_fail_mask: np.ndarray | None = None
+        if mask is not None and not use_multi_mask_coloring:
+            full_mask = self._resolve_gate_plot_mask(events, mask)
+            nd_pass_mask = full_mask if downsample_idx is None else full_mask[downsample_idx]
+            nd_fail_mask = ~nd_pass_mask
+
         scatter_color_values = None if use_multi_mask_coloring else (
             self._plot_score_color_values(events, downsample_idx=downsample_idx, mask=mask)
             if color_by == "score"
@@ -1779,10 +1921,9 @@ class Gate(ABC):
                         )
                         yaxis_max = None
                     else:
-                        if self._plot_has_pass_fail_split(mask):
-                            full_mask = self._resolve_gate_plot_mask(events, mask)
-                            diag_pass_mask = full_mask if downsample_idx is None else full_mask[downsample_idx]
-                            diag_fail_mask = ~diag_pass_mask
+                        if nd_pass_mask is not None and nd_fail_mask is not None:
+                            diag_pass_mask = nd_pass_mask
+                            diag_fail_mask = nd_fail_mask
                         yaxis_title, yaxis_max = self._add_1d_distribution_traces(
                             fig,
                             x_values,
@@ -1817,18 +1958,43 @@ class Gate(ABC):
                             showlegend=(row_idx == 1 and col_idx == 2),
                         )
                     else:
-                        color_values = (
-                            scatter_color_values
-                            if scatter_color_values is not None
-                            else self._plot_scatter_color_values(
-                                x_values,
-                                y_values,
-                                density_nbins=density_nbins,
-                                density_log_scale=density_log_scale,
+                        if color_by == "mask" and nd_pass_mask is not None and nd_fail_mask is not None:
+                            show_mask_legend = row_idx == 1 and col_idx == 2
+                            fail_trace = _create_scatter_trace(
+                                x_values[nd_fail_mask],
+                                y_values[nd_fail_mask],
+                                None,
+                                marker_size=marker_size,
+                                use_gl=use_gl,
+                                showlegend=show_mask_legend,
+                                name="Fail",
                             )
-                        )
-                        color_style = scatter_color_style if scatter_color_values is not None else self._scatter_color_style(color_values, color_by="density", colorscale=colorscale)
-                        fig.add_trace(_create_scatter_trace(x_values, y_values, color_values, marker_size=marker_size, use_gl=use_gl, showlegend=False, **color_style), row=row_idx, col=col_idx)
+                            pass_trace = _create_scatter_trace(
+                                x_values[nd_pass_mask],
+                                y_values[nd_pass_mask],
+                                None,
+                                marker_size=marker_size,
+                                use_gl=use_gl,
+                                showlegend=show_mask_legend,
+                                name="Pass",
+                            )
+                            fail_trace.marker.color = str(kwargs.get("fail_hist_color", "rgba(255, 0, 0, 0.35)")) # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                            pass_trace.marker.color = str(kwargs.get("pass_hist_color", "rgba(0, 255, 0, 0.45)")) # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+                            fig.add_trace(fail_trace, row=row_idx, col=col_idx)
+                            fig.add_trace(pass_trace, row=row_idx, col=col_idx)
+                        else:
+                            color_values = (
+                                scatter_color_values
+                                if scatter_color_values is not None
+                                else self._plot_scatter_color_values(
+                                    x_values,
+                                    y_values,
+                                    density_nbins=density_nbins,
+                                    density_log_scale=density_log_scale,
+                                )
+                            )
+                            color_style = scatter_color_style if scatter_color_values is not None else self._scatter_color_style(color_values, color_by="density", colorscale=colorscale)
+                            fig.add_trace(_create_scatter_trace(x_values, y_values, color_values, marker_size=marker_size, use_gl=use_gl, showlegend=False, **color_style), row=row_idx, col=col_idx)
                     self._add_plot_overlays_2d(fig, (x_dim, y_dim), x_values, y_values, row=row_idx, col=col_idx, showlegend=False, **kwargs)
 
                 if row_idx == n_dims:

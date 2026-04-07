@@ -14,10 +14,8 @@ from cytomind.infra.dataloader import UnifiedDataLoader
 
 if TYPE_CHECKING:
     from anndata import AnnData
-    from cytomind.domain.constants import PathLike, MaskLike, ProjectMetadata
-    import numpy as np
-    from numpy.typing import NDArray
-    BooleanArray = NDArray[np.bool_]
+    from cytomind.domain.constants import PathLike, MaskLike, ProjectMetadata, BooleanArray
+    from cytomind.gates.base import Gate
     R = TypeVar("R")  # Generic return type for parse/serialize functions
 else:
     AnnData = object
@@ -26,6 +24,7 @@ else:
     ProjectMetadata = object
     BooleanArray = object
     R = object
+    Gate = object
 
 
 class ProjectRepository:
@@ -609,7 +608,7 @@ class ProjectRepository:
     def save_gating_masks(
         self,
         sample: str | SampleRef,
-        masks: Mapping[str, Sequence[bool] | NDArray[np.bool_]],
+        masks: Mapping[str, Sequence[bool] | BooleanArray],
         overwrite: bool = True
     ) -> None:
         """
@@ -619,7 +618,7 @@ class ProjectRepository:
         ----------
         sample : str | SampleRef
             Sample identifier or reference.
-        masks : Mapping[str, Sequence[bool] | NDArray[np.bool_]]
+        masks : Mapping[str, Sequence[bool] | BooleanArray]
             Gating mask data to save.
         """
         sample_id = sample.id if isinstance(sample, SampleRef) else sample
@@ -677,7 +676,7 @@ class ProjectRepository:
     def save_gate_state(
         self,
         gate_id: str,
-        gate: Any,
+        gate: Gate,
         sample_id: str = "__all__",
         overwrite: bool = True,
     ) -> dict[str, Any]:
@@ -692,7 +691,7 @@ class ProjectRepository:
         self,
         gate_node: str | GateNode,
         sample_id: str | None = None,
-    ) -> Any:
+    ) -> Gate:
         node = gate_node if isinstance(gate_node, GateNode) else self.load_gate_node(node_id=gate_node)
         return self._dataloader.load_gate(gate_node=node, sample_id=sample_id)
 

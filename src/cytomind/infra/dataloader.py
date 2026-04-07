@@ -968,6 +968,12 @@ class UnifiedDataLoader:
         if path.suffix == ".json":
             UnifiedDataLoader._save_json(path, data)
             return
+        if path.suffix == ".npz":
+            if not isinstance(data, Mapping):
+                raise TypeError(f"Unsupported NPZ artifact payload type for {path.name}: {type(data)}")
+            arrays = {str(key): np.asarray(value) for key, value in data.items()}
+            np.savez_compressed(path, allow_pickle=True, **arrays)
+            return
         if isinstance(data, str):
             path.write_text(data)
             return
@@ -981,4 +987,7 @@ class UnifiedDataLoader:
         path = Path(path)
         if path.suffix == ".json":
             return UnifiedDataLoader._load_json(path)
+        if path.suffix == ".npz":
+            with np.load(path, allow_pickle=True) as data:
+                return {key: np.asarray(data[key]) for key in data.files}
         return path.read_bytes()

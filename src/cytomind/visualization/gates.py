@@ -43,6 +43,8 @@ def _create_scatter_trace(
     color_midpoint: float | None = None,
     color_min: float | None = None,
     color_max: float | None = None,
+    show_colorbar: bool = False,
+    colorbar_title: str | None = None,
     showlegend: bool = False,
     name: str | None = "Events",
     use_gl: bool = True,
@@ -61,9 +63,11 @@ def _create_scatter_trace(
             cmid=color_midpoint,
             cmin=color_min,
             cmax=color_max,
-            showscale=False,
+            showscale=show_colorbar,
             line=dict(width=0),
         )
+        if show_colorbar and colorbar_title is not None:
+            marker["colorbar"] = dict(title=colorbar_title)
     else:
         x_sorted = x
         y_sorted = y
