@@ -13,7 +13,8 @@ dependencies = [
     "plotly (>=6.5.2,<7.0.0)",
     "statsmodels (>=0.14.6,<0.15.0)",
     "levenshtein (>=0.27.3,<0.28.0)",
-    "scikit-learn (>=1.7.2,<2.0.0)"
+    "scikit-learn (>=1.7.2,<2.0.0)",
+    "scikit-image (>=0.25,<0.26)"
 ]
 
 [project.optional-dependencies]
