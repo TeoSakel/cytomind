@@ -102,6 +102,14 @@ class AddSamplesStep(BaseStep):
         comp_id: str | None = None
         comps_parsed: list[dict[str, Any]] = []
         for key, mat_txt in _iter_comp_records_from_metadata(fcs.metadata):
+            if "0.-" in mat_txt:
+                step_comp.flag = QCFlag.WARN
+                step_comp.add_reason(
+                    code="COMPENSATION_PARSE_WARNING",
+                    message=(f"Compensation matrix '{key}' in FCS file {fcs_path} contains '0.-' values,",
+                             "which may indicate an issue with how the matrix was stored in metadata.")
+                )
+                mat_txt = mat_txt.replace("0.-", "-0.")
             try:
                 mat = fk.Matrix(mat_txt, detectors)
             except ValueError as e:

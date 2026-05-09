@@ -3,17 +3,26 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import re
-from typing import Any, Callable, ClassVar, Mapping, Sequence, TYPE_CHECKING, TypeVar
+from typing import Any, ClassVar, Mapping, Sequence, TYPE_CHECKING, TypeVar
 
 import anndata as ad
 import numpy as np
 import plotly.graph_objects as go
-from scipy.ndimage import convolve, distance_transform_edt, label as nd_label
+from scipy.ndimage import convolve, distance_transform_edt, gaussian_filter, label as nd_label
 from scipy.signal import find_peaks, peak_prominences
+from scipy.stats import chi2, false_discovery_control
 from skimage.feature import peak_local_max
-from skimage.filters import gaussian, threshold_otsu
+from skimage.filters import (
+    threshold_isodata,
+    threshold_li,
+    threshold_local,
+    threshold_mean,
+    threshold_otsu,
+    threshold_triangle,
+    threshold_yen,
+)
 from skimage.measure import label
-from skimage.segmentation import watershed
+from skimage.segmentation import random_walker, watershed
 
 from cytomind.domain.gates import GateNode
 
@@ -45,12 +54,14 @@ __all__ = [
     "HistogramLandscape2DBuilder",
     "FeatureDetector",
     "ModeDetector",
+    "CurvatureDetector",
     "FeatureSelector",
     "NearestModeSelector",
     "HighestDensitySelector",
     "ModeIdSelector",
     "RegionExtractor",
     "ProminencePeakRegionExtractor",
+    "RandomWalkerRegionExtractor",
     "WatershedRegionExtractor",
     "LevelSetConnectedComponentExtractor",
     "BoundaryBuilder",
@@ -73,6 +84,7 @@ class ModeFeature:
     grid_index: list[int]
     peak_density: float
     properties: dict[str, Any] = field(default_factory=dict)
+    footprint: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +94,7 @@ class ModeFeature:
             "grid_index": [int(v) for v in self.grid_index],
             "peak_density": float(self.peak_density),
             "properties": dict(self.properties),
+            "footprint": None if self.footprint is None else dict(self.footprint),
         }
 
     @classmethod
@@ -93,7 +106,113 @@ class ModeFeature:
             grid_index=[int(v) for v in payload["grid_index"]],
             peak_density=float(payload["peak_density"]),
             properties=dict(payload.get("properties", {})),
+            footprint=(
+                dict(payload["footprint"])
+                if isinstance(payload.get("footprint"), Mapping)
+                else None
+            ),
         )
+
+    def footprint_bounds(self) -> "tuple[np.ndarray, np.ndarray] | None":
+        """Return the AABB of the footprint as ``(lower, upper)`` float32 arrays.
+
+        Supports ``{"bounds": [[lo...], [hi...]]}`` and
+        ``{"lower": [...], "upper": [...]}`` formats.
+        Returns ``None`` when no usable bounds are found.
+        """
+        fp = self.footprint
+        if not isinstance(fp, Mapping):
+            return None
+        raw_bounds = fp.get("bounds")
+        if isinstance(raw_bounds, Sequence) and len(raw_bounds) == 2:
+            lo = np.asarray(raw_bounds[0], dtype=FLOAT_DTYPE).reshape(-1)
+            hi = np.asarray(raw_bounds[1], dtype=FLOAT_DTYPE).reshape(-1)
+            if lo.shape == hi.shape:
+                return lo, hi
+        if "lower" in fp and "upper" in fp:
+            lo = np.asarray(fp["lower"], dtype=FLOAT_DTYPE).reshape(-1)
+            hi = np.asarray(fp["upper"], dtype=FLOAT_DTYPE).reshape(-1)
+            if lo.shape == hi.shape:
+                return lo, hi
+        return None
+
+    def overlaps_roi_with_footprint(self, roi_bounds: Any) -> "bool | None":
+        """Check AABB overlap between this feature's footprint and *roi_bounds*.
+
+        Returns ``None`` when no footprint bounds are available (caller should
+        fall back to point containment).
+        """
+        roi = _normalize_roi_bounds(roi_bounds)
+        if roi is None:
+            return None
+        bounds = self.footprint_bounds()
+        if bounds is None:
+            return None
+        roi_lower, roi_upper = roi
+        feat_lower, feat_upper = bounds
+        if roi_lower.shape != feat_lower.shape or roi_upper.shape != feat_upper.shape:
+            return None
+        return bool(np.all(feat_lower <= roi_upper) and np.all(feat_upper >= roi_lower))
+
+    def within_roi(self, roi_bounds: Any) -> bool:
+        """Return ``True`` if this feature lies inside *roi_bounds*.
+
+        Checks footprint AABB overlap first; falls back to point containment.
+        """
+        if roi_bounds is None:
+            return True
+        overlap = self.overlaps_roi_with_footprint(roi_bounds)
+        if overlap is not None:
+            return overlap
+        normalized = _normalize_roi_bounds(roi_bounds)
+        if normalized is None:
+            return True
+        lower_arr, upper_arr = normalized
+        point = np.asarray(self.point, dtype=FLOAT_DTYPE).reshape(-1)
+        if lower_arr.shape != point.shape or upper_arr.shape != point.shape:
+            return True
+        return bool(np.all(point >= lower_arr) and np.all(point <= upper_arr))
+
+    def footprint_mask(self, shape: "tuple[int, int]") -> "np.ndarray":
+        """Return a boolean mask of shape *shape* representing this feature's footprint.
+
+        Footprint formats resolved in priority order:
+
+        1. ``footprint["grid_mask"]``    – boolean array already shaped like *shape*.
+        2. ``footprint["grid_indices"]`` – array/list of ``[row, col]`` pairs.
+        3. ``footprint["grid_index"]``   – single pair, promoted to length-1 list.
+        4. ``self.grid_index``           – fallback when no footprint is present.
+
+        Out-of-bounds indices raise ``ValueError``.
+        """
+        fp = self.footprint
+
+        if isinstance(fp, Mapping):
+            # format 1: explicit boolean mask
+            raw_mask = fp.get("grid_mask")
+            if raw_mask is not None:
+                mask = np.asarray(raw_mask, dtype=np.bool_)
+                if mask.shape != shape:
+                    raise ValueError(
+                        f"Feature {self.id!r} grid_mask shape {mask.shape!r} "
+                        f"does not match density shape {shape!r}."
+                    )
+                return mask
+
+            # format 2 (+3): index pairs (single pair promoted to length-1)
+            raw_indices = fp.get("grid_indices")
+            raw_single = fp.get("grid_index")
+            if raw_indices is None and isinstance(raw_single, Sequence) and len(raw_single) == 2:
+                raw_indices = [raw_single]
+
+            if isinstance(raw_indices, Sequence) and not isinstance(raw_indices, (str, bytes)):
+                idx = np.asarray(raw_indices, dtype=np.intp)
+                if idx.ndim == 2 and idx.shape[1] == 2:
+                    return _indices_to_mask(idx, shape, self.id)
+
+        # fallback: feature.grid_index
+        idx = np.asarray([self.grid_index], dtype=np.intp)
+        return _indices_to_mask(idx, shape, self.id)
 
 
 @dataclass
@@ -104,6 +223,9 @@ class ExtractionResult:
 
 
 class DensityLandscape(ABC):
+    density: FloatArray
+    counts: IntArray
+
     @property
     @abstractmethod
     def n_dims(self) -> int:
@@ -149,7 +271,7 @@ class Landscape1D(DensityLandscape):
 
     @property
     def n_bins(self) -> int:
-        return max(int(np.asarray(self.bin_edges).shape[0]) - 1, 0)
+        return max(self.bin_edges.shape[0] - 1, 0)
 
     @property
     def is_regular(self) -> bool:
@@ -163,19 +285,17 @@ class Landscape1D(DensityLandscape):
         }
 
     def left_edge_index(self, value: float) -> int:
-        edges = np.asarray(self.bin_edges, dtype=FLOAT_DTYPE)
-        return int(np.searchsorted(edges, value, side="left"))
+        return int(np.searchsorted(self.bin_edges, value, side="left"))
 
     def right_edge_index(self, value: float) -> int:
-        edges = np.asarray(self.bin_edges, dtype=FLOAT_DTYPE)
-        return int(np.searchsorted(edges, value, side="right"))
+        return int(np.searchsorted(self.bin_edges, value, side="right"))
 
     def bin_index(self, value: float) -> int:
         return self.right_edge_index(value) - 1
 
     def digitize(self, values: FloatArray) -> tuple[IntArray, BooleanArray]:
         arr = np.asarray(values, dtype=FLOAT_DTYPE).reshape(-1)
-        idx = np.searchsorted(np.asarray(self.bin_edges, dtype=FLOAT_DTYPE), arr, side="right") - 1
+        idx = np.searchsorted(self.bin_edges, arr, side="right") - 1
         valid = (idx >= 0) & (idx < self.n_bins)
         return np.asarray(idx, dtype=np.int_), np.asarray(valid, dtype=np.bool_)
 
@@ -185,8 +305,8 @@ class Landscape1D(DensityLandscape):
         return left_bin, right_bin
 
     def interval_bounds(self, left_bin: int, right_bin: int) -> tuple[float, float]:
-        edges = np.asarray(self.bin_edges, dtype=FLOAT_DTYPE)
-        return float(edges[left_bin]), float(edges[right_bin + 1])
+        left_val, right_val = self.bin_edges[[left_bin, right_bin + 1]]
+        return float(left_val), float(right_val)
 
     @classmethod
     def from_state(cls, payload: Mapping[str, Any]) -> "Landscape1D":
@@ -203,6 +323,7 @@ class GridLandscape1D(Landscape1D):
     _bin_edges: FloatArray
     density: FloatArray
     counts: IntArray
+    kernel: KernelSpec = field(default_factory=lambda: {"type": "identity", "params": {}})
 
     @property
     def bin_edges(self) -> FloatArray:
@@ -218,6 +339,7 @@ class GridLandscape1D(Landscape1D):
             "bin_edges": np.asarray(self.bin_edges, dtype=FLOAT_DTYPE),
             "density": np.asarray(self.density, dtype=FLOAT_DTYPE),
             "counts": np.asarray(self.counts, dtype=FLOAT_DTYPE),
+            "kernel": _serialize_kernel(self.kernel),
         }
 
     @classmethod
@@ -226,6 +348,7 @@ class GridLandscape1D(Landscape1D):
             _bin_edges=np.asarray(payload["bin_edges"], dtype=FLOAT_DTYPE),
             density=np.asarray(payload["density"], dtype=FLOAT_DTYPE),
             counts=np.asarray(payload["counts"], dtype=np.int_),
+            kernel=_restore_kernel_from_state(payload),
         )
 
 
@@ -316,6 +439,7 @@ class GridLandscape2D(Landscape2D):
     _y_edges: FloatArray
     density: FloatArray
     counts: IntArray
+    kernel: KernelSpec = field(default_factory=lambda: {"type": "identity", "params": {}})
 
     @property
     def x_edges(self) -> FloatArray:
@@ -340,6 +464,7 @@ class GridLandscape2D(Landscape2D):
             "y_edges": np.asarray(self.y_edges, dtype=FLOAT_DTYPE),
             "density": np.asarray(self.density, dtype=FLOAT_DTYPE),
             "counts": np.asarray(self.counts, dtype=FLOAT_DTYPE),
+            "kernel": _serialize_kernel(self.kernel),
         }
 
     @classmethod
@@ -349,6 +474,7 @@ class GridLandscape2D(Landscape2D):
             _y_edges=np.asarray(payload["y_edges"], dtype=FLOAT_DTYPE),
             density=np.asarray(payload["density"], dtype=FLOAT_DTYPE),
             counts=np.asarray(payload["counts"], dtype=np.int_),
+            kernel=_restore_kernel_from_state(payload),
         )
 
 
@@ -359,6 +485,7 @@ class RegularGridLandscape1D(Landscape1D):
     step_count: int
     density: FloatArray
     counts: IntArray
+    kernel: KernelSpec = field(default_factory=lambda: {"type": "identity", "params": {}})
 
     @property
     def bin_edges(self) -> FloatArray:
@@ -405,6 +532,7 @@ class RegularGridLandscape1D(Landscape1D):
             "step_count": int(self.step_count),
             "density": np.asarray(self.density, dtype=FLOAT_DTYPE),
             "counts": np.asarray(self.counts, dtype=np.int_),
+            "kernel": _serialize_kernel(self.kernel),
         }
 
     @classmethod
@@ -415,6 +543,7 @@ class RegularGridLandscape1D(Landscape1D):
             step_count=int(payload["step_count"]),
             density=np.asarray(payload["density"], dtype=FLOAT_DTYPE),
             counts=np.asarray(payload["counts"], dtype=np.int_),
+            kernel=_restore_kernel_from_state(payload),
         )
 
 
@@ -425,6 +554,7 @@ class RegularGridLandscape2D(Landscape2D):
     step_count: tuple[int, int]
     density: FloatArray
     counts: IntArray
+    kernel: KernelSpec = field(default_factory=lambda: {"type": "identity", "params": {}})
 
     def __post_init__(self):
         if self.step_count[0] < 0 or self.step_count[1] < 0:
@@ -498,6 +628,7 @@ class RegularGridLandscape2D(Landscape2D):
             "step_count": [int(self.step_count[0]), int(self.step_count[1])],
             "density": np.asarray(self.density, dtype=FLOAT_DTYPE),
             "counts": np.asarray(self.counts, dtype=np.int_),
+            "kernel": _serialize_kernel(self.kernel),
         }
 
     @classmethod
@@ -511,6 +642,7 @@ class RegularGridLandscape2D(Landscape2D):
             step_count=(int(count_x), int(count_y)),
             density=np.asarray(payload["density"], dtype=FLOAT_DTYPE),
             counts=np.asarray(payload["counts"], dtype=np.int_),
+            kernel=_restore_kernel_from_state(payload),
         )
 
 
@@ -531,6 +663,12 @@ class LandscapeBuilder(SerializableDensityComponent, ABC):
 
 
 class FeatureDetector(SerializableDensityComponent, ABC):
+    def __init__(self, mask_spec: MaskSpecLike = None) -> None:
+        self.mask_spec = _normalize_mask_spec(mask_spec)
+
+    def _serialized_mask_spec(self) -> dict[str, Any] | None:
+        return _serialize_mask_spec(self.mask_spec)
+
     @abstractmethod
     def detect(self, landscape: DensityLandscape) -> list[ModeFeature]:
         pass
@@ -547,6 +685,12 @@ class FeatureSelector(SerializableDensityComponent, ABC):
 
 
 class RegionExtractor(SerializableDensityComponent, ABC):
+    def __init__(self, mask_spec: MaskSpecLike = None) -> None:
+        self.mask_spec = _normalize_mask_spec(mask_spec)
+
+    def _serialized_mask_spec(self) -> dict[str, Any] | None:
+        return _serialize_mask_spec(self.mask_spec)
+
     def extract(
         self,
         landscape: DensityLandscape,
@@ -746,8 +890,21 @@ _FEATURE_SELECTORS: dict[str, type[FeatureSelector]] = {}
 _REGION_EXTRACTORS: dict[str, type[RegionExtractor]] = {}
 _BOUNDARY_BUILDERS: dict[str, type[BoundaryBuilder]] = {}
 ComponentT = TypeVar("ComponentT")
-SmootherLike = str | Mapping[str, Any] | np.ndarray | Callable[[np.ndarray], np.ndarray] | None
+KernelLike = str | Mapping[str, Any] | np.ndarray | None
+KernelSpec = dict[str, Any]
+MaskSpec = dict[str, Any]
+MaskSpecLike = str | Mapping[str, Any] | np.ndarray | None
 StructureLike = str | Sequence[Sequence[int | bool]] | np.ndarray
+
+_GLOBAL_MASK_THRESHOLD_METHODS: dict[str, Any] = {
+    "isodata": threshold_isodata,
+    "li": threshold_li,
+    "mean": threshold_mean,
+    "otsu": threshold_otsu,
+    "triangle": threshold_triangle,
+    "yen": threshold_yen,
+}
+_LOCAL_MASK_THRESHOLD_METHODS = {"local", "local_gaussian", "local_mean", "local_median"}
 
 
 def _register_component(
@@ -788,18 +945,80 @@ def _load_component(
     return component_cls(**params)
 
 
-def _feature_within_roi(feature: ModeFeature, roi_bounds: Any) -> bool:
+def _normalize_roi_bounds(roi_bounds: Any) -> tuple[np.ndarray, np.ndarray] | None:
     if roi_bounds is None:
-        return True
+        return None
     if not isinstance(roi_bounds, Sequence) or len(roi_bounds) != 2:
-        return True
+        return None
     lower, upper = roi_bounds
     lower_arr = np.asarray(lower, dtype=FLOAT_DTYPE).reshape(-1)
     upper_arr = np.asarray(upper, dtype=FLOAT_DTYPE).reshape(-1)
-    point = np.asarray(feature.point, dtype=FLOAT_DTYPE).reshape(-1)
-    if lower_arr.shape != point.shape or upper_arr.shape != point.shape:
-        return True
-    return bool(np.all(point >= lower_arr) and np.all(point <= upper_arr))
+    return lower_arr, upper_arr
+
+
+
+def _indices_to_mask(
+    indices: "np.ndarray",
+    shape: tuple[int, int],
+    feature_id: str,
+) -> np.ndarray:
+    """Scatter a (N, 2) int array of ``[row, col]`` pairs into a boolean mask.
+
+    Raises ``ValueError`` if any index is out of bounds for *shape*.
+    """
+    rows, cols = shape
+    r_arr, c_arr = indices[:, 0], indices[:, 1]
+    oob = (r_arr < 0) | (r_arr >= rows) | (c_arr < 0) | (c_arr >= cols)
+    if oob.any():
+        bad = indices[oob].tolist()
+        raise ValueError(
+            f"Feature {feature_id!r} grid_indices contain out-of-bounds pairs {bad!r} "
+            f"for grid shape {shape!r}."
+        )
+    mask = np.zeros(shape, dtype=np.bool_)
+    mask[r_arr, c_arr] = True
+    return mask
+
+
+
+def _build_marker_image_2d(
+    features: Sequence["ModeFeature"],
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Build a 2-D integer markers array for watershed / random_walker.
+
+    Each feature is assigned a unique positive integer label (1-based,
+    matching its position in *features*).  Unassigned pixels are 0.
+
+    Algorithm:
+    1. Convert every feature footprint to a boolean mask via
+       ``ModeFeature.footprint_mask``.
+    2. Stack masks and count how many features claim each cell.
+    3. Label cells that are claimed by exactly one feature (no conflict)
+       directly with that feature's marker id.
+    4. Any feature that received zero marker pixels after step 3 (all its
+       cells were contested) is force-assigned the first cell of its mask.
+    """
+    n = len(features)
+    masks = np.stack([f.footprint_mask(shape) for f in features])  # (n, rows, cols)
+    claim_count = masks.sum(axis=0)                                # (rows, cols) int
+    unique = claim_count == 1                                      # uncontested cells
+
+    markers = np.zeros(shape, dtype=np.int_)
+    for marker_id, mask in enumerate(masks, start=1):
+        markers[mask & unique] = marker_id
+
+    # Force-assign any feature that ended up with no marker pixels.
+    for marker_id, (feature, mask) in enumerate(zip(features, masks), start=1):
+        if not (markers == marker_id).any():
+            r_f, c_f = np.nonzero(mask)
+            if r_f.size == 0:
+                raise ValueError(
+                    f"Feature {feature.id!r} has no valid marker cells in a grid of shape {shape!r}."
+                )
+            markers[r_f[0], c_f[0]] = marker_id
+
+    return markers
 
 
 
@@ -955,22 +1174,229 @@ def _frame_path_between(start: FloatArray, end: FloatArray, *, xmin: float, xmax
     return np.asarray(path, dtype=FLOAT_DTYPE)
 
 
-def _normalize_bandwidth(
-    bandwidth: float | Sequence[float],
-    n_dims: int,
-) -> np.ndarray:
-    arr = np.asarray(bandwidth, dtype=FLOAT_DTYPE)
-    if arr.ndim == 0:
-        arr = np.repeat(arr, n_dims)
-    if arr.shape != (n_dims,):
-        raise ValueError(f"bandwidth must be scalar or length {n_dims}.")
-    if np.any(arr <= 0):
-        raise ValueError("bandwidth values must be positive.")
-    return arr
+def _dflt_bandwidth_px(data: np.ndarray, step_sizes: np.ndarray) -> np.ndarray:
+    """Compute default Gaussian sigma in pixel units using the dfltBWrange/featureSignif rule.
+
+    For each axis, estimates a robust scale (min of std-dev and IQR-based scale),
+    computes lower and upper rule-of-thumb bandwidths in data units, then takes a
+    weighted geometric mean (same as ``featureSignif``'s ``h.init``) and converts
+    to pixel units by dividing by the histogram step size.
+
+    Parameters
+    ----------
+    data
+        Array of shape ``(n_events, d)``.
+    step_sizes
+        Per-axis histogram bin widths in data units, shape ``(d,)``.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    step_sizes = np.asarray(step_sizes, dtype=np.float64)
+    n, d = data.shape
+    # Upper-bound factor (r=2): (4 / ((d + 2r + 2) * n))^(1 / (d + 2r + 4))
+    cmb_fac_upp = (4.0 / ((d + 6) * n)) ** (1.0 / (d + 8))
+    # Lower-bound factor (r=0): (4 / ((d + 2) * n))^(1 / (d + 4))
+    cmb_fac_low = (4.0 / ((d + 2) * n)) ** (1.0 / (d + 4))
+    # Robust scale: min(std, IQR / 1.349) per axis
+    IQR_NORM = 1.3489795  # norm.ppf(0.75) - norm.ppf(0.25)
+    std_devs = np.std(data, axis=0, ddof=1)
+    iqr_vals = (np.percentile(data, 75, axis=0) - np.percentile(data, 25, axis=0)) / IQR_NORM
+    sig_hats = np.minimum(std_devs, iqr_vals)
+    h_upp = cmb_fac_upp * sig_hats
+    h_low = 0.1 * cmb_fac_low * sig_hats
+    # Geometric mean at 1/4 lower + 3/4 upper (featureSignif default)
+    h_init = h_low ** 0.25 * h_upp ** 0.75
+    return h_init / step_sizes
 
 
-def _relative_threshold(values: FloatArray, threshold_rel: float) -> float:
-    return float(np.quantile(values[np.isfinite(values)], q=threshold_rel))
+# TODO: consider organizaing all masking functions under LandscapeMasker class.
+def _resolve_scalar_threshold(values: FloatArray, threshold_spec: MaskSpecLike) -> float:
+    arr = np.asarray(values, dtype=FLOAT_DTYPE).reshape(-1)
+    finite_values = arr[np.isfinite(arr)]
+    if finite_values.size == 0:
+        return 0.0
+
+    spec = _normalize_mask_spec(threshold_spec)
+    spec_type = str(spec["type"])
+
+    def _required_float(params: Mapping[str, Any], *keys: str, label: str) -> float:
+        for key in keys:
+            if key in params and params[key] is not None:
+                return float(params[key])
+        joined = ", ".join(keys)
+        raise ValueError(f"{label} requires one of params.{joined}.")
+
+    if spec_type == "none":
+        return float("-inf")
+    if spec_type == "absolute":
+        params = dict(spec.get("params", {}))
+        return _required_float(params, "value", "threshold", label="Absolute threshold specs")
+    if spec_type == "relative":
+        params = dict(spec.get("params", {}))
+        relative = _required_float(params, "value", "relative", label="Relative threshold specs")
+        if relative < 0.0 or relative > 1.0:
+            raise ValueError("Relative threshold must be between 0 and 1.")
+        min_val = float(np.min(finite_values))
+        max_val = float(np.max(finite_values))
+        return min_val + relative * (max_val - min_val)
+    if spec_type != "threshold":
+        raise ValueError("Scalar threshold specs must use type='threshold', 'absolute', or 'relative'.")
+
+    params = dict(spec.get("params", {}))
+    method = str(params.get("method", "quantile"))
+
+    if method == "quantile":
+        quantile = float(params.get("quantile", params.get("q", 0.95)))
+        if quantile < 0.0 or quantile > 1.0:
+            raise ValueError("Quantile threshold must be between 0 and 1.")
+        return float(np.quantile(finite_values, quantile))
+    if method in _GLOBAL_MASK_THRESHOLD_METHODS:
+        return float(_GLOBAL_MASK_THRESHOLD_METHODS[method](finite_values))
+    if method in _LOCAL_MASK_THRESHOLD_METHODS:
+        raise ValueError(f"Local threshold method {method!r} is not valid for scalar threshold resolution.")
+    raise ValueError(f"Unsupported scalar threshold method {method!r}.")
+
+
+def _normalize_mask_spec(mask_spec: MaskSpecLike) -> MaskSpec:
+    if mask_spec is None:
+        return {"type": "none", "params": {}}
+    if isinstance(mask_spec, np.ndarray):
+        return {
+            "type": "array",
+            "params": {"mask": np.asarray(mask_spec, dtype=np.bool_)},
+        }
+    if isinstance(mask_spec, str):
+        normalized = mask_spec.strip().lower()
+        if normalized in {"", "none"}:
+            return {"type": "none", "params": {}}
+        supported = _LOCAL_MASK_THRESHOLD_METHODS | set(_GLOBAL_MASK_THRESHOLD_METHODS) | {"quantile"}
+        if normalized not in supported:
+            raise ValueError(
+                f"Unknown mask method {mask_spec!r}. Supported methods are "
+                f"{sorted(_GLOBAL_MASK_THRESHOLD_METHODS)} plus local/local_gaussian/local_mean/local_median/quantile."
+            )
+        return {
+            "type": "threshold",
+            "params": {"method": normalized},
+        }
+    if not isinstance(mask_spec, Mapping):
+        raise TypeError("mask_spec must be a string, mapping, ndarray, or None.")
+
+    mask_type = str(mask_spec.get("type", "threshold")).strip().lower()
+    params = dict(mask_spec.get("params", {}))
+    if mask_type == "none":
+        return {"type": "none", "params": {}}
+    if mask_type == "array":
+        mask = np.asarray(params.get("mask"), dtype=np.bool_)
+        return {"type": "array", "params": {"mask": mask}}
+    if mask_type in {"absolute", "relative"}:
+        if "value" not in params and "threshold" not in params and "relative" not in params:
+            raise ValueError(
+                f"mask_spec.type={mask_type!r} requires params.value (or params.threshold/params.relative)."
+            )
+        if "threshold" in params and "value" not in params:
+            params["value"] = params["threshold"]
+        if "relative" in params and "value" not in params:
+            params["value"] = params["relative"]
+        return {"type": mask_type, "params": params}
+
+    if mask_type != "threshold":
+        raise ValueError("mask_spec.type must be one of 'none', 'array', 'threshold', 'absolute', or 'relative'.")
+
+    method = str(params.get("method", "otsu")).strip().lower()
+    supported = _LOCAL_MASK_THRESHOLD_METHODS | set(_GLOBAL_MASK_THRESHOLD_METHODS) | {"quantile"}
+    if method not in supported:
+        raise ValueError(
+            f"Unsupported threshold method {method!r}. Supported methods are "
+            f"{sorted(_GLOBAL_MASK_THRESHOLD_METHODS)} plus local/local_gaussian/local_mean/local_median/quantile."
+        )
+    params["method"] = method
+    return {"type": "threshold", "params": params}
+
+
+def _serialize_mask_spec(mask_spec: MaskSpecLike) -> dict[str, Any] | None:
+    normalized = _normalize_mask_spec(mask_spec)
+    if normalized["type"] == "none":
+        return None
+    if normalized["type"] == "array":
+        raise ValueError("Array mask specs are runtime-only and cannot be serialized in gate hyperparameters.")
+    return {
+        "type": str(normalized["type"]),
+        "params": dict(normalized.get("params", {})),
+    }
+
+
+def _resolve_density_mask(density: FloatArray, mask_spec: MaskSpecLike = None) -> BooleanArray:
+    arr = np.asarray(density, dtype=FLOAT_DTYPE)
+    finite_mask = np.asarray(np.isfinite(arr), dtype=np.bool_)
+    spec = _normalize_mask_spec(mask_spec)
+
+    if spec["type"] == "none":
+        return finite_mask
+    if spec["type"] == "array":
+        mask = np.asarray(spec["params"]["mask"], dtype=np.bool_)
+        if mask.shape != arr.shape:
+            raise ValueError(f"Array mask shape {mask.shape!r} does not match density shape {arr.shape!r}.")
+        return mask & finite_mask
+
+    params = dict(spec.get("params", {}))
+    spec_type = str(spec["type"])
+    method = str(params.get("method", "otsu"))
+    finite_values = arr[finite_mask]
+    if finite_values.size == 0:
+        return finite_mask
+
+    def _required_float(*keys: str, label: str) -> float:
+        for key in keys:
+            if key in params and params[key] is not None:
+                return float(params[key])
+        joined = ", ".join(keys)
+        raise ValueError(f"{label} requires one of params.{joined}.")
+
+    threshold_value: float | np.ndarray
+    if spec_type == "absolute":
+        threshold_value = _required_float("value", "threshold", label="Absolute mask threshold")
+    elif spec_type == "relative":
+        relative = _required_float("value", "relative", label="Relative mask threshold")
+        if relative < 0.0 or relative > 1.0:
+            raise ValueError("Relative mask threshold must be between 0 and 1.")
+        min_val = float(np.min(finite_values))
+        max_val = float(np.max(finite_values))
+        threshold_value = min_val + relative * (max_val - min_val)
+    elif method == "quantile":
+        quantile = float(params.get("quantile", params.get("q", 0.95)))
+        if quantile < 0.0 or quantile > 1.0:
+            raise ValueError("Quantile mask threshold must be between 0 and 1.")
+        threshold_value = float(np.quantile(finite_values, quantile))
+    elif method in _GLOBAL_MASK_THRESHOLD_METHODS:
+        threshold_value = float(_GLOBAL_MASK_THRESHOLD_METHODS[method](finite_values))
+    elif method in _LOCAL_MASK_THRESHOLD_METHODS:
+        if arr.ndim != 2:
+            raise ValueError(f"Local threshold method {method!r} only supports 2D landscapes.")
+        block_size = int(params.get("block_size", 35))
+        if block_size < 3 or block_size % 2 == 0:
+            raise ValueError("Local threshold block_size must be an odd integer >= 3.")
+        local_kwargs: dict[str, Any] = {
+            "block_size": block_size,
+            "mode": str(params.get("mode", "reflect")),
+        }
+        local_method = "gaussian"
+        if method == "local_mean":
+            local_method = "mean"
+        elif method == "local_median":
+            local_method = "median"
+        local_kwargs["method"] = local_method
+        threshold_value = np.asarray(
+            threshold_local( # pyright: ignore[reportArgumentType]
+                arr,
+                **local_kwargs,
+            ),
+            dtype=FLOAT_DTYPE,
+        )
+    else:
+        raise ValueError(f"Unsupported threshold method {method!r}.")
+
+    resolved_mask = np.asarray(arr >= threshold_value, dtype=np.bool_) & finite_mask
+    return resolved_mask if np.any(resolved_mask) else finite_mask
 
 
 def _is_close_to_any(value: float, candidates: FloatArray, *, atol: float = 1e-6) -> bool:
@@ -983,79 +1409,190 @@ def _is_grid_corner(point: FloatArray, *, x_edges: FloatArray, y_edges: FloatArr
     return _is_close_to_any(float(pt[0]), x_edges, atol=atol) and _is_close_to_any(float(pt[1]), y_edges, atol=atol)
 
 
-def _serialize_smoother(smoother: SmootherLike) -> dict[str, Any]:
-    if smoother is None:
-        return {"type": "none"}
-    if isinstance(smoother, str):
-        return {"type": smoother}
-    if isinstance(smoother, Mapping):
-        return dict(smoother)
-    if callable(smoother):
-        return {
-            "type": "callable",
-            "name": getattr(smoother, "__name__", smoother.__class__.__name__),
-        }
-
-    kernel = np.asarray(smoother, dtype=FLOAT_DTYPE)
-    if kernel.ndim not in {1, 2}:
-        raise ValueError("Kernel smoother must be one- or two-dimensional.")
-    return {
-        "type": "kernel",
-        "kernel": kernel,
-    }
+def _serialize_kernel(kernel_spec: KernelSpec) -> dict[str, Any]:
+    """Serialize a kernel spec, converting any custom kernel array to float32."""
+    spec = dict(kernel_spec)
+    if spec.get("type") == "custom":
+        params = dict(spec.get("params", {}))
+        arr = params.get("kernel")
+        if arr is not None:
+            params["kernel"] = np.asarray(arr, dtype=FLOAT_DTYPE)
+        spec["params"] = params
+    return spec
 
 
-def _restore_smoother(smoother: SmootherLike, *, n_dims: int) -> SmootherLike:
-    if smoother is None or isinstance(smoother, str) or callable(smoother):
-        return smoother
-    if not isinstance(smoother, Mapping):
-        kernel = np.asarray(smoother, dtype=FLOAT_DTYPE)
-        if kernel.ndim != n_dims:
-            raise ValueError(f"Kernel smoother dimensionality must match landscape dimensionality ({n_dims}).")
-        return kernel
+def _resolve_kernel(kernel: KernelLike, *, n_dims: int) -> KernelSpec:
+    """Resolve a kernel shorthand to a normalized spec dict."""
+    if kernel is None:
+        return {"type": "identity", "params": {}}
+    if isinstance(kernel, str):
+        if kernel in {"gaussian", "gauss"}:
+            return {"type": "gaussian", "params": {"mode": "reflect"}}
+        if kernel in {"none", "identity"}:
+            return {"type": "identity", "params": {}}
+        raise ValueError(f"Unknown kernel string {kernel!r}. Use 'gaussian', 'identity', or None.")
+    if isinstance(kernel, Mapping):
+        ktype = str(kernel.get("type", "identity"))
+        if ktype not in {"identity", "gaussian", "custom"}:
+            raise ValueError(f"Unknown kernel type {ktype!r}. Supported: 'identity', 'gaussian', 'custom'.")
+        return {"type": ktype, "params": dict(kernel.get("params", {}))}
+    arr = np.asarray(kernel, dtype=FLOAT_DTYPE)
+    if arr.ndim not in {1, 2}:
+        raise ValueError("Custom kernel array must be 1D or 2D.")
+    if arr.ndim != n_dims:
+        raise ValueError(f"Custom kernel array dimensionality ({arr.ndim}) must match landscape dimensionality ({n_dims}).")
+    return {"type": "custom", "params": {"kernel": arr}}
 
-    smoother_type = str(smoother.get("type", "none"))
-    if smoother_type in {"none", "gaussian"}:
-        return None if smoother_type == "none" else "gaussian"
-    if smoother_type == "kernel":
-        kernel = np.asarray(smoother.get("kernel"), dtype=FLOAT_DTYPE)
-        if kernel.ndim != n_dims:
-            raise ValueError(f"Kernel smoother dimensionality must match landscape dimensionality ({n_dims}).")
-        return kernel
-    if smoother_type == "callable":
-        raise ValueError("Callable smoothers cannot be reconstructed from serialized specs.")
-    raise ValueError(f"Unknown smoother type {smoother_type!r}.")
+
+def _restore_kernel_from_state(payload: Mapping[str, Any]) -> KernelSpec:
+    """Restore a kernel spec from a landscape state payload."""
+    raw = payload.get("kernel", {"type": "identity", "params": {}})
+    if not isinstance(raw, Mapping):
+        return {"type": "identity", "params": {}}
+    spec = dict(raw)
+    if spec.get("type") == "custom":
+        params = dict(spec.get("params", {}))
+        arr = params.get("kernel")
+        if arr is not None:
+            params["kernel"] = np.asarray(arr, dtype=FLOAT_DTYPE)
+        spec["params"] = params
+    return spec
 
 
-def _apply_smoother(
+def _apply_kernel(
     values: np.ndarray,
     *,
-    smoother: SmootherLike,
-    bandwidth: FloatArray,
-    grid_spacing: FloatArray,
+    kernel_spec: KernelSpec,
 ) -> FloatArray:
-    arr = np.asarray(values, dtype=FLOAT_DTYPE)
-    if smoother is None or smoother == "none":
-        return arr
-    if smoother == "gaussian":
-        sigma = bandwidth
-        sigma_arg: float | tuple[float, ...]
-        sigma_arg = float(sigma[0]) if sigma.size == 1 else tuple(float(v) for v in sigma)
-        return np.asarray(gaussian(arr, sigma=sigma_arg, preserve_range=True), dtype=FLOAT_DTYPE) # pyright: ignore[reportArgumentType]
-    if callable(smoother):
-        smoothed = np.asarray(smoother(arr), dtype=FLOAT_DTYPE)
-        if smoothed.shape != arr.shape:
-            raise ValueError("Callable smoother must return an array with the same shape as the input grid.")
-        return smoothed
+    """Apply a kernel to a grid of values.
 
-    kernel = np.asarray(smoother, dtype=FLOAT_DTYPE)
-    if kernel.ndim != arr.ndim:
-        raise ValueError("Kernel smoother dimensionality must match the input grid.")
-    kernel_sum = float(np.sum(kernel))
-    if np.isclose(kernel_sum, 0.0):
-        raise ValueError("Kernel smoother sum must be non-zero.")
-    kernel = kernel / kernel_sum
-    return np.asarray(convolve(arr, kernel, mode="nearest"), dtype=FLOAT_DTYPE)
+    Parameters
+    ----------
+    values
+        The grid array to transform (counts or density).
+    kernel_spec
+        Normalized kernel spec dict with ``type`` in ``{'identity', 'gaussian', 'custom'}``.
+        ``params`` is passed directly to the underlying function (``gaussian_filter`` or
+        ``convolve``), with the exception that ``custom`` extracts and normalizes
+        ``params["kernel"]`` before forwarding the remaining kwargs.
+    """
+    arr = np.asarray(values, dtype=FLOAT_DTYPE)
+    ktype = kernel_spec.get("type", "identity")
+    if ktype == "identity":
+        return arr
+    if ktype == "gaussian":
+        params = dict(kernel_spec.get("params", {}))
+        # Builder-only control for auto sigma estimation; never forwarded to scipy.
+        params.pop("sigma_adjust", None)
+        sigma_raw = params.pop("sigma")
+        sigma_arg: float | list[float] = float(sigma_raw[0]) if len(sigma_raw) == 1 else [float(v) for v in sigma_raw]
+        params.setdefault("mode", "reflect")
+        return np.asarray(gaussian_filter(arr, sigma=sigma_arg, **params), dtype=FLOAT_DTYPE)
+    if ktype == "custom":
+        params = dict(kernel_spec.get("params", {}))
+        k = np.asarray(params.pop("kernel"), dtype=FLOAT_DTYPE)
+        if k.ndim != arr.ndim:
+            raise ValueError(
+                f"Custom kernel dimensionality ({k.ndim}) must match the input grid ({arr.ndim})."
+            )
+        k_sum = float(np.sum(k))
+        if np.isclose(k_sum, 0.0):
+            raise ValueError("Custom kernel weights sum to zero.")
+        params.setdefault("mode", "nearest")
+        return np.asarray(convolve(arr, k / k_sum, **params), dtype=FLOAT_DTYPE)
+    raise ValueError(f"Unknown kernel type {ktype!r}.")
+
+
+def _compute_landscape_derivatives(landscape: "DensityLandscape") -> "dict[str, Any]":
+    """Compute gradient and Hessian of the density estimate from a Gaussian-smoothed landscape.
+
+    Differentiation is performed on the normalised histogram
+    ``H_norm = counts / (n * prod(step_sizes))`` rather than on
+    ``landscape.density``.  ``landscape.density`` equals ``G_σ * H_norm``
+    (already smoothed); re-applying the derivative Gaussian filter to ``H_norm``
+    with the original σ yields estimates with the correct effective bandwidth.
+    Differentiating ``landscape.density`` would effectively use σ·√2.
+
+    Only ``RegularGridLandscape1D`` and ``RegularGridLandscape2D`` with a
+    Gaussian kernel are supported.  Other landscape types raise ``TypeError``
+    and non-Gaussian kernels raise ``ValueError``.
+
+    Parameters
+    ----------
+    landscape
+        A fitted regular-grid density landscape with a Gaussian kernel.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``"gradient"``: tuple of FLOAT_DTYPE arrays (one per axis), physical units
+      (density per data unit).
+    * ``"hessian"``: tuple of FLOAT_DTYPE arrays.
+      1D: ``(f2,)``; 2D: ``(Hxx, Hxy, Hyy)``.
+    * ``"eigenvalues"``: tuple of FLOAT_DTYPE arrays.
+      1D: ``(f2,)`` (the only curvature is the second derivative itself);
+      2D: ``(l_min, l_max)`` — smaller and larger eigenvalue of the Hessian.
+    """
+    if not isinstance(landscape, (RegularGridLandscape1D, RegularGridLandscape2D)):
+        raise TypeError(
+            "_compute_landscape_derivatives only supports RegularGridLandscape1D and "
+            f"RegularGridLandscape2D, got {type(landscape).__name__!r}."
+        )
+    kernel = landscape.kernel
+    if kernel.get("type") != "gaussian":
+        raise ValueError(
+            "_compute_landscape_derivatives only supports Gaussian kernels, "
+            f"got {kernel.get('type')!r}."
+        )
+    params = dict(kernel.get("params", {}))
+    sigma_px = params["sigma"]  # list: 1D → [σ_px]; 2D → [σ_y_px, σ_x_px]
+    mode: str = params.get("mode", "reflect")  # type: ignore[assignment]
+
+    counts = landscape.counts
+    n = float(counts.sum())
+    if n <= 0.0:
+        raise ValueError("Landscape has no events (counts sum to zero).")
+
+    if isinstance(landscape, RegularGridLandscape1D):
+        dx = float(landscape.step_size)
+        sigma_1d = float(sigma_px[0])
+        H_norm = counts / (n * dx)
+        gx = gaussian_filter(H_norm, sigma=sigma_1d, mode=mode, order=1) / dx
+        f2 = gaussian_filter(H_norm, sigma=sigma_1d, mode=mode, order=2) / (dx * dx)
+        return {
+            "gradient": (gx,),
+            "hessian": (f2,),
+            "eigenvalues": (f2,),
+        }
+
+    # RegularGridLandscape2D:
+    #   counts.shape = (n_y, n_x)  — axis 0 = y, axis 1 = x
+    #   sigma_px     = [σ_y_px, σ_x_px]
+    #   step_size    = (step_x, step_y)
+    dx, dy = landscape.step_size
+    dx, dy = float(dx), float(dy)
+    sigma_arr = [float(sigma_px[0]), float(sigma_px[1])]  # [σ_y_px, σ_x_px]
+    H_norm = counts / (n * dx * dy)
+    kw: dict[str, Any] = {"sigma": sigma_arr, "mode": mode}
+    # Gradient (axis 1 = x, axis 0 = y)
+    grad_x = gaussian_filter(H_norm, order=(0, 1), **kw) / dx  # type: ignore[call-arg]
+    grad_y = gaussian_filter(H_norm, order=(1, 0), **kw) / dy  # type: ignore[call-arg]
+    # Hessian
+    Hxx = gaussian_filter(H_norm, order=(0, 2), **kw) / (dx * dx)  # type: ignore[call-arg]
+    Hyy = gaussian_filter(H_norm, order=(2, 0), **kw) / (dy * dy)  # type: ignore[call-arg]
+    Hxy = gaussian_filter(H_norm, order=(1, 1), **kw) / (dx * dy)  # type: ignore[call-arg]
+    # Eigenvalues (analytical via trace/determinant)
+    tr = Hxx + Hyy
+    disc = np.maximum(tr * tr - 4.0 * (Hxx * Hyy - Hxy * Hxy), 0.0)
+    sqrt_disc = np.sqrt(disc)
+    l_min = (tr - sqrt_disc) * 0.5
+    l_max = (tr + sqrt_disc) * 0.5
+    return {
+        "gradient": (grad_x, grad_y),
+        "hessian": (Hxx, Hxy, Hyy),
+        "eigenvalues": (l_min, l_max),
+    }
 
 
 @_register_component(_LANDSCAPE_BUILDERS, "histogram1d")
@@ -1065,44 +1602,32 @@ class HistogramLandscape1DBuilder(LandscapeBuilder):
 
     def __init__(
         self,
-        bandwidth: float = 1.0,
         grid_size: int = 256,
         pad_factor: float = 0.05,
-        smoother: SmootherLike = "gaussian",
-        log_density: bool = True,
-        log_eps: float = 1e-9,
-        smooth_before_log: bool = True,
+        kernel: KernelLike = "gaussian",
     ) -> None:
         """Configure a 1D histogram-based density landscape builder.
 
         Parameters
         ----------
-        bandwidth
-            Smoothing bandwidth in grid/pixel units. When ``smoother="gaussian"``,
-            this is used directly as the Gaussian sigma on the histogram raster.
         grid_size
             Number of histogram bins used to discretize the axis.
         pad_factor
             Extra range padding added on both sides before histogramming, expressed as
-            a fraction of the observed data span.
-        smoother
-            Smoothing strategy applied to the histogram grid. Supports ``"gaussian"``,
-            ``None``, a kernel array, or a callable.
-        log_density
-            Whether to log-transform the landscape after histogramming.
-        log_eps
-            Small positive constant added before the log transform to avoid ``log(0)``.
-        smooth_before_log
-            If ``True``, smooth counts first and then apply the log transform. If
-            ``False``, log-transform counts first and smooth the logged landscape.
+            a fraction of an IQR-based standard-deviation estimate
+            ``(Q3 - Q1) / 1.3489795``.
+        kernel
+            Kernel applied to the histogram grid to convert counts to density.
+            Supports ``"gaussian"``, ``None``/``"identity"``, a custom kernel array,
+            or a normalized spec dict ``{"type": ..., "params": {...}}``.
+            For ``"gaussian"``, include ``"sigma"`` in ``params`` to fix the bandwidth
+            in pixel units; omit it to auto-compute a data-driven default.
+            Optionally include ``"sigma_adjust"`` (default ``1.0``) to scale only the
+            auto-computed sigma.
         """
-        self.bandwidth = float(bandwidth)
         self.grid_size = int(grid_size)
         self.pad_factor = float(pad_factor)
-        self.smoother = _restore_smoother(smoother, n_dims=1)
-        self.log_density = bool(log_density)
-        self.log_eps = float(log_eps)
-        self.smooth_before_log = bool(smooth_before_log)
+        self.kernel = _resolve_kernel(kernel, n_dims=1)
         if self.grid_size < 8:
             raise ValueError("grid_size must be at least 8 for HistogramLandscape1DBuilder.")
 
@@ -1110,13 +1635,9 @@ class HistogramLandscape1DBuilder(LandscapeBuilder):
         return {
             "type": self.component_type,
             "params": {
-                "bandwidth": self.bandwidth,
                 "grid_size": self.grid_size,
                 "pad_factor": self.pad_factor,
-                "smoother": _serialize_smoother(self.smoother),
-                "log_density": self.log_density,
-                "log_eps": self.log_eps,
-                "smooth_before_log": self.smooth_before_log,
+                "kernel": _serialize_kernel(self.kernel),
             },
         }
 
@@ -1126,43 +1647,34 @@ class HistogramLandscape1DBuilder(LandscapeBuilder):
             raise ValueError("Cannot build a density landscape from empty data.")
         vmin = float(np.min(values))
         vmax = float(np.max(values))
-        span = max(vmax - vmin, 1e-6)
-        pad = span * self.pad_factor
+        iqr_std = float((np.percentile(values, 75.0) - np.percentile(values, 25.0)) / 1.3489795)
+        pad_scale = max(iqr_std, 1e-6)
+        pad = pad_scale * self.pad_factor
         edges = np.linspace(vmin - pad, vmax + pad, self.grid_size + 1, dtype=FLOAT_DTYPE)
         counts, _ = np.histogram(values, bins=edges)
         counts_f = counts.astype(FLOAT_DTYPE)
-        bandwidth = np.asarray([self.bandwidth], dtype=FLOAT_DTYPE)
-        grid_spacing = np.asarray([max(edges[1] - edges[0], 1e-9)], dtype=FLOAT_DTYPE)
-        if self.log_density:
-            if self.smooth_before_log:
-                smoothed = _apply_smoother(
-                    counts_f,
-                    smoother=self.smoother,
-                    bandwidth=bandwidth,
-                    grid_spacing=grid_spacing,
-                )
-                density = np.log(np.maximum(smoothed, 0.0) + self.log_eps)
-            else:
-                density = np.log(np.maximum(counts_f, 0.0) + self.log_eps)
-                density = _apply_smoother(
-                    density,
-                    smoother=self.smoother,
-                    bandwidth=bandwidth,
-                    grid_spacing=grid_spacing,
-                )
-        else:
-            density = _apply_smoother(
-                counts_f,
-                smoother=self.smoother,
-                bandwidth=bandwidth,
-                grid_spacing=grid_spacing,
-            )
+        step_size = float(edges[1] - edges[0])
+        kernel_spec: KernelSpec = dict(self.kernel)
+        if kernel_spec["type"] == "gaussian":
+            params = dict(kernel_spec.get("params", {}))
+            sigma_adjust = float(params.get("sigma_adjust", 1.0))
+            if sigma_adjust <= 0.0:
+                raise ValueError("Gaussian kernel params.sigma_adjust must be > 0.")
+            if "sigma" not in params:
+                sigma_px = _dflt_bandwidth_px(values.reshape(-1, 1), np.array([step_size])) * sigma_adjust
+                params["sigma"] = [float(sigma_px[0])]
+            params.setdefault("mode", "reflect")
+            kernel_spec = {"type": "gaussian", "params": params}
+        smoothed = _apply_kernel(counts_f, kernel_spec=kernel_spec)
+        total_events = float(np.sum(counts_f))
+        density = smoothed / (total_events * step_size)
         return RegularGridLandscape1D(
             start=float(edges[0]),
             step_size=float(edges[1] - edges[0]),
             step_count=int(self.grid_size),
             density=density,
             counts=counts.astype(np.int_),
+            kernel=kernel_spec,
         )
 
 
@@ -1173,37 +1685,30 @@ class HistogramLandscape2DBuilder(LandscapeBuilder):
 
     def __init__(
         self,
-        bandwidth: float | Sequence[float] = 1.0,
         grid_size: int | Sequence[int] = 256,
         pad_factor: float = 0.05,
-        smoother: SmootherLike = "gaussian",
-        log_density: bool = True,
-        log_eps: float = 1e-9,
-        smooth_before_log: bool = True,
+        kernel: KernelLike = "gaussian",
     ) -> None:
         """Configure a 2D histogram-based density landscape builder.
 
         Parameters
         ----------
-        bandwidth
-            Smoothing bandwidth in grid/pixel units for ``x`` and ``y``. A scalar
-            applies to both axes; a length-2 sequence sets them independently.
         grid_size
             Number of histogram bins per axis. A scalar uses the same resolution on
             both axes; a length-2 sequence sets ``x`` and ``y`` resolutions separately.
         pad_factor
             Extra range padding added around the observed data before histogramming,
-            expressed as a fraction of the data span on each axis.
-        smoother
-            Smoothing strategy applied to the 2D histogram grid. Supports
-            ``"gaussian"``, ``None``, a kernel array, or a callable.
-        log_density
-            Whether to log-transform the landscape after histogramming.
-        log_eps
-            Small positive constant added before the log transform to avoid ``log(0)``.
-        smooth_before_log
-            If ``True``, smooth counts first and then apply the log transform. If
-            ``False``, log-transform counts first and smooth the logged landscape.
+            expressed as a fraction of an IQR-based standard-deviation estimate on
+            each axis: ``(Q3 - Q1) / 1.3489795``.
+        kernel
+            Kernel applied to the 2D histogram grid to convert counts to density.
+            Supports ``"gaussian"``, ``None``/``"identity"``, a custom 2D kernel
+            array, or a normalized spec dict.
+            For ``"gaussian"``, include ``"sigma"`` in ``params`` as a length-2 list
+            ``[sigma_y, sigma_x]`` (array-axis order) to fix the bandwidth in pixel
+            units; omit it to auto-compute a data-driven default per axis.
+            Optionally include ``"sigma_adjust"`` (default ``1.0``) to scale only the
+            auto-computed sigma.
         """
         if isinstance(grid_size, Sequence) and not isinstance(grid_size, (str, bytes)):
             grid_arr = np.asarray(grid_size, dtype=np.int_)
@@ -1214,24 +1719,16 @@ class HistogramLandscape2DBuilder(LandscapeBuilder):
             self.grid_size = (int(grid_size), int(grid_size))
         if min(self.grid_size) < 8:
             raise ValueError("grid_size must be at least 8 in both dimensions for HistogramLandscape2DBuilder.")
-        self.bandwidth = tuple(float(v) for v in _normalize_bandwidth(bandwidth, 2))
         self.pad_factor = float(pad_factor)
-        self.smoother = _restore_smoother(smoother, n_dims=2)
-        self.log_density = bool(log_density)
-        self.log_eps = float(log_eps)
-        self.smooth_before_log = bool(smooth_before_log)
+        self.kernel = _resolve_kernel(kernel, n_dims=2)
 
     def to_spec(self) -> dict[str, Any]:
         return {
             "type": self.component_type,
             "params": {
-                "bandwidth": list(self.bandwidth),
                 "grid_size": list(self.grid_size),
                 "pad_factor": self.pad_factor,
-                "smoother": _serialize_smoother(self.smoother),
-                "log_density": self.log_density,
-                "log_eps": self.log_eps,
-                "smooth_before_log": self.smooth_before_log,
+                "kernel": _serialize_kernel(self.kernel),
             },
         }
 
@@ -1244,51 +1741,40 @@ class HistogramLandscape2DBuilder(LandscapeBuilder):
 
         mins = np.min(coords, axis=0)
         maxs = np.max(coords, axis=0)
-        span = np.maximum(maxs - mins, 1e-6)
-        pad = span * self.pad_factor
+        iqr_std = (
+            np.percentile(coords, 75.0, axis=0) - np.percentile(coords, 25.0, axis=0)
+        ) / 1.3489795
+        pad_scale = np.maximum(iqr_std, 1e-6)
+        pad = pad_scale * self.pad_factor
         x_edges = np.linspace(mins[0] - pad[0], maxs[0] + pad[0], self.grid_size[0] + 1, dtype=FLOAT_DTYPE)
         y_edges = np.linspace(mins[1] - pad[1], maxs[1] + pad[1], self.grid_size[1] + 1, dtype=FLOAT_DTYPE)
 
         counts_xy, _, _ = np.histogram2d(coords[:, 0], coords[:, 1], bins=[x_edges, y_edges])
         counts = counts_xy.T.astype(np.int_)
-        bandwidth = np.asarray([self.bandwidth[1], self.bandwidth[0]], dtype=FLOAT_DTYPE)
-        grid_spacing = np.asarray(
-            [
-                max(y_edges[1] - y_edges[0], 1e-9),
-                max(x_edges[1] - x_edges[0], 1e-9),
-            ],
-            dtype=FLOAT_DTYPE,
-        )
-        if self.log_density:
-            if self.smooth_before_log:
-                smoothed = _apply_smoother(
-                    counts,
-                    smoother=self.smoother,
-                    bandwidth=bandwidth,
-                    grid_spacing=grid_spacing,
-                )
-                density = np.log(np.maximum(smoothed, 0.0) + self.log_eps)
-            else:
-                density = np.log(np.maximum(counts, 0.0) + self.log_eps)
-                density = _apply_smoother(
-                    density,
-                    smoother=self.smoother,
-                    bandwidth=bandwidth,
-                    grid_spacing=grid_spacing,
-                )
-        else:
-            density = _apply_smoother(
-                counts,
-                smoother=self.smoother,
-                bandwidth=bandwidth,
-                grid_spacing=grid_spacing,
-            )
+        step_x = float(x_edges[1] - x_edges[0])
+        step_y = float(y_edges[1] - y_edges[0])
+        kernel_spec: KernelSpec = dict(self.kernel)
+        if kernel_spec["type"] == "gaussian":
+            params = dict(kernel_spec.get("params", {}))
+            sigma_adjust = float(params.get("sigma_adjust", 1.0))
+            if sigma_adjust <= 0.0:
+                raise ValueError("Gaussian kernel params.sigma_adjust must be > 0.")
+            if "sigma" not in params:
+                # Auto-compute sigma in pixel units; stored in array-axis (y, x) order.
+                sigma_px = _dflt_bandwidth_px(coords, np.array([step_x, step_y])) * sigma_adjust
+                params["sigma"] = [float(sigma_px[1]), float(sigma_px[0])]  # [sigma_y, sigma_x]
+            params.setdefault("mode", "reflect")
+            kernel_spec = {"type": "gaussian", "params": params}
+        smoothed = _apply_kernel(counts, kernel_spec=kernel_spec)
+        total_events = float(np.sum(counts))
+        density = smoothed / (total_events * step_x * step_y)
         return RegularGridLandscape2D(
             start=(float(x_edges[0]), float(y_edges[0])),
             step_size=(float(x_edges[1] - x_edges[0]), float(y_edges[1] - y_edges[0])),
             step_count=(int(self.grid_size[0]), int(self.grid_size[1])),
             density=density,
             counts=counts,
+            kernel=kernel_spec,
         )
 
 
@@ -1299,10 +1785,9 @@ class ModeDetector(FeatureDetector):
     def __init__(
         self,
         min_distance: int = 5,
-        threshold_rel: float = 0.05,
+        peak_threshold_spec: MaskSpecLike = None,
         exclude_border: bool | int = False,
-        auto_peak_mask: str | None = "otsu",
-        peak_mask_quantile: float = 0.95,
+        mask_spec: MaskSpecLike = None,
         min_marker_component_size: int = 10,
         structure: StructureLike = "centrosymmetric",
     ) -> None:
@@ -1312,15 +1797,17 @@ class ModeDetector(FeatureDetector):
         ----------
         min_distance
             Minimum separation between detected modes in grid cells.
-        threshold_rel
-            Relative density threshold used to suppress weak local maxima.
+        peak_threshold_spec
+            Threshold strategy used to suppress weak local maxima before peak
+            selection. Supports any global threshold method from MaskSpec
+            (for example ``"otsu"``, ``"yen"``, ``"li"``, ``"isodata"``,
+            ``"triangle"``, ``"mean"``), ``"quantile"``, ``"absolute"``,
+            ``"relative"``, or ``None`` for no threshold.
         exclude_border
             Forwarded to ``skimage.feature.peak_local_max`` for 2D mode detection.
-        auto_peak_mask
-            Optional pre-mask used before peak detection. Supported values are
-            ``"otsu"``, ``"quantile"``, or ``None``.
-        peak_mask_quantile
-            Quantile used when ``auto_peak_mask="quantile"``.
+        mask_spec
+            Mask configuration used to limit where peaks can be detected.
+            Accepts KernelSpec-like dictionaries, threshold method strings, or ``None``.
         min_marker_component_size
             Minimum connected-component size allowed in the peak mask before a region
             can contribute peak markers.
@@ -1328,11 +1815,10 @@ class ModeDetector(FeatureDetector):
             Connectivity structure used for peak-mask connected components. Supports
             ``"centrosymmetric"``, ``"cross"``, or a custom 2D boolean array.
         """
+        super().__init__(mask_spec=mask_spec)
         self.min_distance = int(min_distance)
-        self.threshold_rel = float(threshold_rel)
+        self.peak_threshold_spec = _normalize_mask_spec(peak_threshold_spec)
         self.exclude_border = exclude_border
-        self.auto_peak_mask = None if auto_peak_mask in {None, "none"} else str(auto_peak_mask)
-        self.peak_mask_quantile = float(peak_mask_quantile)
         self.min_marker_component_size = int(min_marker_component_size)
         self.structure = self._restore_structure(structure)
 
@@ -1341,10 +1827,9 @@ class ModeDetector(FeatureDetector):
             "type": self.component_type,
             "params": {
                 "min_distance": self.min_distance,
-                "threshold_rel": self.threshold_rel,
+                "peak_threshold_spec": _serialize_mask_spec(self.peak_threshold_spec),
                 "exclude_border": self.exclude_border,
-                "auto_peak_mask": self.auto_peak_mask,
-                "peak_mask_quantile": self.peak_mask_quantile,
+                "mask_spec": self._serialized_mask_spec(),
                 "min_marker_component_size": self.min_marker_component_size,
                 "structure": self._serialize_structure(),
             },
@@ -1374,16 +1859,23 @@ class ModeDetector(FeatureDetector):
 
     def detect(self, landscape: DensityLandscape) -> list[ModeFeature]:
         if isinstance(landscape, Landscape1D):
-            return self._detect_1d(landscape)
+            return self._detect_1d(landscape, mask_spec=self.mask_spec)
         if isinstance(landscape, Landscape2D):
-            return self._detect_2d(landscape)
+            return self._detect_2d(landscape, mask_spec=self.mask_spec)
         raise TypeError(f"Unsupported landscape type {type(landscape)!r}.")
 
-    def _detect_1d(self, landscape: Landscape1D) -> list[ModeFeature]:
-        density = np.asarray(landscape.density, dtype=FLOAT_DTYPE).reshape(-1)
-        if density.size == 0:
+    @staticmethod
+    def _to_detection_density(density: FloatArray) -> FloatArray:
+        arr = np.asarray(density, dtype=FLOAT_DTYPE)
+        return np.log(np.maximum(arr, 0.0) + 1e-9)
+
+    def _detect_1d(self, landscape: Landscape1D, *, mask_spec: MaskSpecLike) -> list[ModeFeature]:
+        density_raw = np.asarray(landscape.density, dtype=FLOAT_DTYPE).reshape(-1)
+        density = self._to_detection_density(density_raw)
+        if density_raw.size == 0:
             return []
-        threshold = _relative_threshold(density, self.threshold_rel)
+        peak_mask = _resolve_density_mask(density, mask_spec)
+        threshold = _resolve_scalar_threshold(density[peak_mask], self.peak_threshold_spec)
         candidate_idx, peak_properties = find_peaks(
             density,
             height=threshold,
@@ -1391,13 +1883,17 @@ class ModeDetector(FeatureDetector):
             prominence=0.0,
             width=1.0,
         )
+        candidate_idx = candidate_idx[np.asarray(peak_mask[candidate_idx], dtype=np.bool_)]
         if candidate_idx.size == 0:
             # Fallback to global maximum if no peaks are detected
-            imax = int(np.argmax(density))
+            search_density = np.where(peak_mask, density, -np.inf)
+            if not np.isfinite(search_density).any():
+                search_density = density
+            imax = int(np.argmax(search_density))
             start, end = 0, density.size - 1
             candidate_idx = np.asarray([imax], dtype=np.int_)
             peak_properties = {
-                "peak_heights": np.asarray([density[imax]], dtype=FLOAT_DTYPE),
+                "peak_heights": np.asarray([density_raw[imax]], dtype=FLOAT_DTYPE),
                 "left_bases": np.asarray([start], dtype=np.int_),
                 "right_bases": np.asarray([end], dtype=np.int_),
                 "left_ips": np.asarray([start], dtype=FLOAT_DTYPE),
@@ -1409,7 +1905,7 @@ class ModeDetector(FeatureDetector):
             props = {
                 "point": [float(landscape.axis[idx])],
                 "grid_index": [int(idx)],
-                "peak_density": float(peak_properties["peak_heights"][k]),
+                "peak_density": float(density_raw[idx]),
                 "properties": {
                     "left_base": int(peak_properties["left_bases"][k]),
                     "right_base": int(peak_properties["right_bases"][k]),
@@ -1432,24 +1928,9 @@ class ModeDetector(FeatureDetector):
             for rank, mode in enumerate(mode_features, start=1)
         ]
 
-    def _peak_mask_2d(self, density: FloatArray) -> BooleanArray:
-        # TODO: add more options from skimage.filters.threshold_*
-        finite_mask = np.isfinite(density)
-        finite_values = density[finite_mask]
-        if finite_values.size == 0:
-            return np.ones_like(density, dtype=np.bool_)
-        if self.auto_peak_mask == "otsu":
-            threshold = float(threshold_otsu(finite_values))
-            peak_mask = np.asarray(density >= threshold, dtype=np.bool_)
-        elif self.auto_peak_mask == "quantile":
-            threshold = float(np.quantile(finite_values, self.peak_mask_quantile))
-            peak_mask = np.asarray(density >= threshold, dtype=np.bool_)
-        elif self.auto_peak_mask is None:
-            peak_mask = np.ones_like(density, dtype=np.bool_)
-        else:
-            raise ValueError("auto_peak_mask must be 'otsu', 'quantile', or None.")
-
-        peak_mask &= finite_mask
+    def _marker_peak_mask_2d(self, density: FloatArray, *, mask_spec: MaskSpecLike) -> BooleanArray:
+        peak_mask = _resolve_density_mask(density, mask_spec)
+        finite_mask = np.asarray(np.isfinite(density), dtype=np.bool_)
         if self.min_marker_component_size > 1:
             component_labels, _ = nd_label(peak_mask, structure=self.structure) # pyright: ignore[reportGeneralTypeIssues]
             sizes = np.bincount(component_labels.ravel())
@@ -1461,16 +1942,22 @@ class ModeDetector(FeatureDetector):
             return finite_mask
         return peak_mask
 
-    def _detect_2d(self, landscape: Landscape2D) -> list[ModeFeature]:
-        density = np.asarray(landscape.density, dtype=FLOAT_DTYPE)
-        peak_mask = self._peak_mask_2d(density)
+    def _detect_2d(
+        self,
+        landscape: Landscape2D,
+        *,
+        mask_spec: MaskSpecLike,
+    ) -> list[ModeFeature]:
+        density_raw = np.asarray(landscape.density, dtype=FLOAT_DTYPE)
+        density = self._to_detection_density(density_raw)
+        peak_mask = self._marker_peak_mask_2d(density, mask_spec=mask_spec)
         peak_mask_components = None
         if self.min_marker_component_size > 1:
             peak_mask_components, _ = nd_label(peak_mask, structure=self.structure) # pyright: ignore[reportGeneralTypeIssues]
         coords = peak_local_max(
             density,
             min_distance=max(self.min_distance, 1),
-            threshold_abs=_relative_threshold(density[peak_mask], self.threshold_rel),
+            threshold_abs=_resolve_scalar_threshold(density[peak_mask], self.peak_threshold_spec),
             labels=peak_mask.astype(np.uint8),
             exclude_border=self.exclude_border, # pyright: ignore[reportArgumentType]
         )
@@ -1484,7 +1971,7 @@ class ModeDetector(FeatureDetector):
                 rank=rank,
                 point=[float(landscape.x_centers[col]), float(landscape.y_centers[row])],
                 grid_index=[int(row), int(col)],
-                peak_density=float(density[row, col]),
+                peak_density=float(density_raw[row, col]),
                 properties={
                     "peak_mask_component": (
                         int(peak_mask_components[row, col]) if peak_mask_components is not None else 0
@@ -1493,6 +1980,284 @@ class ModeDetector(FeatureDetector):
             )
             for rank, (row, col) in enumerate(peak_order, start=1)
         ]
+
+
+@_register_component(_FEATURE_DETECTORS, "curvature_detector")
+class CurvatureDetector(FeatureDetector):
+    """Detect density modes by locating statistically significant negative-curvature regions.
+
+    The detector implements the curvature significance test from
+    Duong & Hazelton (2003) as coded in R's ``feature`` package
+    (``SignifFeatureRegion.R``).  For each grid cell the Wald chi-squared
+    statistic for the second-order derivative of the density estimate is
+    computed, corrected for multiple testing via Hochberg's step-up procedure,
+    and cells with significantly negative curvature (local maxima of the
+    density) are grouped into connected components.  One ``ModeFeature`` is
+    returned per component, located at the density maximum within it.
+
+    Differentiation uses :func:`_compute_landscape_derivatives`, which requires
+    a ``RegularGridLandscape1D`` or ``RegularGridLandscape2D`` with a Gaussian
+    kernel.  Other landscape types raise ``TypeError`` at detection time.
+
+    Parameters
+    ----------
+    alpha
+        Family-wise error rate for Hochberg's step-up correction.
+    ess_min
+        Minimum effective sample size (``n · f̂ · prod(h) · (√2π)^d``) for a
+        grid cell to be included in the significance test.  Cells below this
+        threshold are excluded regardless of their curvature.
+    neg_curv_only
+        If ``True`` (default), restrict significant cells to those where all
+        Hessian eigenvalues are negative (confirmed local mode).  If ``False``,
+        any significant curvature region is retained.
+    min_component_size
+        Minimum number of grid cells a connected significant-curvature component
+        must contain to produce a ``ModeFeature``.  Smaller components are
+        discarded as noise.
+    mask_spec
+        Optional density mask applied before significance testing, restricting
+        which cells are considered active.  Accepts any ``MaskSpecLike`` value
+        (threshold method string, mapping, boolean array, or ``None``).
+    exclude_border
+        Reserved for future border-exclusion support; currently unused.
+    """
+
+    component_type = "curvature_detector"
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        ess_min: float = 5.0,
+        neg_curv_only: bool = True,
+        min_component_size: int = 10,
+        mask_spec: MaskSpecLike = None,
+        exclude_border: bool = False,
+    ) -> None:
+        super().__init__(mask_spec=mask_spec)
+        self.alpha = float(alpha)
+        self.ess_min = float(ess_min)
+        self.neg_curv_only = bool(neg_curv_only)
+        self.min_component_size = int(min_component_size)
+        self.exclude_border = bool(exclude_border)
+
+    def to_spec(self) -> dict[str, Any]:
+        return {
+            "type": self.component_type,
+            "params": {
+                "alpha": self.alpha,
+                "ess_min": self.ess_min,
+                "neg_curv_only": self.neg_curv_only,
+                "min_component_size": self.min_component_size,
+                "mask_spec": self._serialized_mask_spec(),
+                "exclude_border": self.exclude_border,
+            },
+        }
+
+    def detect(
+        self,
+        landscape: DensityLandscape,
+    ) -> list[ModeFeature]:
+        derivs = _compute_landscape_derivatives(landscape)
+        if isinstance(landscape, Landscape1D):
+            return self._detect_1d(landscape, derivs, mask_spec=self.mask_spec)
+        if isinstance(landscape, Landscape2D):
+            return self._detect_2d(landscape, derivs, mask_spec=self.mask_spec)
+        raise TypeError(f"Unsupported landscape type {type(landscape)!r}.")
+
+    @staticmethod
+    def _fdr_reject(pval_flat: "np.ndarray", alpha: float) -> "np.ndarray":
+        """Benjamini-Hochberg FDR correction on a flat p-value array.
+
+        Cells with ``p == 0`` are auto-rejected; ``NaN`` cells are treated as
+        non-rejected.
+        """
+        reject = np.zeros(pval_flat.size, dtype=np.bool_)
+        finite_idx = np.where(np.isfinite(pval_flat))[0]
+        if finite_idx.size == 0:
+            return reject
+        p = pval_flat[finite_idx]
+        # p == 0: auto-reject
+        reject[finite_idx[p <= 0.0]] = True
+        pos_mask = p > 0.0
+        if not np.any(pos_mask):
+            return reject
+        pos_idx = finite_idx[pos_mask]
+        p_pos = p[pos_mask]
+        p_adj = false_discovery_control(p_pos, method="bh")
+        reject[pos_idx] = p_adj <= alpha
+        return reject
+
+    def _detect_1d(
+        self,
+        landscape: Landscape1D,
+        derivs: "dict[str, Any]",
+        *,
+        mask_spec: MaskSpecLike,
+    ) -> list[ModeFeature]:
+        if not isinstance(landscape, RegularGridLandscape1D):
+            raise TypeError(
+                "CurvatureDetector requires RegularGridLandscape1D for 1D detection."
+            )
+        D = landscape.density
+        n = float(landscape.counts.sum())
+        dx = float(landscape.step_size)
+        h = float(landscape.kernel["params"]["sigma"][0]) * dx  # bandwidth in data units
+
+        f2: np.ndarray = derivs["hessian"][0]
+
+        active = np.isfinite(D) & (D > 0.0)
+        # Effective sample size: n · f̂ · h · √(2π)
+        active &= n * D * h * np.sqrt(2.0 * np.pi) >= self.ess_min
+        active &= _resolve_density_mask(D, mask_spec)
+
+        # Sig2_scalar = D / (8·√π·n·h)   [R d=1 formula]
+        sig2 = D / (8.0 * np.sqrt(np.pi) * n * h)
+        wald = np.full(D.shape, np.nan, dtype=FLOAT_DTYPE)
+        valid = active & (sig2 > 0.0)
+        wald[valid] = (f2[valid] ** 2 * h ** 4) / (3.0 * sig2[valid])
+
+        pval = np.full(D.shape, np.nan, dtype=FLOAT_DTYPE)
+        finite = np.isfinite(wald)
+        pval[finite] = chi2.sf(wald[finite], df=1)
+
+        p_flat = pval.ravel().copy()
+        p_flat[~active.ravel()] = np.nan
+        signif = self._fdr_reject(p_flat, self.alpha).reshape(D.shape)
+
+        if self.neg_curv_only:
+            signif &= f2 < 0.0
+
+        structure_1d = np.ones(3, dtype=np.bool_)
+        lab, n_comp = nd_label(signif, structure=structure_1d)  # pyright: ignore[reportGeneralTypeIssues]
+        if n_comp == 0:
+            return []
+        sizes = np.bincount(lab.ravel())
+        axis = np.asarray(landscape.axis, dtype=FLOAT_DTYPE)
+
+        features: list[ModeFeature] = []
+        for comp_id in range(1, n_comp + 1):
+            if sizes[comp_id] < self.min_component_size:
+                continue
+            comp_mask = np.asarray(lab == comp_id, dtype=np.bool_)
+            D_comp = np.where(comp_mask, D, -np.inf)
+            peak_idx = int(np.argmax(D_comp))
+            comp_axis = axis[comp_mask]
+            features.append(
+                ModeFeature(
+                    id=f"mode_{comp_id}",
+                    rank=0,
+                    point=[float(axis[peak_idx])],
+                    grid_index=[peak_idx],
+                    peak_density=float(landscape.density[peak_idx]),
+                    properties={"component_size": int(sizes[comp_id])},
+                    footprint={
+                        "grid_mask": comp_mask,
+                        "bounds": [[float(comp_axis.min())], [float(comp_axis.max())]],
+                    },
+                )
+            )
+
+        features.sort(key=lambda f: f.peak_density, reverse=True)
+        for rank, feat in enumerate(features, start=1):
+            feat.rank = rank
+            feat.id = f"mode_{rank}"
+        return features
+
+    def _detect_2d(
+        self,
+        landscape: Landscape2D,
+        derivs: "dict[str, Any]",
+        *,
+        mask_spec: MaskSpecLike,
+    ) -> list[ModeFeature]:
+        if not isinstance(landscape, RegularGridLandscape2D):
+            raise TypeError(
+                "CurvatureDetector requires RegularGridLandscape2D for 2D detection."
+            )
+        D = landscape.density
+        n = float(landscape.counts.sum())
+        dx, dy = landscape.step_size  # (step_x, step_y)
+        sigma_px = landscape.kernel["params"]["sigma"]  # [σ_y_px, σ_x_px]
+        h_x = float(sigma_px[1]) * dx  # bandwidth in x data units
+        h_y = float(sigma_px[0]) * dy  # bandwidth in y data units
+
+        Hxx, Hxy, Hyy = derivs["hessian"]
+        l_min, l_max = derivs["eigenvalues"]
+
+        # Setup Wald test active mask:
+        active = np.isfinite(D) & (D > 0.0)
+        # Effective sample size: n · f̂ · h_x · h_y · 2π
+        active &= (n * h_x * h_y * 2.0 * np.pi * D) >= self.ess_min
+        active &= _resolve_density_mask(D, mask_spec)
+
+        # Sig2_scalar = D / (16·π·n·h_x·h_y)   [R d=2 formula]
+        sig2 = D / (16.0 * np.pi * n * h_x * h_y)
+
+        # Wald statistic — vectorized closed-form quadratic from R's Sig2.mat.inv
+        # Sig2.mat ordering: [f20, f11, f02] with h[1]=h_x, h[2]=h_y
+        a = 3.0 / h_x ** 4
+        b = 1.0 / (h_x * h_y) ** 2
+        c = 3.0 / h_y ** 4
+        det_sub = a * c - b * b  # > 0 by construction for finite h_x, h_y
+        wald = np.full(D.shape, np.nan, dtype=FLOAT_DTYPE)
+        valid = active & (sig2 > 0.0) & (det_sub > 0.0)
+        quad = (
+            (c * Hxx[valid] ** 2 + a * Hyy[valid] ** 2 - 2.0 * b * Hxx[valid] * Hyy[valid]) / det_sub
+            + Hxy[valid] ** 2 / b
+        )
+        wald[valid] = quad / sig2[valid]
+
+        pval = np.full(D.shape, np.nan, dtype=FLOAT_DTYPE)
+        finite = np.isfinite(wald)
+        pval[finite] = chi2.sf(wald[finite], df=3)  # df = d*(d+1)/2 = 3
+
+        p_flat = pval.ravel().copy()
+        p_flat[~active.ravel()] = np.nan
+        signif = self._fdr_reject(p_flat, self.alpha).reshape(D.shape)
+
+        if self.neg_curv_only:
+            signif &= (l_min < 0.0) & (l_max < 0.0)
+
+        structure_2d = np.ones((3, 3), dtype=np.bool_)
+        lab, n_comp = nd_label(signif, structure=structure_2d)  # pyright: ignore[reportGeneralTypeIssues]
+        if n_comp == 0:
+            return []
+        sizes = np.bincount(lab.ravel())
+        x_centers = np.asarray(landscape.x_centers, dtype=FLOAT_DTYPE)
+        y_centers = np.asarray(landscape.y_centers, dtype=FLOAT_DTYPE)
+
+        features: list[ModeFeature] = []
+        for comp_id in range(1, n_comp + 1):
+            if sizes[comp_id] < self.min_component_size:
+                continue
+            comp_mask = np.asarray(lab == comp_id, dtype=np.bool_)
+            D_comp = np.where(comp_mask, D, -np.inf)
+            row, col = np.unravel_index(int(np.argmax(D_comp)), D.shape)
+            row, col = int(row), int(col)
+            rows_in, cols_in = np.where(comp_mask)
+            lo = [float(x_centers[cols_in.min()]), float(y_centers[rows_in.min()])]
+            hi = [float(x_centers[cols_in.max()]), float(y_centers[rows_in.max()])]
+            features.append(
+                ModeFeature(
+                    id=f"mode_{comp_id}",
+                    rank=0,
+                    point=[float(x_centers[col]), float(y_centers[row])],
+                    grid_index=[row, col],
+                    peak_density=float(landscape.density[row, col]),
+                    properties={"component_size": int(sizes[comp_id])},
+                    footprint={
+                        "grid_mask": comp_mask,
+                        "bounds": [lo, hi],
+                    },
+                )
+            )
+
+        features.sort(key=lambda f: f.peak_density, reverse=True)
+        for rank, feat in enumerate(features, start=1):
+            feat.rank = rank
+            feat.id = f"mode_{rank}"
+        return features
 
 
 @_register_component(_FEATURE_SELECTORS, "nearest_mode")
@@ -1523,7 +2288,7 @@ class NearestModeSelector(FeatureSelector):
         distances = np.linalg.norm(coords - seed_point.reshape(1, -1), axis=1)
         selected = features[int(np.argmin(distances))]
         roi_bounds = hint.get("roi_bounds")
-        if roi_bounds is not None and not _feature_within_roi(selected, roi_bounds):
+        if roi_bounds is not None and not selected.within_roi(roi_bounds):
             raise ValueError("Nearest mode selected from seed_point falls outside roi_bounds.")
         return selected
 
@@ -1560,7 +2325,7 @@ class HighestDensitySelector(FeatureSelector):
         hint = dict(selection_hint or {})
         roi_bounds = hint.get("roi_bounds")
         if roi_bounds is not None:
-            candidates = [feature for feature in features if _feature_within_roi(feature, roi_bounds)]
+            candidates = [feature for feature in features if feature.within_roi(roi_bounds)]
             if candidates:
                 return max(candidates, key=lambda feature: feature.peak_density)
         return max(features, key=lambda feature: feature.peak_density)
@@ -1601,7 +2366,9 @@ class ProminencePeakRegionExtractor(RegionExtractor):
     def to_spec(self) -> dict[str, Any]:
         return {
             "type": self.component_type,
-            "params": {},
+            "params": {
+                "mask_spec": self._serialized_mask_spec(),
+            },
         }
 
     def extract(
@@ -1726,6 +2493,7 @@ class WatershedRegionExtractor(RegionExtractor):
     def __init__(
         self,
         watershed_line: bool = False,
+        mask_spec: MaskSpecLike = None,
     ) -> None:
         """Configure watershed-based region extraction.
 
@@ -1734,7 +2502,10 @@ class WatershedRegionExtractor(RegionExtractor):
         watershed_line
             Whether to keep watershed ridge lines as label ``0`` in the output
             segmentation. This is forwarded to ``skimage.segmentation.watershed``.
+        mask_spec
+            Optional masking strategy used before watershed segmentation.
         """
+        super().__init__(mask_spec=mask_spec)
         self.watershed_line = bool(watershed_line)
 
     def to_spec(self) -> dict[str, Any]:
@@ -1742,6 +2513,7 @@ class WatershedRegionExtractor(RegionExtractor):
             "type": self.component_type,
             "params": {
                 "watershed_line": self.watershed_line,
+                "mask_spec": self._serialized_mask_spec(),
             },
         }
 
@@ -1757,30 +2529,143 @@ class WatershedRegionExtractor(RegionExtractor):
         if not isinstance(landscape, Landscape2D):
             raise TypeError("WatershedRegionExtractor only supports 2D landscapes.")
         density = np.asarray(landscape.density, dtype=FLOAT_DTYPE)
-        markers = np.zeros_like(density, dtype=np.int_)
+        segmentation_mask = _resolve_density_mask(density, self.mask_spec)
         feature_order = list(features)
-        for marker_id, feature in enumerate(feature_order, start=1):
-            row, col = feature.grid_index
-            markers[int(row), int(col)] = marker_id
+        markers = _build_marker_image_2d(feature_order, density.shape)
         labels = watershed(
             -density,
             markers=markers,
-            mask=np.isfinite(density),
+            mask=segmentation_mask,
             watershed_line=self.watershed_line,
         )
         region_lookup: dict[str, GateRegion] = {}
         for marker_id, feature in enumerate(feature_order, start=1):
+            region_mask = np.asarray(labels == marker_id, dtype=np.bool_)
             region_id = f"{region_prefix}_{feature.id}"
             region_lookup[region_id] = RasterRegion2D(
                 x_edges=landscape.x_edges,
                 y_edges=landscape.y_edges,
-                mask=np.asarray(labels == marker_id, dtype=np.bool_),
+                mask=region_mask,
             )
+        # Build renumbered label image so label i corresponds to region i.
+        label_image = np.zeros_like(labels, dtype=np.int_)
+        for new_id, region in enumerate(region_lookup.values(), start=1):
+            label_image[np.asarray(region.mask, dtype=np.bool_)] = new_id  # pyright: ignore[reportAttributeAccessIssue]
         return ExtractionResult(
             regions=region_lookup,
-            label_image=labels,
+            label_image=label_image,
             diagnostics={"n_regions": len(region_lookup)},
         )
+
+
+@_register_component(_REGION_EXTRACTORS, "random_walker")
+class RandomWalkerRegionExtractor(RegionExtractor):
+    component_type = "random_walker"
+
+    def __init__(
+        self,
+        beta: float = 130.0,
+        mode: str = "cg_j",
+        tol: float = 0.001,
+        prob_tol: float = 0.001,
+        spacing: Sequence[float] | None = None,
+        normalize_data: bool = True,
+        mask_spec: MaskSpecLike = None,
+    ) -> None:
+        """Configure random-walker-based region extraction.
+
+        Parameters are forwarded to ``skimage.segmentation.random_walker``
+        after feature markers and the optional density mask are resolved.
+        """
+        super().__init__(mask_spec=mask_spec)
+        self.beta = float(beta)
+        self.mode = str(mode)
+        self.tol = float(tol)
+        self.prob_tol = float(prob_tol)
+        self.spacing = None if spacing is None else [float(v) for v in spacing]
+        self.normalize_data = bool(normalize_data)
+
+    def to_spec(self) -> dict[str, Any]:
+        return {
+            "type": self.component_type,
+            "params": {
+                "beta": self.beta,
+                "mode": self.mode,
+                "tol": self.tol,
+                "prob_tol": self.prob_tol,
+                "spacing": None if self.spacing is None else list(self.spacing),
+                "normalize_data": self.normalize_data,
+                "mask_spec": self._serialized_mask_spec(),
+            },
+        }
+
+    def segment(
+        self,
+        landscape: DensityLandscape,
+        features: Sequence[ModeFeature],
+        *,
+        region_prefix: str,
+    ) -> ExtractionResult:
+        if not features:
+            raise ValueError("RandomWalkerRegionExtractor requires at least one feature.")
+        if not isinstance(landscape, Landscape2D):
+            raise TypeError("RandomWalkerRegionExtractor only supports 2D landscapes.")
+        density = np.asarray(landscape.density, dtype=FLOAT_DTYPE)
+        segmentation_mask = _resolve_density_mask(density, self.mask_spec)
+        feature_order = list(features)
+        markers = _build_marker_image_2d(feature_order, density.shape)
+        walker_markers = np.asarray(markers, dtype=np.int_)
+        walker_markers[~segmentation_mask] = -1
+
+        walker_data = self._prepare_walker_data(density)
+        labels = random_walker(
+            walker_data,
+            walker_markers,
+            beta=self.beta,
+            mode=self.mode,
+            tol=self.tol,
+            prob_tol=self.prob_tol,
+            spacing=self.spacing,
+            copy=True,
+        )
+
+        region_lookup: dict[str, GateRegion] = {}
+        for marker_id, feature in enumerate(feature_order, start=1):
+            region_mask = np.asarray(labels == marker_id, dtype=np.bool_)
+            region_id = f"{region_prefix}_{feature.id}"
+            region_lookup[region_id] = RasterRegion2D(
+                x_edges=landscape.x_edges,
+                y_edges=landscape.y_edges,
+                mask=region_mask,
+            )
+
+        label_image = np.zeros_like(labels, dtype=np.int_)
+        for new_id, region in enumerate(region_lookup.values(), start=1):
+            label_image[np.asarray(region.mask, dtype=np.bool_)] = new_id  # pyright: ignore[reportAttributeAccessIssue]
+        return ExtractionResult(
+            regions=region_lookup,
+            label_image=label_image,
+            diagnostics={"n_regions": len(region_lookup)},
+        )
+
+    def _prepare_walker_data(self, density: FloatArray) -> FloatArray:
+        data = np.asarray(density, dtype=FLOAT_DTYPE)
+        finite_mask = np.isfinite(data)
+        if not np.any(finite_mask):
+            return np.zeros_like(data, dtype=FLOAT_DTYPE)
+
+        finite_values = data[finite_mask]
+        fill_value = float(np.min(finite_values))
+        prepared = np.where(finite_mask, data, fill_value).astype(FLOAT_DTYPE, copy=False)
+        if not self.normalize_data:
+            return prepared
+
+        min_value = float(np.min(finite_values))
+        max_value = float(np.max(finite_values))
+        value_range = max_value - min_value
+        if value_range <= 0.0:
+            return np.zeros_like(prepared, dtype=FLOAT_DTYPE)
+        return np.asarray((prepared - min_value) / value_range, dtype=FLOAT_DTYPE)
 
 
 @_register_component(_REGION_EXTRACTORS, "level_set_cc")
@@ -1792,6 +2677,7 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
         threshold_rel: float = 0.5,
         threshold_abs: float | None = None,
         connectivity: int = 1,
+        mask_spec: MaskSpecLike = None,
     ) -> None:
         """Configure level-set connected-component extraction.
 
@@ -1805,7 +2691,10 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
             components are computed.
         connectivity
             Pixel connectivity passed to connected-component labeling in 2D.
+        mask_spec
+            Optional masking strategy used before connected-component extraction.
         """
+        super().__init__(mask_spec=mask_spec)
         self.threshold_rel = float(threshold_rel)
         self.threshold_abs = None if threshold_abs is None else float(threshold_abs)
         self.connectivity = int(connectivity)
@@ -1817,6 +2706,7 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
                 "threshold_rel": self.threshold_rel,
                 "threshold_abs": self.threshold_abs,
                 "connectivity": self.connectivity,
+                "mask_spec": self._serialized_mask_spec(),
             },
         }
 
@@ -1825,6 +2715,7 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
             threshold_rel=self.threshold_rel,
             threshold_abs=threshold_abs,
             connectivity=self.connectivity,
+            mask_spec=self.mask_spec,
         )
 
     def extract(
@@ -1844,6 +2735,20 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
             region_prefix=region_prefix,
         )
         extraction.diagnostics = dict(extraction.diagnostics) | {"threshold_rel": self.threshold_rel}
+        selected_id = f"{region_prefix}_{target.id}"
+        selected = extraction.regions.get(selected_id)
+        region_size: int
+        if isinstance(selected, IntervalRegion) and isinstance(landscape, Landscape1D):
+            left_bin, right_bin = landscape.interval_to_bin_slice(selected.min_value, selected.max_value)
+            region_size = right_bin - left_bin + 1
+        elif isinstance(selected, RasterRegion2D):
+            region_size = int(np.count_nonzero(selected.mask))
+        else:
+            region_size = 0  # unknown region type — do not filter
+        if region_size == 0:
+            raise KeyError(
+                f"Region for target {target.id!r} was removed due to unknown region type."
+            )
         return extraction
 
     def segment(
@@ -1854,9 +2759,19 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
         region_prefix: str,
     ) -> ExtractionResult:
         if isinstance(landscape, Landscape1D):
-            return self._extract_1d_components(landscape, features=features, region_prefix=region_prefix)
+            return self._extract_1d_components(
+                landscape,
+                features=features,
+                region_prefix=region_prefix,
+                mask_spec=self.mask_spec,
+            )
         if isinstance(landscape, Landscape2D):
-            return self._extract_2d_components(landscape, features=features, region_prefix=region_prefix)
+            return self._extract_2d_components(
+                landscape,
+                features=features,
+                region_prefix=region_prefix,
+                mask_spec=self.mask_spec,
+            )
         raise TypeError(f"Unsupported landscape type {type(landscape)!r}.")
 
     def _threshold_for_feature(self, feature: ModeFeature, landscape: DensityLandscape) -> float:
@@ -1882,9 +2797,11 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
         *,
         features: Sequence[ModeFeature],
         region_prefix: str,
+        mask_spec: MaskSpecLike,
     ) -> ExtractionResult:
         threshold = self._global_threshold(features, landscape)
-        active = np.asarray(landscape.density >= threshold, dtype=np.bool_)
+        support_mask = _resolve_density_mask(np.asarray(landscape.density, dtype=FLOAT_DTYPE), mask_spec)
+        active = np.asarray(landscape.density >= threshold, dtype=np.bool_) & support_mask
         labels = self._component_labels_1d(active)
         regions: dict[str, GateRegion] = {}
         labels_out = np.zeros_like(labels, dtype=np.int_)
@@ -1929,9 +2846,11 @@ class LevelSetConnectedComponentExtractor(RegionExtractor):
         *,
         features: Sequence[ModeFeature],
         region_prefix: str,
+        mask_spec: MaskSpecLike,
     ) -> ExtractionResult:
         threshold = self._global_threshold(features, landscape)
-        active = np.asarray(landscape.density >= threshold, dtype=np.bool_)
+        support_mask = _resolve_density_mask(np.asarray(landscape.density, dtype=FLOAT_DTYPE), mask_spec)
+        active = np.asarray(landscape.density >= threshold, dtype=np.bool_) & support_mask
         labels: np.ndarray = label(active, connectivity=max(self.connectivity, 1)) # pyright: ignore[reportAssignmentType]
         regions: dict[str, GateRegion] = {}
         labels_out = np.zeros_like(landscape.density, dtype=np.int_)
@@ -2064,8 +2983,8 @@ class ContourBoundaryBuilder(BoundaryBuilder):
             return []
 
         segment_array = np.vstack(segments)
-        starts = [tuple(int(v) for v in row[:2]) for row in segment_array]
-        ends = [tuple(int(v) for v in row[2:]) for row in segment_array]
+        starts: list[tuple[int, int]] = [tuple(row[:2]) for row in segment_array]
+        ends: list[tuple[int, int]] = [tuple(row[2:]) for row in segment_array]
 
         start_map: dict[tuple[int, int], list[int]] = {}
         for idx, start in enumerate(starts):
@@ -2092,7 +3011,7 @@ class ContourBoundaryBuilder(BoundaryBuilder):
                 current_vertex[0] - start_vertex[0],
                 current_vertex[1] - start_vertex[1],
             )
-            loop: list[tuple[int, int]] = [start_vertex, current_vertex] # pyright: ignore[reportAssignmentType]
+            loop: list[tuple[int, int]] = [start_vertex, current_vertex]
 
             while current_vertex != start_vertex:
                 candidates = [
@@ -2402,7 +3321,16 @@ class BaseDensityGate(Gate, ABC):
                 f"got {len(dimensions)}."
             )
 
+        removed_mask_kwargs = {"detector_mask_spec", "extractor_mask_spec"} & set(kwargs)
+        if removed_mask_kwargs:
+            names = ", ".join(sorted(removed_mask_kwargs))
+            raise TypeError(f"{names} must be configured on detector/extractor mask_spec.")
+
         normalized_hyperparams = dict(hyperparams or {})
+        removed_mask_hyperparams = {"detector_mask_spec", "extractor_mask_spec"} & set(normalized_hyperparams)
+        if removed_mask_hyperparams:
+            names = ", ".join(sorted(removed_mask_hyperparams))
+            raise TypeError(f"{names} must be configured on detector/extractor mask_spec.")
         normalized_hyperparams.update(kwargs)
         normalized_hyperparams.update(
             {
